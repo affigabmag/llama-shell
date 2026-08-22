@@ -21,7 +21,7 @@ The footer shows this build timestamp (there's no semantic version — it's a li
 ## Layout
 
 - **Header** (fixed top): app title.
-- **Footer** (fixed bottom): build timestamp (left) + ollama installed/not-installed status with version (right, green if installed, red if not).
+- **Footer** (fixed bottom): purple bar matching the header. Build timestamp (left), a clickable GitHub repo link (OSC-8 terminal hyperlink, middle) or a context-specific key hint in the agentic chat/tools/help screens, and ollama installed/not-installed status with version (right, green if installed, red if not).
 - **Body**: the current screen. All menus support Up/Down + Enter navigation as well as the letter shortcut shown in brackets.
 - **Banner**: "LLAMA-SHELL" rendered as solid-color block letters (blue, white, red, green, cyan, magenta, yellow, repeating by letter position — static, not animated) at the top of the main menu.
 
@@ -46,7 +46,7 @@ Queries three sources every time it's opened (no cache — always fresh):
 - **ollama-library** — the full public catalog scraped from `ollama.com/library` (~235 model families). Size shown is the available parameter sizes (e.g. `2b,7b,72b`), since the index page doesn't expose download size.
 - **huggingface** — top 50 GGUF repos by downloads, via the public HF API. (HF hosts 100k+ GGUF repos — this is a slice, not the whole catalog.)
 
-Columns: `NAME`, `SOURCE`, `LOCAL` (installed y/n, cross-referenced against the ollama source), `SIZE`, `MODIFIED`.
+Columns: `NAME`, `SOURCE`, `LOCAL` (installed y/n, cross-referenced against the ollama source), `SIZE`, `CAPABILITIES` (via `ollama show`, e.g. `completion,vision,tools` — only populated for installed/`ollama`-source rows; library/HF entries show `-` since there's nothing to introspect until they're pulled).
 
 Controls:
 - Type to filter/search the list live.
@@ -63,14 +63,25 @@ Live `ollama ps` output, scrollable/selectable. Enter on a row asks to confirm, 
 
 Runs `ollama show` against every locally installed model (progress bar while scanning) and caches the result (`%LocalAppData%\llama-shell\models_cache.json`) so it loads instantly next time. `r` forces a rescan ignoring the cache.
 
-Table columns: `NAME`, `PARAMS`, `QUANT`, `CONTEXT`, `ARCH`, `SIZE`, `CPU/GPU`, `MATCH%` (the last two come from the benchmark — see below; `-` until you've run it).
+Table columns: `NAME`, `PARAMS`, `QUANT`, `CONTEXT`, `ARCH`, `SIZE`, `CAPABILITIES` (via `ollama show`'s "Capabilities" section, e.g. `completion,vision,audio,tools,thinking` — tells you at a glance whether a model is chat-only, multimodal, or tool-calling capable), `CPU/GPU`, `MATCH%` (the last two come from the benchmark — see below; `-` until you've run it).
 
 Enter on a row opens an action menu:
+- `[a]` run own agentic chat — see below, listed first.
 - `[x]` run interactively — hands the terminal to `ollama run <model>` for a real chat session.
 - `[r]` remove — `ollama rm`.
 - `[k]` kill/stop — `ollama stop`.
 
-The list is also automatically invalidated (forced rescan) the next time you open it after downloading a new model from the List models screen, so newly pulled models show up right away instead of a stale cached list.
+The list is also automatically invalidated (forced rescan) the next time you open it after downloading a new model from the List models screen, so newly pulled models show up right away instead of a stale cached list. Cache entries from before the `CAPABILITIES` column existed won't have it populated until you press `r` to force a rescan.
+
+### Agentic chat (`a` from Show model info)
+
+llama-shell's own built-in chat + tool-calling agent — no Aider/OpenCode/Claude Code needed, talks to Ollama's `/api/chat` directly.
+
+- **Streaming replies**: parses Ollama's newline-delimited JSON stream chunk-by-chunk, so replies type out token-by-token instead of appearing all at once.
+- **42 tools** across files & archives, shell & processes, networking & web (including `web_search` via a DuckDuckGo HTML scrape, no API key), system & environment, git & ollama, and open/launch. Press **Ctrl+T** to browse the full list grouped by category; the chat header just shows a one-line count.
+- **Keys**: `Enter` send, `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` scroll history (via a real `bubbles/viewport`, works even while the model is thinking), `Ctrl+T` tool categories, `Ctrl+H` this keybind help dialog, `Esc` back to the model actions menu, `Ctrl+C` quit.
+- **Fixed layout**: the transcript viewport fills the space between the header and the input line; `you>` always sits exactly 3 rows above the very bottom (footer, one blank line, `you>`), regardless of conversation length or scroll position — the viewport's own output is manually padded to its declared height before being placed, since `bubbles/viewport` doesn't pad short content itself, and a global `clampToLastLines` safety net in `View()` guarantees no single frame can ever exceed the terminal's actual height (an earlier bug let a huge streamed reply overflow the frame, which permanently desynced the terminal's scroll position from bubbletea's cursor tracking until restart — the header would just vanish).
+- Tool-calling reliability depends entirely on the model — small/local models can refuse or hallucinate. The system prompt explicitly tells the model it has real file/system access and that tools are additive to normal conversation, not a replacement for it, after early tests showed models either refusing everything ("I'm just an AI") or refusing *everything else* once tools were mentioned ("I can only do file ops").
 
 ### Device info (`d`)
 
