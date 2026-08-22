@@ -3,6 +3,41 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## README screenshots — attempted, blocked, abandoned in favor of manual capture
+- Asked for screenshots of the main menu and show-model-info screens for the
+  README. Since this is a TUI with no headless render path, that means an
+  actual screenshot of a running terminal window, not a mock-up.
+- Tried automating it end-to-end from the agent side:
+  1. Launched `llama-shell.exe` directly via `Start-Process`, found its
+     console window by enumerating top-level windows (`EnumWindows` +
+     `GetWindowText`, since `Process.MainWindowHandle` came back `0` for a
+     console app hosted in a `conhost`/`OpenConsole` child window).
+  2. Moved/resized that window, called `SetForegroundWindow`, and captured
+     the region with `Graphics.CopyFromScreen`.
+  3. Result was a grayscale image — no banner colors, no yellow highlight.
+     Diagnosed by sampling a pixel grid and checking R/G/B spread (a real
+     Windows Terminal capture should show plenty of non-gray pixels; this
+     had ~0%).
+  4. Suspected legacy `conhost` lacking full truecolor VT rendering, so
+     relaunched through `wt.exe` (Windows Terminal) instead, matching what
+     the user's own screenshots throughout this session actually showed.
+     Same grayscale result.
+  5. Root-caused it by calling `GetForegroundWindow()` immediately before
+     the capture: it returned the VS Code window, not the terminal, even
+     after `SetForegroundWindow` / `BringWindowToTop` / `ShowWindow` /
+     `Microsoft.VisualBasic.Interaction.AppActivate` all reported success.
+     Windows deliberately blocks background/automated processes from
+     stealing foreground focus (a documented OS security restriction) — so
+     every capture had actually been screenshotting whatever real window
+     already had focus (VS Code), not the app, regardless of which API said
+     it had switched focus.
+- Conclusion: this can't be fixed with more automation from an agent process
+  — it's an OS-level restriction, not a bug in the capture script. Manual
+  screenshots (user-initiated, e.g. Win+Shift+S) aren't subject to the same
+  restriction, which is why every screenshot pasted directly by the user
+  during this session rendered fine. Bad captures were deleted rather than
+  committed; README screenshots are pending a manually-provided image.
+
 ## Help / Disclaimer / Log (`h`) — new menu item
 - Added a submenu with three options:
   - `[h]` read help — keybindings and screen-by-screen usage notes.
