@@ -104,6 +104,11 @@ const (
 	viewShowScan
 	viewShowTable
 	viewDeviceInfo
+	viewHelpMenu
+	viewHelpText
+	viewDisclaimerText
+	viewLogText
+	viewFirstRunDisclaimer
 )
 
 type cmdResultMsg struct {
@@ -145,6 +150,66 @@ type scanStartMsg struct {
 type scanStepMsg struct {
 	index int
 	row   modelRow
+}
+
+func disclaimerAcceptedFilePath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "disclaimer_accepted")
+}
+
+func isDisclaimerAccepted() bool {
+	_, err := os.Stat(disclaimerAcceptedFilePath())
+	return err == nil
+}
+
+func markDisclaimerAccepted() {
+	path := disclaimerAcceptedFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(time.Now().Format(time.RFC3339)), 0o644)
+}
+
+func logFilePath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "activity.log")
+}
+
+// appendLog records a timestamped activity line (downloads, removes,
+// kills, benchmark runs) for the in-app log viewer. Best-effort: logging
+// never blocks or fails the action it's recording.
+func appendLog(format string, args ...interface{}) {
+	path := logFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	line := fmt.Sprintf(format, args...)
+	fmt.Fprintf(f, "%s  %s\n", time.Now().Format("2006-01-02 15:04:05"), line)
+}
+
+// readLogTail returns the last n lines of the activity log, or a
+// placeholder if there's nothing yet.
+func readLogTail(n int) string {
+	data, err := os.ReadFile(logFilePath())
+	if err != nil || len(data) == 0 {
+		return "no log entries yet."
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func cacheFilePath() string {
@@ -1087,7 +1152,20 @@ var menuItems = []menuItem{
 	{"p", "running models    (ollama ps)"},
 	{"s", "show model info   (scan all + cache)"},
 	{"d", "device info       (cpu/ram/disk/gpu)"},
+	{"h", "help / disclaimer / log"},
 	{"q", "quit"},
+}
+
+type helpMenuItem struct {
+	key   string
+	label string
+	dest  view
+}
+
+var helpMenuItems = []helpMenuItem{
+	{"h", "read help", viewHelpText},
+	{"d", "disclaimer (no warranty)", viewDisclaimerText},
+	{"g", "view log", viewLogText},
 }
 
 type model struct {
@@ -1116,6 +1194,8 @@ type model struct {
 	benchElapsed    float64
 	benchCancelling bool
 	benchDoneMsg    string
+
+	helpMenuCursor int
 
 	scanRows  []modelRow
 	scanTotal int
@@ -1160,9 +1240,13 @@ type model struct {
 }
 
 func initialModel() model {
-	return model{
+	m := model{
 		ollama: checkOllama(),
 	}
+	if !isDisclaimerAccepted() {
+		m.view = viewFirstRunDisclaimer
+	}
+	return m
 }
 
 func (m model) Init() tea.Cmd {
@@ -1224,6 +1308,10 @@ func (m model) enterMenu(sel string) (tea.Model, tea.Cmd) {
 		m.deviceLoading = true
 		m.deviceInfo = nil
 		return m, gatherDeviceInfo
+	case "h":
+		m.view = viewHelpMenu
+		m.helpMenuCursor = 0
+		return m, nil
 	case "q":
 		return m, tea.Quit
 	}
@@ -1296,8 +1384,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.psKilling = false
 		if msg.err != "" {
 			m.psKillMsg = fmt.Sprintf("failed to stop %s:\n%s\n%s", msg.name, msg.err, msg.output)
+			appendLog("stop failed: %s: %s", msg.name, msg.err)
 		} else {
 			m.psKillMsg = fmt.Sprintf("%s stopped.", msg.name)
+			appendLog("stopped %s (from running models)", msg.name)
 		}
 		return m, nil
 
@@ -1317,6 +1407,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.benchCmd = nil
 		if m.benchCancelling {
 			_ = saveCache(m.scanRows)
+			appendLog("benchmark cancelled after %d/%d model(s)", m.benchIndex, m.benchTotal)
 			m.benchRunning = false
 			m.benchCancelling = false
 			m.benchDoneMsg = fmt.Sprintf(
@@ -1335,11 +1426,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		row.Benchmarked = true
 		row.MatchScore = computeMatchScore(msg.cpuGpu, m.benchElapsed)
 		_ = saveCache(m.scanRows)
+		appendLog("benchmarked %s: %s, match %d%%, %.1fs", row.Name, formatCPUGPU(row.CPUGPU), row.MatchScore, row.LoadSecs)
 
 		m.benchIndex++
 		if m.benchIndex >= m.benchTotal {
 			m.benchRunning = false
 			m.benchDoneMsg = fmt.Sprintf("benchmark complete: %d model(s) measured.", m.benchTotal)
+			appendLog("benchmark complete: %d model(s) measured", m.benchTotal)
 			return m, nil
 		}
 		next := m.benchIndex
@@ -1363,11 +1456,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case m.downloadAborting:
 			m.downloadMsg = fmt.Sprintf("download of %s aborted.", name)
+			appendLog("download aborted: %s", name)
 		case msg.err != nil:
 			m.downloadMsg = fmt.Sprintf("download failed for %s:\n%s", name, msg.err.Error())
+			appendLog("download failed: %s: %s", name, msg.err.Error())
 		default:
 			m.downloadMsg = fmt.Sprintf("%s downloaded successfully.", name)
 			m.installedDirty = true
+			appendLog("downloaded %s", name)
 		}
 		m.downloadCh = nil
 		m.downloadCmd = nil
@@ -1377,6 +1473,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanBusy = false
 		if msg.err != "" {
 			m.scanActionMsg = fmt.Sprintf("failed to remove %s:\n%s\n%s", msg.name, msg.err, msg.output)
+			appendLog("remove failed: %s: %s", msg.name, msg.err)
 			return m, nil
 		}
 		for i, r := range m.scanRows {
@@ -1393,14 +1490,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		_ = saveCache(m.scanRows)
 		m.scanActionMsg = fmt.Sprintf("%s removed.", msg.name)
+		appendLog("removed %s (from show model info)", msg.name)
 		return m, nil
 
 	case showStopMsg:
 		m.scanBusy = false
 		if msg.err != "" {
 			m.scanActionMsg = fmt.Sprintf("failed to stop %s:\n%s\n%s", msg.name, msg.err, msg.output)
+			appendLog("stop failed: %s: %s", msg.name, msg.err)
 		} else {
 			m.scanActionMsg = fmt.Sprintf("%s stopped.", msg.name)
+			appendLog("stopped %s (from show model info)", msg.name)
 		}
 		return m, nil
 
@@ -1411,6 +1511,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.scanActionMsg = fmt.Sprintf("chat session with %s ended.", msg.name)
 		}
+		appendLog("ran %s interactively", msg.name)
 		return m, nil
 
 	case scanStartMsg:
@@ -1600,6 +1701,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.benchIndex = 0
 					m.benchTotal = len(m.scanRows)
 					m.benchCancelling = false
+					appendLog("benchmark started: %d model(s)", m.benchTotal)
 					return m, startBenchLoad(0, m.scanRows[0].Name)
 				case "n", "esc":
 					m.benchConfirm = false
@@ -1635,6 +1737,54 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return parseSizeBytes(m.scanRows[i].Size) < parseSizeBytes(m.scanRows[j].Size)
 				})
 				m.benchConfirm = true
+			}
+			return m, nil
+
+		case viewFirstRunDisclaimer:
+			switch key {
+			case "a", "enter":
+				markDisclaimerAccepted()
+				m.view = viewMenu
+			case "q", "esc", "ctrl+c":
+				return m, tea.Quit
+			}
+			return m, nil
+
+		case viewHelpMenu:
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.view = viewMenu
+				return m, nil
+			case "up", "k":
+				m.helpMenuCursor--
+				if m.helpMenuCursor < 0 {
+					m.helpMenuCursor = len(helpMenuItems) - 1
+				}
+			case "down", "j":
+				m.helpMenuCursor++
+				if m.helpMenuCursor >= len(helpMenuItems) {
+					m.helpMenuCursor = 0
+				}
+			case "enter":
+				m.view = helpMenuItems[m.helpMenuCursor].dest
+			default:
+				for _, it := range helpMenuItems {
+					if key == it.key {
+						m.view = it.dest
+					}
+				}
+			}
+			return m, nil
+
+		case viewHelpText, viewDisclaimerText, viewLogText:
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.view = viewHelpMenu
+				return m, nil
 			}
 			return m, nil
 
@@ -1959,6 +2109,16 @@ func (m model) renderBody() string {
 		return box.Render(m.renderTable())
 	case viewDeviceInfo:
 		return box.Render(m.renderDeviceInfo())
+	case viewHelpMenu:
+		return box.Render(m.renderHelpMenu())
+	case viewHelpText:
+		return box.Render(renderHelpText())
+	case viewDisclaimerText:
+		return box.Render(renderDisclaimerText())
+	case viewLogText:
+		return box.Render(renderLogText())
+	case viewFirstRunDisclaimer:
+		return box.Render(renderFirstRunDisclaimer())
 	}
 
 	var b strings.Builder
@@ -2031,6 +2191,86 @@ func (m model) renderBenchTable(count int) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+func (m model) renderHelpMenu() string {
+	var b strings.Builder
+	b.WriteString("help / disclaimer / log\n\n")
+	for i, it := range helpMenuItems {
+		line := fmt.Sprintf("[%s] %s", it.key, it.label)
+		if i == m.helpMenuCursor {
+			b.WriteString(selectedStyle.Render("> " + line))
+		} else {
+			b.WriteString(unselectedStyle.Render("  " + line))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\nUp/Down + Enter, or press the letter shown. Esc: back to main menu.\n")
+	return b.String()
+}
+
+func renderHelpText() string {
+	return `help
+
+llama-shell is a terminal UI shell for ollama.
+
+Every screen supports Up/Down + Enter for navigation, in addition to the
+letter shortcut shown in brackets. Esc goes back one level; ctrl+c always
+quits immediately.
+
+Main menu
+  l  list models     - browse ollama (local + library) and huggingface,
+                        search by typing, Enter to download a model
+  p  running models   - live ollama ps, Enter to stop a selected model
+  s  show model info  - full details for every installed model, Enter
+                        to run/remove/stop a selected one
+  d  device info      - this machine's specs; 'b' benchmarks every
+                        installed model's CPU/GPU split
+  h  this menu        - help, disclaimer, activity log
+  q  quit
+
+Tips
+  - "list models" search box: just start typing to filter, Esc clears it.
+  - Downloads show a live progress bar; press 'c' to cancel mid-download.
+  - The device-info benchmark loads and unloads every model in turn to
+    measure its CPU/GPU split - it's slow by nature; cancel any time with
+    'c' and whatever was measured so far is kept.
+
+Esc: back
+`
+}
+
+const disclaimerBody = `llama-shell is an independent, unofficial tool. It is not affiliated
+with, endorsed by, or sponsored by Ollama Inc., Hugging Face, or any
+model author listed in its catalogs. "Ollama" and any other product
+names referenced are the property of their respective owners.
+
+License. This software is source-available for viewing and personal
+use only. You may read the code and run it, but you may not modify it
+or redistribute a modified version - see the LICENSE file in the
+repository for the exact terms.
+
+No warranty. This software is provided "as is", without warranty of
+any kind, express or implied, including but not limited to the
+warranties of merchantability, fitness for a particular purpose, and
+noninfringement. In no event shall the authors be liable for any
+claim, damages, or other liability arising from, out of, or in
+connection with the software or its use.
+
+Use at your own risk - in particular, the "remove" and "stop" actions
+call ollama directly and are not reversible from within this app.`
+
+func renderDisclaimerText() string {
+	return "disclaimer\n\n" + disclaimerBody + "\n\nEsc: back\n"
+}
+
+func renderFirstRunDisclaimer() string {
+	return "disclaimer — please read before continuing\n\n" + disclaimerBody +
+		"\n\nYou must agree to continue.\n\n[a] I agree, continue    [q] quit\n"
+}
+
+func renderLogText() string {
+	return "activity log (most recent entries)\n\n" + readLogTail(200) + "\n\nEsc: back\n"
 }
 
 func (m model) renderDeviceInfo() string {

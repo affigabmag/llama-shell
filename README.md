@@ -33,7 +33,10 @@ The footer shows this build timestamp (there's no semantic version — it's a li
 | `p` | Running models |
 | `s` | Show model info |
 | `d` | Device info |
+| `h` | Help / disclaimer / log |
 | `q` | Quit |
+
+On first launch, the app shows the disclaimer and requires `[a] I agree` before continuing — declining (any other key) quits the app.
 
 ### List models (`l`)
 
@@ -90,3 +93,7 @@ Static machine info: OS/arch, CPU model, logical core count, RAM, per-drive used
 
 - GPU detection for the benchmark's CPU/GPU split comes from `ollama ps`, which only reports an aggregate percentage — it doesn't distinguish which physical GPU on a multi-GPU machine. On Windows, ollama only has a CUDA backend, so in practice "GPU" always means the NVIDIA card if present; integrated GPUs (Intel, etc.) are listed in Device Info but never used by ollama.
 - Only ollama + Hugging Face are treated as real model sources. LM Studio, llama.cpp, koboldcpp, text-generation-webui etc. don't maintain their own catalogs (they all consume HF), so they'd just be aliases for the same HF listing. GPT4All does have its own catalog but runs through a different engine entirely — it's not wired up here since none of this app's actions (`run`/`kill`/`remove`) would work against it.
+
+## License
+
+Source-available, view-only — see [LICENSE](LICENSE). You can read the code and run it for personal use, but you may not modify it or redistribute a modified version. Provided with no warranty of any kind. Not affiliated with or endorsed by Ollama Inc. or Hugging Face. On first launch, the app requires you to accept this disclaimer before continuing (`help / disclaimer / log` in the main menu to review it again later).

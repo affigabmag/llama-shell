@@ -3,6 +3,32 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Help / Disclaimer / Log (`h`) — new menu item
+- Added a submenu with three options:
+  - `[h]` read help — keybindings and screen-by-screen usage notes.
+  - `[d]` disclaimer — not affiliated with Ollama Inc. or Hugging Face, no
+    warranty, and a note on the license's no-modification restriction.
+  - `[g]` view log — tails the app's own activity log (last 200 lines).
+- Added real activity logging (`%LocalAppData%\llama-shell\activity.log`):
+  downloads (success/fail/abort), removes, stops (from both the running-models
+  and show-model-info screens), interactive runs, and every benchmark
+  start/per-model result/cancel/complete.
+- Added a first-run gate: on first launch (checked via a marker file), the
+  full disclaimer is shown with a single way forward — `[a] I agree` to
+  continue, anything else (`q`/`Esc`/`ctrl+c`) quits without entering the app.
+  Accepted once, never shown again on that machine.
+
+## Licensing
+- Switched from MIT to a custom source-available, view-only license: reading
+  the code and running it is permitted, modifying it or redistributing a
+  modified version is not. No warranty, all rights otherwise reserved. Not an
+  OSI-approved open-source license by design — noted explicitly in the
+  LICENSE file and in the in-app disclaimer.
+
+## Repo
+- Initialized git, pushed to a new public GitHub repo
+  (`github.com/affigabmag/llama-shell`), first release cut as `v0.1.0`.
+
 ## Scaffolding
 - Initial project: Go + Bubble Tea + Lipgloss chosen over Rust/Python/Node for
   fast iteration, mature TUI ecosystem, single static cross-platform binary.
