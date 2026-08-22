@@ -1,9 +1,9 @@
 # llama-shell
 
-A terminal UI (TUI) shell for [Ollama](https://ollama.com), written in Go with
-
+A terminal UI (TUI) shell for [Ollama](https://ollama.com), written in Go with 
 [Bubble Tea](https://github.com/charmbracelet/bubbletea) + [Lipgloss](https://github.com/charmbracelet/lipgloss).
 Single static executable, no runtime dependencies.
+
 <img width="1113" height="626" alt="image" src="https://github.com/user-attachments/assets/14a70184-6333-44b4-8992-7f8b92d9bd38" />
 <img width="1113" height="626" alt="image" src="https://github.com/user-attachments/assets/71dcccef-e5c3-4dcf-a1d0-29b2fac7bedf" />
 
