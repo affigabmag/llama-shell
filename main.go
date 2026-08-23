@@ -1,10 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,9 +30,224 @@ import (
 )
 
 // buildTime is overridden at build time via:
-//   go build -ldflags "-X main.buildTime=<value>"
+//
+//	go build -ldflags "-X main.buildTime=<value>"
+//
 // Falls back to "dev" for a plain `go build` with no ldflags.
 var buildTime = "dev"
+
+// appVersion is overridden at build time via:
+//
+//	go build -ldflags "-X main.appVersion=v0.1.0"
+//
+// tied to the git tag a release is cut from. Falls back to "dev" for a
+// plain `go build`, in which case the update checker never reports an
+// update — there is no baseline version to compare against.
+var appVersion = "dev"
+
+const updateRepoAPI = "https://api.github.com/repos/affigabmag/llama-shell/releases/latest"
+
+// updateAssetName is the release-asset naming convention actually used by
+// github.com/affigabmag/llama-shell releases: a per-platform zip (e.g.
+// "llama-shell-windows-amd64.zip") containing the binary — "llama-shell.exe"
+// on Windows, "llama-shell" on macOS/Linux.
+func updateAssetName(goos, goarch string) string {
+	return fmt.Sprintf("llama-shell-%s-%s.zip", goos, goarch)
+}
+
+// updateBinaryNameInZip is the file name of the binary inside that zip.
+func updateBinaryNameInZip(goos string) string {
+	if goos == "windows" {
+		return "llama-shell.exe"
+	}
+	return "llama-shell"
+}
+
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+type updateCheckResultMsg struct {
+	latestVersion string
+	assetURL      string
+	err           string
+}
+
+// checkForUpdate hits the GitHub releases API once and reports whether a
+// newer version than the running binary is available for this OS/arch.
+// Silently reports nothing actionable when appVersion is "dev" (no
+// ldflag-injected baseline to compare against).
+func checkForUpdate() tea.Cmd {
+	return func() tea.Msg {
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(updateRepoAPI)
+		if err != nil {
+			return updateCheckResultMsg{err: err.Error()}
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return updateCheckResultMsg{err: err.Error()}
+		}
+		if resp.StatusCode != 200 {
+			return updateCheckResultMsg{err: fmt.Sprintf("status %d", resp.StatusCode)}
+		}
+		var rel githubRelease
+		if err := json.Unmarshal(data, &rel); err != nil {
+			return updateCheckResultMsg{err: err.Error()}
+		}
+		want := updateAssetName(runtime.GOOS, runtime.GOARCH)
+		assetURL := ""
+		for _, a := range rel.Assets {
+			if a.Name == want {
+				assetURL = a.BrowserDownloadURL
+				break
+			}
+		}
+		return updateCheckResultMsg{latestVersion: rel.TagName, assetURL: assetURL}
+	}
+}
+
+// isNewerVersion reports whether latest differs from current, treating a
+// missing/"dev" current version as nothing to compare against.
+func isNewerVersion(current, latest string) bool {
+	if current == "" || current == "dev" || latest == "" {
+		return false
+	}
+	norm := func(v string) string { return strings.TrimPrefix(strings.TrimSpace(v), "v") }
+	return norm(current) != norm(latest)
+}
+
+type updateApplyResultMsg struct {
+	err     string
+	message string
+}
+
+// applyUpdate downloads the matching release asset and swaps it in for the
+// running executable. Linux/macOS allow an atomic rename over a running
+// binary's file (the kernel keeps the old inode open until the process
+// exits), so one os.Rename does it. Windows locks the running exe against
+// being overwritten or renamed onto, so it takes two steps: rename the
+// running exe out of the way first, then rename the new one into place;
+// the leftover ".old" file is cleaned up on next startup.
+func applyUpdate(assetURL string) tea.Cmd {
+	return func() tea.Msg {
+		exePath, err := os.Executable()
+		if err != nil {
+			return updateApplyResultMsg{err: err.Error()}
+		}
+		exePath, err = filepath.EvalSymlinks(exePath)
+		if err != nil {
+			return updateApplyResultMsg{err: err.Error()}
+		}
+		return applyUpdateAt(exePath, assetURL)
+	}
+}
+
+// applyUpdateAt does the actual download/extract/swap for exePath, split
+// out from applyUpdate so the swap mechanics can be exercised directly
+// against a throwaway binary in tests instead of the real running exe.
+func applyUpdateAt(exePath, assetURL string) updateApplyResultMsg {
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Get(assetURL)
+	if err != nil {
+		return updateApplyResultMsg{err: err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return updateApplyResultMsg{err: fmt.Sprintf("download failed: status %d", resp.StatusCode)}
+	}
+
+	// Release assets are zips (see updateAssetName) containing the
+	// binary alongside e.g. README/LICENSE — download to a temp zip
+	// file first since zip.OpenReader needs a seekable file, not a
+	// streaming response body.
+	zipPath := exePath + ".update.zip"
+	zipOut, err := os.Create(zipPath)
+	if err != nil {
+		return updateApplyResultMsg{err: err.Error()}
+	}
+	if _, err := io.Copy(zipOut, resp.Body); err != nil {
+		zipOut.Close()
+		os.Remove(zipPath)
+		return updateApplyResultMsg{err: err.Error()}
+	}
+	zipOut.Close()
+	defer os.Remove(zipPath)
+
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return updateApplyResultMsg{err: "couldn't open downloaded zip: " + err.Error()}
+	}
+	defer zr.Close()
+
+	wantName := updateBinaryNameInZip(runtime.GOOS)
+	var binFile *zip.File
+	for _, f := range zr.File {
+		if filepath.Base(f.Name) == wantName {
+			binFile = f
+			break
+		}
+	}
+	if binFile == nil {
+		return updateApplyResultMsg{err: fmt.Sprintf("no %q found inside the downloaded zip", wantName)}
+	}
+
+	rc, err := binFile.Open()
+	if err != nil {
+		return updateApplyResultMsg{err: err.Error()}
+	}
+	defer rc.Close()
+
+	newPath := exePath + ".new"
+	out, err := os.Create(newPath)
+	if err != nil {
+		return updateApplyResultMsg{err: err.Error()}
+	}
+	if _, err := io.Copy(out, rc); err != nil {
+		out.Close()
+		os.Remove(newPath)
+		return updateApplyResultMsg{err: err.Error()}
+	}
+	out.Close()
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(newPath, 0o755)
+	}
+
+	if runtime.GOOS == "windows" {
+		oldPath := exePath + ".old"
+		os.Remove(oldPath) // leftover from a previous update, if any
+		if err := os.Rename(exePath, oldPath); err != nil {
+			os.Remove(newPath)
+			return updateApplyResultMsg{err: "couldn't move running exe aside: " + err.Error()}
+		}
+		if err := os.Rename(newPath, exePath); err != nil {
+			return updateApplyResultMsg{err: "couldn't move new exe into place: " + err.Error()}
+		}
+	} else {
+		if err := os.Rename(newPath, exePath); err != nil {
+			os.Remove(newPath)
+			return updateApplyResultMsg{err: err.Error()}
+		}
+	}
+
+	return updateApplyResultMsg{message: "Updated. Restart llama-shell to use the new version."}
+}
+
+// cleanupOldExe removes a ".old" file left behind by a prior Windows
+// update swap (see applyUpdate) — harmless no-op on other OSes or when
+// there's nothing to clean up.
+func cleanupOldExe() {
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	_ = os.Remove(exePath + ".old")
+}
 
 // bannerGlyph is a 5-row-tall block letter. Every row must be the same
 // width so letters line up; a blank glyph (the space between words) is
@@ -103,10 +320,12 @@ const (
 	viewHelpText
 	viewDisclaimerText
 	viewLogText
+	viewUpdateText
 	viewFirstRunDisclaimer
 	viewAgentChat
 	viewToolCategories
 	viewAgentHelp
+	viewOllamaInstallPrompt
 )
 
 type cmdResultMsg struct {
@@ -188,7 +407,7 @@ type clipboardPasteMsg struct {
 
 // pasteFromClipboard grabs whatever is on the Windows clipboard — an image
 // (screenshot, copied picture) takes priority and gets saved to a temp PNG,
-// otherwise falls back to plain text — so Ctrl+V in agentic chat works for
+// otherwise falls back to plain text — so Alt+V in agentic chat works for
 // both without the user needing to know which one is on the clipboard.
 func pasteFromClipboard() tea.Cmd {
 	return func() tea.Msg {
@@ -203,7 +422,10 @@ if ($img) {
 } else {
   Write-Output ([System.Windows.Forms.Clipboard]::GetText())
 }`
-		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+		// -sta is required: System.Windows.Forms.Clipboard throws
+		// "current thread must be set to single thread apartment" without
+		// it, since PowerShell's default -Command execution is MTA.
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-sta", "-Command", script).CombinedOutput()
 		if err != nil {
 			return clipboardPasteMsg{err: strings.TrimSpace(string(out))}
 		}
@@ -619,6 +841,138 @@ func agentTools() []ollamaTool {
 			Description: "List Ollama models currently loaded in memory (`ollama ps`).",
 			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "take_screenshot",
+			Description: "Capture the current screen and attach it as an image for you to see directly (requires a vision-capable model).",
+			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "view_image",
+			Description: "Read an existing local image file and attach it for you to see directly (requires a vision-capable model) — use this to look at a screenshot, photo, or diagram already on disk.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"path": strProp("Image file path, relative to the working directory or absolute.")},
+				"required":   []string{"path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "read_pdf",
+			Description: "Extract text from a PDF file. Requires poppler's `pdftotext` to be installed and on PATH.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"path": strProp("PDF file path, relative to the working directory or absolute.")},
+				"required":   []string{"path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "http_post",
+			Description: "POST a request body to a URL over HTTP(S) and return the response as text (truncated if large).",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"url":          strProp("URL to POST to."),
+					"body":         strProp("Request body to send."),
+					"content_type": strProp("Content-Type header, e.g. \"application/json\". Defaults to application/json if omitted."),
+				},
+				"required": []string{"url", "body"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "download_file",
+			Description: "Download a URL's contents directly to a local file.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"url":  strProp("URL to download."),
+					"path": strProp("Destination file path, relative to the working directory or absolute."),
+				},
+				"required": []string{"url", "path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "send_notification",
+			Description: "Show a system notification/message dialog to the user on this machine.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"title":   strProp("Notification title."),
+					"message": strProp("Notification body text."),
+				},
+				"required": []string{"title", "message"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "read_registry",
+			Description: "Read a Windows registry key's values (read-only).",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"key": strProp("Registry key path, e.g. \"HKLM:\\Software\\Microsoft\\Windows NT\\CurrentVersion\".")},
+				"required":   []string{"key"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "run_sql",
+			Description: "Run a read/write SQL query against a local SQLite database file. Requires the `sqlite3` CLI to be installed and on PATH.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"db_path": strProp("SQLite database file path, relative to the working directory or absolute."),
+					"query":   strProp("SQL query to run."),
+				},
+				"required": []string{"db_path", "query"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "read_csv",
+			Description: "Read a CSV file and return it formatted as an aligned table.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"path": strProp("CSV file path, relative to the working directory or absolute.")},
+				"required":   []string{"path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "read_json",
+			Description: "Read a JSON file and return it pretty-printed and validated.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"path": strProp("JSON file path, relative to the working directory or absolute.")},
+				"required":   []string{"path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "git_commit",
+			Description: "Stage all changes and create a git commit with the given message.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path":    strProp("Path to the git repository. Use \".\" for the working directory."),
+					"message": strProp("Commit message."),
+				},
+				"required": []string{"path", "message"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "git_branch",
+			Description: "List git branches, or create and switch to a new one if a name is given.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": strProp("Path to the git repository. Use \".\" for the working directory."),
+					"name": strProp("Name of a new branch to create and switch to. Omit to just list existing branches."),
+				},
+				"required": []string{"path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "pull_ollama_model",
+			Description: "Download an Ollama model (`ollama pull`).",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"name": strProp("Model name to pull, e.g. \"llama3.2:1b\".")},
+				"required":   []string{"name"},
+			},
+		}},
 	}
 }
 
@@ -717,6 +1071,46 @@ func webSearch(query string) (string, error) {
 		return "(no results)", nil
 	}
 	return b.String(), nil
+}
+
+// executeAgentToolWithImages wraps executeAgentTool for the two tools that
+// need to hand image bytes back to the model (take_screenshot, view_image),
+// which executeAgentTool's plain string return can't carry. Everything else
+// delegates straight through with no images.
+func executeAgentToolWithImages(workDir, name string, args map[string]interface{}) (string, []string) {
+	switch name {
+	case "take_screenshot":
+		const script = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$path = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'llama-shell-shot-' + [guid]::NewGuid().ToString('N') + '.png')
+$bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+Write-Output $path`
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-sta", "-Command", script).CombinedOutput()
+		if err != nil {
+			return "error: " + err.Error() + "\n" + string(out), nil
+		}
+		path := strings.TrimSpace(string(out))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "error reading captured screenshot: " + err.Error(), nil
+		}
+		_ = os.Remove(path)
+		return "captured screenshot (attached as an image)", []string{base64.StdEncoding.EncodeToString(data)}
+
+	case "view_image":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return "error: " + err.Error(), nil
+		}
+		return "attached " + full + " as an image", []string{base64.StdEncoding.EncodeToString(data)}
+	}
+	return executeAgentTool(workDir, name, args), nil
 }
 
 func executeAgentTool(workDir, name string, args map[string]interface{}) string {
@@ -863,6 +1257,9 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 
 	case "open_url":
 		url := toolArgString(args, "url")
+		if !strings.Contains(url, "://") {
+			url = "https://" + url
+		}
 		if err := exec.Command("cmd", "/c", "start", "", url).Start(); err != nil {
 			return "error: " + err.Error()
 		}
@@ -1028,7 +1425,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 	case "compress_zip":
 		src := resolveAgentPath(workDir, toolArgString(args, "path"))
 		dst := resolveAgentPath(workDir, toolArgString(args, "zip_path"))
-		psCmd := fmt.Sprintf("Compress-Archive -Path '%s' -DestinationPath '%s' -Force", src, dst)
+		psCmd := fmt.Sprintf("Compress-Archive -Path '%s' -DestinationPath '%s' -Force", psQuote(src), psQuote(dst))
 		if out, err := exec.Command("powershell", "-NoProfile", "-Command", psCmd).CombinedOutput(); err != nil {
 			return "error: " + err.Error() + "\n" + string(out)
 		}
@@ -1037,7 +1434,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 	case "extract_zip":
 		src := resolveAgentPath(workDir, toolArgString(args, "zip_path"))
 		dst := resolveAgentPath(workDir, toolArgString(args, "dest"))
-		psCmd := fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", src, dst)
+		psCmd := fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", psQuote(src), psQuote(dst))
 		if out, err := exec.Command("powershell", "-NoProfile", "-Command", psCmd).CombinedOutput(); err != nil {
 			return "error: " + err.Error() + "\n" + string(out)
 		}
@@ -1138,9 +1535,217 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		}
 		return string(out)
 
+	case "read_pdf":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		out, err := exec.Command("pdftotext", full, "-").CombinedOutput()
+		if err != nil {
+			return "error: " + err.Error() + " (requires poppler's pdftotext on PATH)\n" + string(out)
+		}
+		return truncateToolOutput(string(out))
+
+	case "http_post":
+		contentType := toolArgString(args, "content_type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		client := &http.Client{Timeout: 20 * time.Second}
+		resp, err := client.Post(toolArgString(args, "url"), contentType, strings.NewReader(toolArgString(args, "body")))
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return truncateToolOutput(fmt.Sprintf("status %d\n%s", resp.StatusCode, string(data)))
+
+	case "download_file":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Get(toolArgString(args, "url"))
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		defer resp.Body.Close()
+		out, err := os.Create(full)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		defer out.Close()
+		n, err := io.Copy(out, resp.Body)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return fmt.Sprintf("downloaded %d bytes to: %s", n, full)
+
+	case "send_notification":
+		psCmd := fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; "+
+			"[System.Windows.Forms.MessageBox]::Show(%s, %s) | Out-Null",
+			toolArgQuoted(args, "message"), toolArgQuoted(args, "title"))
+		if out, err := exec.Command("powershell", "-NoProfile", "-Command", psCmd).CombinedOutput(); err != nil {
+			return "error: " + err.Error() + "\n" + string(out)
+		}
+		return "notification shown"
+
+	case "read_registry":
+		psCmd := fmt.Sprintf("Get-ItemProperty -Path '%s' | Format-List", psQuote(toolArgString(args, "key")))
+		out, err := exec.Command("powershell", "-NoProfile", "-Command", psCmd).CombinedOutput()
+		if err != nil {
+			return "error: " + err.Error() + "\n" + string(out)
+		}
+		return truncateToolOutput(string(out))
+
+	case "run_sql":
+		full := resolveAgentPath(workDir, toolArgString(args, "db_path"))
+		out, err := exec.Command("sqlite3", full, toolArgString(args, "query")).CombinedOutput()
+		if err != nil {
+			return "error: " + err.Error() + " (requires the sqlite3 CLI on PATH)\n" + string(out)
+		}
+		return truncateToolOutput(string(out))
+
+	case "read_csv":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		f, err := os.Open(full)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		defer f.Close()
+		rows, err := csv.NewReader(f).ReadAll()
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return truncateToolOutput(formatCSVTable(rows))
+
+	case "read_json":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		var v interface{}
+		if err := json.Unmarshal(data, &v); err != nil {
+			return "error: invalid JSON: " + err.Error()
+		}
+		pretty, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return truncateToolOutput(string(pretty))
+
+	case "git_commit":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		if out, err := exec.Command("git", "-C", full, "add", "-A").CombinedOutput(); err != nil {
+			return "error staging changes: " + err.Error() + "\n" + string(out)
+		}
+		out, err := exec.Command("git", "-C", full, "commit", "-m", toolArgString(args, "message")).CombinedOutput()
+		result := string(out)
+		if err != nil {
+			result += "\n(exit error: " + err.Error() + ")"
+		}
+		return result
+
+	case "git_branch":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		name := toolArgString(args, "name")
+		if name == "" {
+			out, err := exec.Command("git", "-C", full, "branch").CombinedOutput()
+			if err != nil {
+				return "error: " + err.Error() + "\n" + string(out)
+			}
+			return string(out)
+		}
+		out, err := exec.Command("git", "-C", full, "checkout", "-b", name).CombinedOutput()
+		result := string(out)
+		if err != nil {
+			result += "\n(exit error: " + err.Error() + ")"
+		}
+		return result
+
+	case "pull_ollama_model":
+		out, err := exec.Command("ollama", "pull", toolArgString(args, "name")).CombinedOutput()
+		result := string(out)
+		if err != nil {
+			result += "\n(exit error: " + err.Error() + ")"
+		}
+		return truncateToolOutput(result)
+
 	default:
 		return "error: unknown tool " + name
 	}
+}
+
+// toolArgQuoted returns a tool argument as a single-quoted PowerShell string
+// literal, with embedded single quotes escaped by doubling — for building
+// -Command strings safely from model-supplied text.
+func toolArgQuoted(args map[string]interface{}, key string) string {
+	return "'" + psQuote(toolArgString(args, key)) + "'"
+}
+
+// psQuote escapes single quotes in s by doubling them, for safe embedding
+// inside a single-quoted PowerShell string literal.
+func psQuote(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// formatCSVTable renders parsed CSV rows as a plain aligned text table.
+func formatCSVTable(rows [][]string) string {
+	if len(rows) == 0 {
+		return "(empty)"
+	}
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < len(widths) && len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+	var b strings.Builder
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < len(widths) {
+				b.WriteString(cell)
+				if i < len(row)-1 {
+					b.WriteString(strings.Repeat(" ", widths[i]-len(cell)+2))
+				}
+			}
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+type agentWarmupMsg struct {
+	ready bool
+	err   string
+}
+
+// warmupPollOllama checks `ollama ps` for whether modelName is already
+// loaded into memory, so the chat can show a "connecting..." vs "ready"
+// status without competing with the user's own first message for the
+// model slot. An earlier version fired its own throwaway generate request
+// to force-detect readiness, but that raced with a real message sent while
+// the model was still cold-loading/being swapped in and corrupted that
+// turn (confirmed: removing the extra request fixed a vision regression) —
+// polling `ollama ps` only ever reads state, it never triggers a request.
+func warmupPollOllama(modelName string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := exec.Command("ollama", "ps").CombinedOutput()
+		if err != nil {
+			return agentWarmupMsg{err: err.Error()}
+		}
+		return agentWarmupMsg{ready: strings.Contains(string(out), modelName)}
+	}
+}
+
+// warmupPollTick schedules the next warmupPollOllama check — used while
+// still "pending" so the status flips to "ready" shortly after the model
+// actually finishes loading, without ever issuing a competing request.
+func warmupPollTick(modelName string) tea.Cmd {
+	return tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg {
+		return warmupPollOllama(modelName)()
+	})
 }
 
 // ollamaChatStream sends one /api/chat request with stream:true. Ollama's
@@ -1170,6 +1775,7 @@ func ollamaChatStream(modelName string, messages []ollamaChatMsg, tools []ollama
 	var final ollamaChatMsg
 	final.Role = "assistant"
 	var content strings.Builder
+	sawDone := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
@@ -1191,11 +1797,21 @@ func ollamaChatStream(modelName string, messages []ollamaChatMsg, tools []ollama
 			final.ToolCalls = chunk.Message.ToolCalls
 		}
 		if chunk.Done {
+			sawDone = true
 			break
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return ollamaChatMsg{}, err
+	}
+	// The stream ended (EOF, no read error) but never sent its final
+	// done:true chunk — the connection was cut mid-response, almost always
+	// because the ollama/llama-server backend crashed or was killed while
+	// generating (e.g. the 0xC0000409 stack-overrun crash seen with some
+	// models). Without this check that silently looked like a successful
+	// empty reply: no error, no content, nothing shown to the user at all.
+	if !sawDone {
+		return ollamaChatMsg{}, fmt.Errorf("ollama's response stream ended unexpectedly without finishing (the model/backend likely crashed mid-generation — check if `ollama ps` still shows it running)")
 	}
 	final.Content = content.String()
 	return final, nil
@@ -1241,7 +1857,12 @@ func agentTickCmd() tea.Cmd {
 // them locally and feed the results back, until it replies with plain
 // content or maxSteps is hit. Runs in a goroutine and reports back over a
 // channel so the UI can update live as tokens arrive.
-func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool) tea.Cmd {
+// suppressTools disables tools for just this one turn without touching the
+// model's underlying toolsSupported capability flag — used for "auto" tool
+// mode, which skips tools on any turn that attaches an image (see the call
+// site for why) but must not let that turn's request permanently forget the
+// model actually does support tools once no image is involved.
+func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool, suppressTools bool) tea.Cmd {
 	ch := make(chan tea.Msg)
 	go func() {
 		msgs := append([]ollamaChatMsg(nil), history...)
@@ -1268,7 +1889,7 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 		const maxSteps = 8
 		for i := 0; i < maxSteps; i++ {
 			var tools []ollamaTool
-			if toolsSupported {
+			if toolsSupported && !suppressTools {
 				tools = agentTools()
 			}
 			reply, err := attempt(tools)
@@ -1290,8 +1911,8 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 				break
 			}
 			for _, tc := range reply.ToolCalls {
-				toolResult := executeAgentTool(workDir, tc.Function.Name, tc.Function.Arguments)
-				msgs = append(msgs, ollamaChatMsg{Role: "tool", Content: toolResult})
+				toolResult, toolImages := executeAgentToolWithImages(workDir, tc.Function.Name, tc.Function.Arguments)
+				msgs = append(msgs, ollamaChatMsg{Role: "tool", Content: toolResult, Images: toolImages})
 			}
 			ch <- agentStepMsg{ch: ch, messages: append([]ollamaChatMsg(nil), msgs...), toolsSupported: toolsSupported}
 		}
@@ -2363,6 +2984,58 @@ func checkOllama() ollamaStatus {
 	return ollamaStatus{installed: true, version: v}
 }
 
+type ollamaInstallResultMsg struct {
+	output string
+	err    string
+}
+
+// installOllama runs the best available unattended install path per OS.
+// Linux uses Ollama's official one-line installer script. macOS and
+// Windows don't offer a silent/scriptable install (the official
+// distribution is a signed .app / .exe installer meant to be run
+// interactively), so those just open the download page instead of trying
+// to fake an unattended install.
+func installOllama() tea.Cmd {
+	return func() tea.Msg {
+		switch runtime.GOOS {
+		case "linux":
+			out, err := exec.Command("sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh").CombinedOutput()
+			if err != nil {
+				return ollamaInstallResultMsg{output: string(out), err: err.Error()}
+			}
+			return ollamaInstallResultMsg{output: string(out)}
+		case "darwin":
+			openErr := openInBrowser("https://ollama.com/download/mac")
+			msg := "Opened https://ollama.com/download/mac — download and run the installer, then relaunch llama-shell."
+			if openErr != nil {
+				msg = "Couldn't open a browser automatically. Download and install Ollama from https://ollama.com/download/mac, then relaunch llama-shell."
+			}
+			return ollamaInstallResultMsg{output: msg}
+		default: // windows and anything else
+			openErr := openInBrowser("https://ollama.com/download/windows")
+			msg := "Opened https://ollama.com/download/windows — download and run the installer, then relaunch llama-shell."
+			if openErr != nil {
+				msg = "Couldn't open a browser automatically. Download and install Ollama from https://ollama.com/download/windows, then relaunch llama-shell."
+			}
+			return ollamaInstallResultMsg{output: msg}
+		}
+	}
+}
+
+// openInBrowser opens a URL with the OS's default handler — same mechanism
+// as the open_url agent tool, duplicated here to avoid a dependency from
+// this early-startup path into the agent-tool code.
+func openInBrowser(url string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		return exec.Command("open", url).Start()
+	default:
+		return exec.Command("xdg-open", url).Start()
+	}
+}
+
 type menuItem struct {
 	key   string
 	label string
@@ -2373,7 +3046,7 @@ var menuItems = []menuItem{
 	{"p", "running models    (ollama ps)"},
 	{"s", "show model info   (scan all + cache)"},
 	{"d", "device info       (cpu/ram/disk/gpu)"},
-	{"h", "help / disclaimer / log"},
+	{"h", "help / disclaimer / log / update"},
 	{"q", "quit"},
 }
 
@@ -2387,6 +3060,7 @@ var helpMenuItems = []helpMenuItem{
 	{"h", "read help", viewHelpText},
 	{"d", "disclaimer (no warranty)", viewDisclaimerText},
 	{"g", "view log", viewLogText},
+	{"u", "update", viewUpdateText},
 }
 
 type model struct {
@@ -2419,18 +3093,37 @@ type model struct {
 	helpMenuCursor int
 	helpScroll     int
 
-	scanRows  []modelRow
-	scanTotal int
-	scanDone  int
-	scanErr   string
-	fromCache bool
+	ollamaInstallRunning bool
+	ollamaInstallResult  string
+	ollamaInstallErr     string
+
+	updateChecked     bool
+	updateAvailable   bool
+	updateLatest      string
+	updateAssetURL    string
+	updateCheckErr    string
+	updateDownloading bool
+	updateResult      string
+	updateResultErr   string
+
+	agentPasting     bool
+	agentPasteNotice string
+
+	toolCatCursor  int
+	toolDetailOpen bool
+
+	scanRows   []modelRow
+	scanTotal  int
+	scanDone   int
+	scanErr    string
+	fromCache  bool
 	scanCursor int
 
-	scanAction     bool
-	scanActionSel  int
-	scanBusy       bool
-	scanBusyLabel  string
-	scanActionMsg  string
+	scanAction    bool
+	scanActionSel int
+	scanBusy      bool
+	scanBusyLabel string
+	scanActionMsg string
 
 	catalogRows   []catalogRow
 	catalogStage  int
@@ -2452,12 +3145,12 @@ type model struct {
 	sizeSelectOptions []string
 	sizeSelectCursor  int
 
-	psRows       []psRow
-	psCursor     int
-	psErr        string
-	psKillTarget string
-	psKilling    bool
-	psKillMsg    string
+	psRows        []psRow
+	psCursor      int
+	psErr         string
+	psKillTarget  string
+	psKilling     bool
+	psKillMsg     string
 	psConfirmKill bool
 
 	// Agentic chat (own agent, read/write files), started from the
@@ -2466,16 +3159,18 @@ type model struct {
 	agentWorkDir        string
 	agentCapabilities   string
 	agentToolsSupported bool
-	agentMessages  []ollamaChatMsg
-	agentInput     string
-	agentBusy      bool
-	agentErr       string
-	agentSpinner   int
-	agentStarted   time.Time
-	agentScroll    int // lines scrolled back from the bottom; 0 = live/latest
-	agentStreamBuf string
-	agentViewport  viewport.Model
-	agentVPReady   bool
+	agentToolMode       string // "auto" (default), "on", "off"
+	agentWarmup         string // "pending", "ready", or "error: ..."
+	agentMessages       []ollamaChatMsg
+	agentInput          string
+	agentBusy           bool
+	agentErr            string
+	agentSpinner        int
+	agentStarted        time.Time
+	agentScroll         int // lines scrolled back from the bottom; 0 = live/latest
+	agentStreamBuf      string
+	agentViewport       viewport.Model
+	agentVPReady        bool
 }
 
 func initialModel() model {
@@ -2489,7 +3184,7 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return checkForUpdate()
 }
 
 func (m model) enterMenu(sel string) (tea.Model, tea.Cmd) {
@@ -2793,7 +3488,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		next := msg.index + 1
 		return m, scanOne(next, m.scanRows[next])
 
+	case updateCheckResultMsg:
+		m.updateChecked = true
+		m.updateCheckErr = msg.err
+		m.updateLatest = msg.latestVersion
+		m.updateAssetURL = msg.assetURL
+		if msg.err == "" && isNewerVersion(appVersion, msg.latestVersion) {
+			m.updateAvailable = true
+			appendLog("update available: %s (current %s)", msg.latestVersion, appVersion)
+		}
+		return m, nil
+
+	case updateApplyResultMsg:
+		m.updateDownloading = false
+		if msg.err != "" {
+			m.updateResultErr = msg.err
+			appendLog("update failed: %s", msg.err)
+		} else {
+			m.updateResult = msg.message
+			m.updateAvailable = false
+			appendLog("update applied: %s", m.updateLatest)
+		}
+		return m, nil
+
+	case ollamaInstallResultMsg:
+		m.ollamaInstallRunning = false
+		if msg.err != "" {
+			m.ollamaInstallErr = strings.TrimSpace(msg.output + "\n" + msg.err)
+			appendLog("ollama install failed: %s", msg.err)
+		} else {
+			m.ollamaInstallResult = strings.TrimSpace(msg.output)
+			appendLog("ollama install finished")
+		}
+		return m, nil
+
+	case agentWarmupMsg:
+		if msg.err != "" {
+			m.agentWarmup = "error: " + msg.err
+			appendLog("model warmup check failed: %s", msg.err)
+			m.syncAgentViewport()
+			return m, nil
+		}
+		if msg.ready {
+			m.agentWarmup = "ready"
+			appendLog("model warmup complete: %s", m.agentModelName)
+			m.syncAgentViewport()
+			return m, nil
+		}
+		// Not loaded yet — keep polling as long as this same chat/model is
+		// still the active one, so leaving the chat or switching models
+		// doesn't leave a stray poll loop running forever.
+		if m.view == viewAgentChat && m.agentWarmup == "pending" {
+			return m, warmupPollTick(m.agentModelName)
+		}
+		return m, nil
+
 	case clipboardPasteMsg:
+		m.agentPasting = false
 		switch {
 		case msg.err != "":
 			m.agentErr = "clipboard paste failed: " + msg.err
@@ -2802,17 +3553,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentInput += " "
 			}
 			m.agentInput += msg.imagePath
+			m.agentPasteNotice = "pasted image: " + filepath.Base(msg.imagePath)
 			appendLog("pasted image from clipboard: %s", msg.imagePath)
 		case msg.text != "":
 			m.agentInput += msg.text
+			m.agentPasteNotice = "pasted clipboard text (" + strconv.Itoa(len(msg.text)) + " chars)"
+			appendLog("pasted clipboard text (%d chars)", len(msg.text))
+		default:
+			m.agentPasteNotice = "clipboard is empty"
 		}
 		return m, nil
 
 	case agentStreamDeltaMsg:
+		// A real token streaming in is the strongest possible proof the
+		// model is loaded and answering — overrides a stale "pending" from
+		// the ollama-ps poll (e.g. a name-format mismatch that never
+		// matches) so the status line can't say "loading" forever while
+		// answers are visibly arriving. Only resync the viewport on the
+		// transition into "ready", not on every single token.
+		if m.agentWarmup != "ready" {
+			m.agentWarmup = "ready"
+			m.syncAgentViewport()
+		}
 		m.agentStreamBuf += msg.delta
 		return m, waitForAgentStream(msg.ch)
 
 	case agentStepMsg:
+		m.agentWarmup = "ready" // a completed tool round proves the model answered
 		m.agentMessages = msg.messages
 		m.agentStreamBuf = ""
 		m.agentToolsSupported = msg.toolsSupported
@@ -2821,6 +3588,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentTurnDoneMsg:
 		m.agentBusy = false
+		if msg.err == "" {
+			m.agentWarmup = "ready"
+		}
 		m.agentMessages = msg.messages
 		// A turn error always wins. A clean turn leaves any warning already
 		// set this turn (e.g. "image not attached, file not found") alone
@@ -2909,6 +3679,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						// runAgentTurn if the model rejects the tools list.
 						m.agentToolsSupported = m.agentCapabilities == "" || m.agentCapabilities == "-" ||
 							strings.Contains(m.agentCapabilities, "too")
+						m.agentToolMode = "auto"
+						m.agentWarmup = "pending"
 						m.agentMessages = []ollamaChatMsg{
 							{Role: "system", Content: fmt.Sprintf(
 								"You are a coding assistant running locally with REAL, WORKING file system access "+
@@ -2948,7 +3720,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.syncAgentViewport()
 						m.view = viewAgentChat
 						appendLog("started agentic chat with %s", name)
-						return m, nil
+						return m, warmupPollOllama(name)
 					case 1:
 						m.scanBusy = true
 						m.scanBusyLabel = fmt.Sprintf("running %s...", name)
@@ -3002,7 +3774,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				appendLog("back to main menu")
 				m.view = viewMenu
 				return m, nil
-			case "ctrl+h":
+			case "alt+h":
 				appendLog("opened help")
 				m.view = viewHelpText
 				m.helpScroll = 0
@@ -3050,13 +3822,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var cmd tea.Cmd
 				m.agentViewport, cmd = m.agentViewport.Update(msg)
 				return m, cmd
-			case "ctrl+t":
+			case "alt+t":
 				appendLog("opened tool categories")
 				m.view = viewToolCategories
+				m.toolCatCursor = 0
+				m.toolDetailOpen = false
+				m.helpScroll = 0
 				return m, nil
-			case "ctrl+h":
+			case "alt+h":
 				appendLog("opened agent help")
 				m.view = viewAgentHelp
+				return m, nil
+			case "alt+m":
+				switch m.agentToolMode {
+				case "on":
+					m.agentToolMode = "off"
+				case "off":
+					m.agentToolMode = "auto"
+				default:
+					m.agentToolMode = "on"
+				}
+				m.agentPasteNotice = "tool mode: " + m.agentToolMode
+				appendLog("tool mode set to %s", m.agentToolMode)
 				return m, nil
 			}
 			if m.agentBusy {
@@ -3080,8 +3867,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				m.agentInput = ""
 				m.agentErr = ""
+				m.agentPasteNotice = ""
 				if len(missingPaths) > 0 {
-					m.agentErr = fmt.Sprintf("image not attached, file not found: %s (drag-and-drop managers like Ditto sometimes show a path that isn't a real file — use Ctrl+V to paste the image itself instead)", strings.Join(missingPaths, ", "))
+					m.agentErr = fmt.Sprintf("image not attached, file not found: %s (drag-and-drop managers like Ditto sometimes show a path that isn't a real file — use Alt+V to paste the image itself instead)", strings.Join(missingPaths, ", "))
 				}
 				m.agentBusy = true
 				m.agentStreamBuf = ""
@@ -3094,14 +3882,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					appendLog("agent chat message: %s", truncateName(text, 80))
 				}
-				return m, tea.Batch(runAgentTurn(m.agentModelName, m.agentMessages, m.agentWorkDir, m.agentToolsSupported), agentTickCmd())
+				// "auto" (the default) skips tools on any turn that attaches an
+				// image: Ollama's tool-calling chat template garbles image
+				// tokens for at least gemma4:e2b (confirmed directly against
+				// /api/chat — the same image decodes fine without `tools` in
+				// the request, and comes back "unreadable/corrupted" with it),
+				// so a turn can have working vision or working tools, not
+				// reliably both. "on" always tries tools anyway (the user's
+				// explicit override); "off" never does. This only suppresses
+				// tools for THIS turn — it never touches agentToolsSupported,
+				// so the model's real tool-calling capability is remembered
+				// correctly for the next image-free message.
+				suppressTools := m.agentToolMode == "off" ||
+					(m.agentToolMode == "auto" && len(imagePaths) > 0)
+				return m, tea.Batch(runAgentTurn(m.agentModelName, m.agentMessages, m.agentWorkDir, m.agentToolsSupported, suppressTools), agentTickCmd())
 			case "backspace":
 				if len(m.agentInput) > 0 {
 					r := []rune(m.agentInput)
 					m.agentInput = string(r[:len(r)-1])
 				}
 				return m, nil
-			case "ctrl+v":
+			case "alt+v":
+				m.agentPasting = true
+				m.agentPasteNotice = ""
 				return m, pasteFromClipboard()
 			default:
 				if len(key) == 1 || key == "space" {
@@ -3118,8 +3921,78 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+c":
 				appendLog("quit")
 				return m, tea.Quit
-			case "esc", "ctrl+t":
+			case "esc":
+				if m.toolDetailOpen {
+					m.toolDetailOpen = false
+					return m, nil
+				}
 				m.view = viewAgentChat
+				return m, nil
+			case "alt+t":
+				m.view = viewAgentChat
+				return m, nil
+			case "enter":
+				if !m.toolDetailOpen {
+					m.toolDetailOpen = true
+					appendLog("viewed tool detail: %s", m.selectedToolName())
+				}
+				return m, nil
+			case "tab":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				names := flatToolNames()
+				m.toolCatCursor = (m.toolCatCursor + 1) % len(names)
+				m.ensureToolCursorVisible()
+				return m, nil
+			case "shift+tab":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				names := flatToolNames()
+				m.toolCatCursor = (m.toolCatCursor - 1 + len(names)) % len(names)
+				m.ensureToolCursorVisible()
+				return m, nil
+			case "up", "k":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				m.helpScroll--
+				m.clampHelpScroll()
+				return m, nil
+			case "down", "j":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				m.helpScroll++
+				m.clampHelpScroll()
+				return m, nil
+			case "pgup":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				m.helpScroll -= helpPageLines(m.height)
+				m.clampHelpScroll()
+				return m, nil
+			case "pgdown":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				m.helpScroll += helpPageLines(m.height)
+				m.clampHelpScroll()
+				return m, nil
+			case "home":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				m.helpScroll = 0
+				return m, nil
+			case "end":
+				if m.toolDetailOpen {
+					return m, nil
+				}
+				m.helpScroll = 1 << 30
+				m.clampHelpScroll()
 				return m, nil
 			}
 			return m, nil
@@ -3129,7 +4002,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+c":
 				appendLog("quit")
 				return m, tea.Quit
-			case "esc", "ctrl+h":
+			case "esc", "alt+h":
 				m.view = viewAgentChat
 				return m, nil
 			}
@@ -3220,8 +4093,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "a", "enter":
 				markDisclaimerAccepted()
-				m.view = viewMenu
+				if m.ollama.installed {
+					m.view = viewMenu
+				} else {
+					m.view = viewOllamaInstallPrompt
+				}
 			case "q", "esc", "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			return m, nil
+
+		case viewOllamaInstallPrompt:
+			if m.ollamaInstallRunning {
+				return m, nil
+			}
+			if m.ollamaInstallResult != "" || m.ollamaInstallErr != "" {
+				// Any key dismisses the result and moves on.
+				m.ollamaInstallResult = ""
+				m.ollamaInstallErr = ""
+				m.ollama = checkOllama()
+				m.view = viewMenu
+				return m, nil
+			}
+			switch key {
+			case "y", "enter":
+				m.ollamaInstallRunning = true
+				appendLog("installing ollama")
+				return m, installOllama()
+			case "n", "esc", "q":
+				appendLog("skipped ollama install")
+				m.view = viewMenu
+			case "ctrl+c":
 				appendLog("quit")
 				return m, tea.Quit
 			}
@@ -3283,6 +4186,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.helpScroll = 1 << 30 // clamped below
 			}
 			m.clampHelpScroll()
+			return m, nil
+
+		case viewUpdateText:
+			if m.updateDownloading {
+				return m, nil
+			}
+			if key == "ctrl+c" {
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			if m.updateResult != "" || m.updateResultErr != "" {
+				m.updateResult = ""
+				m.updateResultErr = ""
+				m.view = viewHelpMenu
+				return m, nil
+			}
+			switch key {
+			case "esc":
+				m.view = viewHelpMenu
+				return m, nil
+			case "u", "enter":
+				if m.updateAvailable && m.updateAssetURL != "" {
+					m.updateDownloading = true
+					appendLog("downloading update %s", m.updateLatest)
+					return m, applyUpdate(m.updateAssetURL)
+				}
+				if m.updateAvailable && m.updateAssetURL == "" {
+					m.updateResultErr = fmt.Sprintf("no %s release asset found for this platform", updateAssetName(runtime.GOOS, runtime.GOARCH))
+				}
+			case "r":
+				m.updateChecked = false
+				m.updateCheckErr = ""
+				appendLog("re-checking for update")
+				return m, checkForUpdate()
+			}
 			return m, nil
 
 		case viewListTable:
@@ -3354,9 +4292,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			filtered := m.filteredCatalog()
 
 			switch key {
-			case "ctrl+r":
+			case "alt+r":
 				return m.rescanCatalog()
-			case "ctrl+h":
+			case "alt+h":
 				appendLog("opened help")
 				m.view = viewHelpText
 				m.helpScroll = 0
@@ -3587,6 +4525,8 @@ func (m *model) clampHelpScroll() {
 		content = renderDisclaimerText()
 	case viewLogText:
 		content = renderLogText()
+	case viewToolCategories:
+		content, _ = m.renderToolCategories()
 	default:
 		return
 	}
@@ -3597,6 +4537,40 @@ func (m *model) clampHelpScroll() {
 	}
 	if m.helpScroll > maxScroll {
 		m.helpScroll = maxScroll
+	}
+	if m.helpScroll < 0 {
+		m.helpScroll = 0
+	}
+}
+
+// selectedToolName returns the tool at toolCatCursor, clamped into range —
+// used both to render the detail view and to drive scroll-into-view.
+func (m model) selectedToolName() string {
+	names := flatToolNames()
+	if len(names) == 0 {
+		return ""
+	}
+	c := m.toolCatCursor
+	if c < 0 {
+		c = 0
+	}
+	if c >= len(names) {
+		c = len(names) - 1
+	}
+	return names[c]
+}
+
+// ensureToolCursorVisible scrolls the tool-category list just enough to
+// keep the currently selected tool on screen after Tab/Shift+Tab moves it —
+// unlike the other help screens, this one auto-scrolls to the selection
+// instead of taking free Up/Down scroll input.
+func (m *model) ensureToolCursorVisible() {
+	_, cursorLine := m.renderToolCategories()
+	page := helpPageLines(m.height)
+	if cursorLine < m.helpScroll {
+		m.helpScroll = cursorLine
+	} else if cursorLine >= m.helpScroll+page {
+		m.helpScroll = cursorLine - page + 1
 	}
 	if m.helpScroll < 0 {
 		m.helpScroll = 0
@@ -3635,29 +4609,33 @@ func (m model) renderHeader() string {
 	style := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(lipgloss.Color("#5F5FAF")).
+		Background(lipgloss.Color("#3A3A66")).
 		Width(m.width).
 		Padding(0, 1)
 
 	if m.view == viewAgentChat {
 		seg := func(fg, text string) string {
-			return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("#5F5FAF")).Foreground(lipgloss.Color(fg)).Render(text)
+			return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("#3A3A66")).Foreground(lipgloss.Color(fg)).Render(text)
 		}
 		title := seg("#FFFFFF", "llama-shell — ") +
 			seg("#FFD700", fmt.Sprintf("agentic chat: %s", m.agentModelName)) +
 			seg("#00FFFF", fmt.Sprintf("   cwd: %s", m.agentWorkDir))
-		return lipgloss.NewStyle().Background(lipgloss.Color("#5F5FAF")).Width(m.width).Padding(0, 1).Render(title)
+		return lipgloss.NewStyle().Background(lipgloss.Color("#3A3A66")).Width(m.width).Padding(0, 1).Render(title)
 	}
 	return style.Render("llama-shell — Ollama TUI")
 }
 
 func (m model) renderFooter() string {
-	const footerBG = "#5F5FAF"
-	status := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("ollama: not installed")
+	const footerBG = "#3A3A66"
+	status := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("ollama: not installed")
 	if m.ollama.installed {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG)).Render(
 			fmt.Sprintf("ollama: installed (%s)", m.ollama.version),
 		)
+	}
+	if m.updateAvailable {
+		updateFlag := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("update")
+		status = updateFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 	}
 
 	// Every fragment placed on the footer line — including plain filler
@@ -3680,8 +4658,16 @@ func (m model) renderFooter() string {
 
 	if m.view == viewAgentChat || m.view == viewToolCategories || m.view == viewAgentHelp ||
 		m.view == viewShowTable || m.view == viewListTable {
-		hintText := "Ctrl+H: help"
-		if m.view == viewToolCategories || m.view == viewAgentHelp {
+		hintText := "Alt+H: help"
+		if m.view == viewAgentChat {
+			mode := m.agentToolMode
+			if mode == "" {
+				mode = "auto"
+			}
+			hintText = "tool mode: " + mode + "  Alt+H: help"
+		} else if m.view == viewToolCategories {
+			hintText = "Tab: next  Enter: details  Esc: back"
+		} else if m.view == viewAgentHelp {
 			hintText = "Esc: back to chat  Ctrl+C: quit"
 		}
 		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA500")).Background(lipgloss.Color(footerBG)).Render(hintText)
@@ -3811,8 +4797,12 @@ func (m model) renderBody() string {
 		return box.Render(m.scrollHelpBody(renderDisclaimerText()))
 	case viewLogText:
 		return box.Render(m.scrollHelpBody(renderLogText()))
+	case viewUpdateText:
+		return box.Render(m.renderUpdateText())
 	case viewFirstRunDisclaimer:
 		return box.Render(renderFirstRunDisclaimer())
+	case viewOllamaInstallPrompt:
+		return box.Render(m.renderOllamaInstallPrompt())
 	case viewAgentChat:
 		// No vertical padding here (unlike the shared `box`): the agentic
 		// chat view sizes its own scrollback precisely to the terminal
@@ -3820,7 +4810,11 @@ func (m model) renderBody() string {
 		// unexplained gap above the footer.
 		return lipgloss.NewStyle().Padding(0, 2).Render(m.renderAgentChat())
 	case viewToolCategories:
-		return lipgloss.NewStyle().Padding(1, 2).Render(m.renderToolCategories())
+		if m.toolDetailOpen {
+			return lipgloss.NewStyle().Padding(1, 2).Render(renderToolDetail(m.selectedToolName()))
+		}
+		content, _ := m.renderToolCategories()
+		return lipgloss.NewStyle().Padding(1, 2).Render(m.scrollHelpBody(content))
 	case viewAgentHelp:
 		return lipgloss.NewStyle().Padding(1, 2).Render(renderAgentHelp())
 	}
@@ -3937,13 +4931,12 @@ List models
   type       filter the catalog by name, Esc clears the search box
   Enter      download the selected model (size picker first if it has
              more than one size)
-  ctrl+r     rescan the catalog, ignoring the cache
-  ctrl+h     jump straight to this help screen
+  alt+r      rescan the catalog, ignoring the cache
+  alt+h      jump straight to this help screen
   c          cancel an in-progress download
   Esc        back to main menu (or clear the search box first)
-  CAPABILITIES column: com=completion too=tools ins=insert vis=vision
-             emb=embedding thi=thinking aud=audio ("-" = none reported
-             yet, or cache still warming up)
+  CAPABILITIES column: see the "CAPABILITIES column" table further down
+             this screen for what each 3-letter code means.
 
 Running models
   Enter      stop the selected model (confirm y/n)
@@ -3956,11 +4949,10 @@ Show model info
                r = remove, k = stop
   r          rescan installed models, ignoring the cache (outside the
              action menu)
-  ctrl+h     jump straight to this help screen
+  alt+h      jump straight to this help screen
   Esc / q    back to main menu / quit
-  CAPABILITIES column: com=completion too=tools ins=insert vis=vision
-             emb=embedding thi=thinking aud=audio ("-" = none reported
-             yet, or cache still warming up)
+  CAPABILITIES column: see the "CAPABILITIES column" table further down
+             this screen for what each 3-letter code means.
 
 Device info
   b          benchmark every installed model's CPU/GPU split
@@ -3977,17 +4969,24 @@ Tips
 
 This screen
   - Reached by pressing 'h' from the main menu. It also opens directly
-    with Ctrl+H from "list models" and "show model info" (Esc from here
+    with Alt+H from "list models" and "show model info" (Esc from here
     goes to this help menu, not back to that screen).
-  - Ctrl+H means something different inside agentic chat: there it opens
+  - Alt+H means something different inside agentic chat: there it opens
     that screen's own keys reference ("Agentic chat - keys"), not this
     screen.
 
 CAPABILITIES column (list models / show model info)
-  Each ollama-reported capability is truncated to its first 3 letters:
-    com = completion   too = tools       ins = insert
-    vis = vision        emb = embedding   thi = thinking
-    aud = audio
+  Each ollama-reported capability is truncated to its first 3 letters.
+
+  CODE  WORD        MEANING
+  com   completion  plain text generation - can hold a normal conversation
+  too   tools       can call functions (file/shell access in agentic chat)
+  ins   insert      can fill in the middle of existing text (code infill)
+  vis   vision      can accept and understand image input
+  emb   embedding   turns text into vectors (search/RAG, not chat)
+  thi   thinking    supports an explicit reasoning/"thinking" step
+  aud   audio       can accept and understand audio input
+
   A bare "-" means no capability info yet (cache still warming up) or
   ollama reports none for that model.
 
@@ -3999,24 +4998,42 @@ Agentic chat (started from show model info -> 'a')
   Up / Down    scroll history one line (works while the model is busy)
   PgUp / PgDn  scroll history one page
   Home / End   jump to top / bottom of history
-  Ctrl+V       paste - an image on the clipboard is attached directly
+  Alt+V        paste - an image on the clipboard is attached directly
                (vision-capable models can then see it); otherwise pastes
                clipboard text
-  Ctrl+T       browse all available tools by category
-  Ctrl+H       this chat's own keys reference (see below)
+  Alt+T        browse all available tools by category
+  Alt+H        this chat's own keys reference (see below)
+  Alt+M        cycle tool mode: auto -> on -> off -> auto (see below)
   Esc          back to the show-model-info action menu
   Ctrl+C       quit llama-shell
   Typing or pasting a path to an existing image file (.png/.jpg/.jpeg/
-  .gif/.bmp/.webp) in your message also attaches it, same as Ctrl+V.
+  .gif/.bmp/.webp) in your message also attaches it, same as Alt+V.
 
-Tool categories (Ctrl+T from agentic chat)
-  Lists every tool the agent can call, grouped by what it does (files,
-  shell/processes, networking, system/environment, git/ollama,
-  open/launch).
-  Esc / Ctrl+T   back to chat
-  Ctrl+C         quit llama-shell
+  Tool mode (Alt+M cycles it; shown briefly above the input line):
+    auto (default) - tools stay on normally, but are automatically
+             turned off for any single message that attaches an image.
+             Some models (confirmed for at least gemma4:e2b) garble the
+             image entirely when the request also lists tools, so a
+             message can reliably have working vision or working tools,
+             not both - auto picks vision whenever an image is present,
+             then goes back to tools on the next message.
+    on       always try tools, even on a message with an image attached
+             (accept the vision-breaking tradeoff above, e.g. because
+             you need the agent to call a tool this turn regardless).
+    off      never send tools this chat - plain conversation only, no
+             file/system access, regardless of what the model supports.
 
-Agent help (Ctrl+H from agentic chat)
+Tool categories (Alt+T from agentic chat)
+  Lists every tool the agent can call, numbered and grouped by what it
+  does (files, shell/processes, networking, system/environment,
+  git/ollama, vision/media, data, open/launch).
+  Tab / Shift+Tab  select next / previous tool
+  Enter            show that tool's description and two example prompts
+  Esc              close the detail view, or back to chat from the list
+  Alt+T            back to chat (from the list)
+  Ctrl+C           quit llama-shell
+
+Agent help (Alt+H from agentic chat)
   Same keys reference as above, shown as its own screen.
   Esc            back to chat
   Ctrl+C         quit llama-shell
@@ -4045,13 +5062,99 @@ connection with the software or its use.
 Use at your own risk - in particular, the "remove" and "stop" actions
 call ollama directly and are not reversible from within this app.`
 
+// disclaimerLeadPhrases are the attention-grabbing lead-ins of each
+// disclaimer paragraph, rendered in red so they stand out from the
+// surrounding legal boilerplate.
+var disclaimerLeadPhrases = []string{
+	"llama-shell is an independent, unofficial tool.",
+	"License.",
+	"No warranty.",
+	"Use at your own risk",
+}
+
+func styledDisclaimerBody() string {
+	body := disclaimerBody
+	for _, p := range disclaimerLeadPhrases {
+		body = strings.Replace(body, p, redStyle.Render(p), 1)
+	}
+	return body
+}
+
 func renderDisclaimerText() string {
-	return "disclaimer\n\n" + disclaimerBody + "\n\nEsc: back\n"
+	return redStyle.Render("disclaimer") + "\n\n" + styledDisclaimerBody() + "\n\nEsc: back\n"
 }
 
 func renderFirstRunDisclaimer() string {
-	return "disclaimer — please read before continuing\n\n" + disclaimerBody +
-		"\n\nYou must agree to continue.\n\n[a] I agree, continue    [q] quit\n"
+	return redStyle.Render("disclaimer — please read before continuing") + "\n\n" + styledDisclaimerBody() +
+		"\n\nYou must agree to continue.\n\n" +
+		helpKeyStyle.Render("[a] I agree, continue") + "    " + redStyle.Render("[q] quit") + "\n"
+}
+
+func (m model) renderOllamaInstallPrompt() string {
+	if m.ollamaInstallRunning {
+		return redStyle.Render("ollama not installed") + "\n\n" +
+			"Installing... this may take a minute.\n"
+	}
+	if m.ollamaInstallErr != "" {
+		return redStyle.Render("ollama install failed") + "\n\n" + m.ollamaInstallErr +
+			"\n\n(press any key to continue)\n"
+	}
+	if m.ollamaInstallResult != "" {
+		return helpKeyStyle.Render("ollama") + "\n\n" + m.ollamaInstallResult +
+			"\n\n(press any key to continue)\n"
+	}
+	return redStyle.Render("ollama not installed") + "\n\n" +
+		"llama-shell talks to Ollama to list, run, and manage local models —\n" +
+		"without it there's nothing to manage.\n\n" +
+		"Install it now?\n\n" +
+		helpKeyStyle.Render("[y] yes, install") + "    " + redStyle.Render("[n] no, I'll do it myself") + "\n"
+}
+
+func (m model) renderUpdateText() string {
+	current := appVersion
+	if current == "" {
+		current = "dev"
+	}
+
+	if m.updateDownloading {
+		return helpKeyStyle.Render("update") + "\n\n" +
+			fmt.Sprintf("Downloading %s for %s/%s...\n", m.updateLatest, runtime.GOOS, runtime.GOARCH)
+	}
+	if m.updateResultErr != "" {
+		return redStyle.Render("update failed") + "\n\n" + m.updateResultErr +
+			"\n\n(press any key to continue)\n"
+	}
+	if m.updateResult != "" {
+		return helpKeyStyle.Render("update") + "\n\n" + m.updateResult +
+			"\n\n(press any key to continue)\n"
+	}
+
+	var b strings.Builder
+	b.WriteString(helpKeyStyle.Render("update") + "\n\n")
+	b.WriteString(fmt.Sprintf("current version : %s\n", current))
+	b.WriteString(fmt.Sprintf("platform        : %s/%s\n\n", runtime.GOOS, runtime.GOARCH))
+
+	switch {
+	case !m.updateChecked:
+		b.WriteString("Checking for updates...\n")
+	case m.updateCheckErr != "":
+		b.WriteString(redStyle.Render("couldn't check for updates:") + "\n" + m.updateCheckErr + "\n\n")
+		b.WriteString("[r] retry\n")
+	case m.updateAvailable:
+		b.WriteString(fmt.Sprintf("latest version  : %s  ", m.updateLatest) + redStyle.Render("(update available)") + "\n\n")
+		if m.updateAssetURL != "" {
+			b.WriteString("[u] download and install\n")
+		} else {
+			b.WriteString(redStyle.Render(fmt.Sprintf("no release asset named %q for this platform", updateAssetName(runtime.GOOS, runtime.GOARCH))) + "\n")
+		}
+	case current == "dev":
+		b.WriteString("running a dev build (no version tag) — can't compare against latest release.\n")
+	default:
+		b.WriteString(fmt.Sprintf("latest version  : %s  (up to date)\n", m.updateLatest))
+	}
+
+	b.WriteString("\nEsc: back\n")
+	return b.String()
 }
 
 func renderLogText() string {
@@ -4341,13 +5444,13 @@ func (m model) renderCatalogTable() string {
 				msg += "  - " + e + "\n"
 			}
 		}
-		return msg + "\n\nEsc: back  ctrl+r: rescan"
+		return msg + "\n\nEsc: back  alt+r: rescan"
 	}
 
 	catalogRows := m.filteredCatalog()
 	if len(catalogRows) == 0 {
 		return fmt.Sprintf(
-			"list models\n\n%s\n\nno matches for %q.\n\nEsc: clear search  ctrl+r: rescan\n",
+			"list models\n\n%s\n\nno matches for %q.\n\nEsc: clear search  alt+r: rescan\n",
 			searchLine, m.catalogSearch,
 		)
 	}
@@ -4386,8 +5489,10 @@ func (m model) renderCatalogTable() string {
 		return s + strings.Repeat(" ", w-len(s))
 	}
 
-	// figure out how many rows fit given terminal height
-	const overhead = 12 // title/search/blank/colheader/footer lines + box padding + header/footer bars
+	// figure out how many rows fit given terminal height: outer header(1) +
+	// footer(1) + box padding top/bottom(2) + this screen's own title(1) +
+	// search(1) + blank(1) + column header(1) = 8 fixed lines.
+	const overhead = 8
 	visibleRows := m.height - overhead
 	if visibleRows < 3 {
 		visibleRows = 3
@@ -4627,20 +5732,49 @@ func renderCapabilityBadges(caps string) string {
 	return "capabilities: " + strings.Join(parts, "  ")
 }
 
-func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string) []string {
-	var lines []string
-	toolNames := []string{
-		"read_file", "write_file", "append_file", "list_dir", "make_dir", "delete_file",
-		"search_files", "copy_file", "move_file", "run_command", "run_powershell", "run_python",
-		"open_url", "open_path", "list_processes", "kill_process", "ssh_run", "web_search",
-		"read_webpage", "http_get", "ping_host", "get_public_ip", "system_info", "list_env_vars",
-		"get_env", "get_clipboard", "set_clipboard", "get_datetime", "list_network_interfaces",
-		"disk_usage", "list_installed_programs", "compress_zip", "extract_zip", "git_status",
-		"git_diff", "git_log", "list_window_titles", "count_lines", "file_hash", "file_info",
-		"list_ollama_models", "list_running_ollama_models",
+// renderWarmupStatus shows whether the model has actually answered a
+// request yet — cold-loading a large model can take a minute or more with
+// zero other feedback, which reads as the app being frozen even though
+// typing still works the whole time.
+func renderWarmupStatus(warmup string) string {
+	switch {
+	case warmup == "ready":
+		return helpKeyStyle.Render("● model loaded and ready")
+	case strings.HasPrefix(warmup, "error: "):
+		return redStyle.Render("● couldn't reach the model: " + strings.TrimPrefix(warmup, "error: "))
+	case warmup == "pending":
+		return agentToolStyle.Render("○ waiting for model to finish loading... (a large model can take a while — you can type while you wait; sending a message will trigger loading if it hasn't started)")
+	default:
+		return ""
 	}
-	lines = append(lines, agentHeadStyle.Render(fmt.Sprintf("%d tools available — Ctrl+T to browse by category", len(toolNames))))
+}
+
+// renderPrefixedChatLines wraps "prefix+content" to width, keeping the
+// "you> " / "modelName> " prefix in its own bright color on the first line
+// while the message body itself (first line's remainder, plus every
+// continuation line) renders in plain grey — the prefix is what tells you
+// who's speaking, the actual text doesn't need to compete with it.
+func renderPrefixedChatLines(prefix, content string, width int, prefixStyle lipgloss.Style) []string {
+	wrapped := wrapLines(prefix+content, width)
+	out := make([]string, len(wrapped))
+	for i, l := range wrapped {
+		if i == 0 && strings.HasPrefix(l, prefix) {
+			out[i] = prefixStyle.Render(prefix) + agentToolStyle.Render(l[len(prefix):])
+		} else {
+			out[i] = agentToolStyle.Render(l)
+		}
+	}
+	return out
+}
+
+func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string) []string {
+	var lines []string
+	toolNames := flatToolNames()
+	lines = append(lines, agentHeadStyle.Render(fmt.Sprintf("%d tools available — Alt+T to browse by category", len(toolNames))))
 	lines = append(lines, renderCapabilityBadges(capabilities))
+	if s := renderWarmupStatus(warmup); s != "" {
+		lines = append(lines, s)
+	}
 	lines = append(lines, "")
 	for _, msg := range messages {
 		before := len(lines)
@@ -4648,9 +5782,7 @@ func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, 
 		case "system":
 			continue
 		case "user":
-			for _, l := range wrapLines("you> "+msg.Content, width) {
-				lines = append(lines, agentUserStyle.Render(l))
-			}
+			lines = append(lines, renderPrefixedChatLines("you> ", msg.Content, width, agentUserStyle)...)
 		case "tool":
 			for _, l := range wrapLines("  [tool result] "+msg.Content, width) {
 				lines = append(lines, agentToolStyle.Render(l))
@@ -4663,9 +5795,7 @@ func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, 
 				}
 			}
 			if strings.TrimSpace(msg.Content) != "" {
-				for _, l := range wrapLines(modelName+"> "+msg.Content, width) {
-					lines = append(lines, agentReplyStyle.Render(l))
-				}
+				lines = append(lines, renderPrefixedChatLines(modelName+"> ", msg.Content, width, agentReplyStyle)...)
 			}
 		}
 		// Only add a separating blank line for messages that actually
@@ -4685,7 +5815,7 @@ func (m *model) syncAgentViewport() {
 	if !m.agentVPReady {
 		return
 	}
-	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities)
+	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup)
 	m.agentViewport.SetContent(strings.Join(lines, "\n"))
 	m.agentViewport.GotoBottom()
 }
@@ -4696,6 +5826,11 @@ func (m model) renderAgentChat() string {
 	var bottom strings.Builder
 	if m.agentErr != "" {
 		bottom.WriteString(redStyle.Render("error: "+m.agentErr) + "\n")
+	}
+	if m.agentPasting {
+		bottom.WriteString(agentToolStyle.Render("pasting from clipboard...") + "\n")
+	} else if m.agentPasteNotice != "" {
+		bottom.WriteString(helpKeyStyle.Render(m.agentPasteNotice) + "\n")
 	}
 	if m.agentBusy {
 		frame := agentSpinnerFrames[m.agentSpinner%len(agentSpinnerFrames)]
@@ -4725,7 +5860,7 @@ func (m model) renderAgentChat() string {
 			bottom.WriteString(fmt.Sprintf("%s (%s)\n", frame, elapsed))
 		}
 	} else {
-		bottom.WriteString(agentUserStyle.Render("you> "+m.agentInput+"█") + "\n")
+		bottom.WriteString(agentUserStyle.Render("you> ") + agentToolStyle.Render(m.agentInput+"█") + "\n")
 	}
 
 	if m.agentVPReady {
@@ -4768,30 +5903,78 @@ func (m model) renderAgentChat() string {
 
 // renderToolCategories shows the full tool list grouped by what each tool
 // actually does — the flat 4-row grid in the chat header is a quick
-// reminder, this is the "let me see everything" view (Ctrl+T from chat).
-func (m model) renderToolCategories() string {
+// reminder, this is the "let me see everything" view (Alt+T from chat).
+// renderToolCategories draws the numbered, Tab-navigable tool list.
+// Returns the rendered text plus the 0-based line index the currently
+// selected tool sits on, so the caller can scroll that line into view.
+func (m model) renderToolCategories() (string, int) {
+	names := flatToolNames()
+	if len(names) == 0 {
+		return "(no tools)", 0
+	}
+	cursor := m.toolCatCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(names) {
+		cursor = len(names) - 1
+	}
+	selectedLabel := fmt.Sprintf("%d. %s", cursor+1, names[cursor])
+
 	var b strings.Builder
-	b.WriteString(agentHeadStyle.Render(fmt.Sprintf("Tools by category (%d total)", func() int {
-		n := 0
-		for _, c := range agentToolCategories {
-			n += len(c.tools)
-		}
-		return n
-	}())) + "\n\n")
+	b.WriteString(agentHeadStyle.Render(fmt.Sprintf("Tools by category (%d total) — Tab/Shift+Tab select, Enter for details", len(names))) + "\n\n")
+	lineNo := 2
+	cursorLine := 0
+	globalIdx := 0
 	for _, cat := range agentToolCategories {
 		b.WriteString(headerRowStyle.Render(cat.name) + "\n")
-		for _, l := range toolGridLines(cat.tools, 2, m.width-4) {
+		lineNo++
+		labels := make([]string, len(cat.tools))
+		for i, name := range cat.tools {
+			labels[i] = fmt.Sprintf("%d. %s", globalIdx+i+1, name)
+		}
+		for _, l := range toolGridLines(labels, 2, m.width-4) {
+			if strings.Contains(l, selectedLabel) {
+				l = strings.Replace(l, selectedLabel, selectedStyle.Render(selectedLabel), 1)
+				cursorLine = lineNo
+			}
 			b.WriteString("  " + l + "\n")
+			lineNo++
 		}
 		b.WriteString("\n")
+		lineNo++
+		globalIdx += len(cat.tools)
 	}
-	b.WriteString("Esc or Ctrl+T: back to chat\n")
+	b.WriteString("Esc or Alt+T: back to chat\n")
+	return b.String(), cursorLine
+}
+
+// renderToolDetail shows one tool's name, description, and two example
+// prompts — opened with Enter on the tool list, closed with Esc.
+func renderToolDetail(name string) string {
+	var b strings.Builder
+	b.WriteString(agentHeadStyle.Render(name) + "\n\n")
+	desc := toolDescription(name)
+	if desc == "" {
+		desc = "(no description)"
+	}
+	for _, l := range wrapLines(desc, 76) {
+		b.WriteString(l + "\n")
+	}
+	b.WriteString("\n" + headerRowStyle.Render("Examples") + "\n")
+	if ex, ok := toolExamples[name]; ok {
+		b.WriteString("  1. " + ex[0] + "\n")
+		b.WriteString("  2. " + ex[1] + "\n")
+	} else {
+		b.WriteString("  (no examples yet)\n")
+	}
+	b.WriteString("\nEsc: back to tool list\n")
 	return b.String()
 }
 
-// renderAgentHelp is the Ctrl+H dialog for the agentic chat — the keybind
+// renderAgentHelp is the Alt+H dialog for the agentic chat — the keybind
 // list used to live in the footer hint, but wrapped to two lines on
-// narrower terminals, so it moved here behind a short "Ctrl+H: help" hint.
+// narrower terminals, so it moved here behind a short "Alt+H: help" hint.
 func renderAgentHelp() string {
 	var b strings.Builder
 	b.WriteString(agentHeadStyle.Render("Agentic chat — keys") + "\n\n")
@@ -4799,17 +5982,23 @@ func renderAgentHelp() string {
 	b.WriteString("  Up / Down    scroll history one line\n")
 	b.WriteString("  PgUp / PgDn  scroll history one page\n")
 	b.WriteString("  Home / End   jump to top / bottom of history\n")
-	b.WriteString("  Ctrl+V       paste - an image on the clipboard attaches directly for\n")
+	b.WriteString("  Alt+V        paste - an image on the clipboard attaches directly for\n")
 	b.WriteString("               vision-capable models, otherwise pastes clipboard text\n")
-	b.WriteString("  Ctrl+T       browse all tools by category\n")
-	b.WriteString("  Ctrl+H       this help screen\n")
+	b.WriteString("  Alt+T        browse all tools by category\n")
+	b.WriteString("  Alt+H        this help screen\n")
+	b.WriteString("  Alt+M        cycle tool mode: auto -> on -> off -> auto\n")
 	b.WriteString("  Esc          back to model actions menu\n")
 	b.WriteString("  Ctrl+C       quit llama-shell\n\n")
 	b.WriteString("A path to an existing image file typed/pasted into your message also\n")
-	b.WriteString("attaches it, same as Ctrl+V.\n\n")
+	b.WriteString("attaches it, same as Alt+V.\n\n")
+	b.WriteString("Tool mode (Alt+M): auto (default) turns tools off just for a message\n")
+	b.WriteString("that attaches an image, since at least gemma4:e2b garbles the image\n")
+	b.WriteString("entirely when tools are also in the request - then goes back to tools\n")
+	b.WriteString("on for the next image-free message. on = always try tools even with an\n")
+	b.WriteString("image attached. off = never send tools this chat.\n\n")
 	b.WriteString("Looking for the CAPABILITIES column codes (com/too/ins/vis/emb/thi/aud)?\n")
 	b.WriteString("Those are on \"list models\" / \"show model info\" screens, not here — back\n")
-	b.WriteString("out to one of those and press Ctrl+H there instead.\n\n")
+	b.WriteString("out to one of those and press Alt+H there instead.\n\n")
 	b.WriteString("Esc: back to chat\n")
 	return styleHelpLines(b.String())
 }
@@ -4830,17 +6019,102 @@ var agentToolCategories = []toolCategory{
 		"list_window_titles",
 	}},
 	{"Networking & Web", []string{
-		"web_search", "read_webpage", "http_get", "ping_host", "get_public_ip", "ssh_run",
-		"list_network_interfaces",
+		"web_search", "read_webpage", "http_get", "http_post", "download_file", "ping_host",
+		"get_public_ip", "ssh_run", "list_network_interfaces",
 	}},
 	{"System & Environment", []string{
 		"system_info", "list_env_vars", "get_env", "get_clipboard", "set_clipboard",
-		"get_datetime", "disk_usage", "list_installed_programs",
+		"get_datetime", "disk_usage", "list_installed_programs", "send_notification",
+		"read_registry",
 	}},
 	{"Git & Ollama", []string{
-		"git_status", "git_diff", "git_log", "list_ollama_models", "list_running_ollama_models",
+		"git_status", "git_diff", "git_log", "git_commit", "git_branch",
+		"list_ollama_models", "list_running_ollama_models", "pull_ollama_model",
 	}},
+	{"Vision & Media", []string{"take_screenshot", "view_image", "read_pdf"}},
+	{"Data", []string{"run_sql", "read_csv", "read_json"}},
 	{"Open / Launch", []string{"open_url", "open_path"}},
+}
+
+// flatToolNames lists every tool in the same order they're displayed in,
+// derived from agentToolCategories so the two can never drift apart.
+func flatToolNames() []string {
+	var names []string
+	for _, cat := range agentToolCategories {
+		names = append(names, cat.tools...)
+	}
+	return names
+}
+
+// toolDescription looks up a tool's description from its single source of
+// truth (agentTools()) rather than duplicating description text here.
+func toolDescription(name string) string {
+	for _, t := range agentTools() {
+		if t.Function.Name == name {
+			return t.Function.Description
+		}
+	}
+	return ""
+}
+
+// toolExamples gives two short natural-language prompts per tool, shown in
+// the tool detail view (Enter on a tool in the Alt+T screen).
+var toolExamples = map[string][2]string{
+	"read_file":                  {"Read the contents of config.yaml", "What does main.go say on line 42?"},
+	"write_file":                 {"Create a file notes.txt with today's TODO list", "Write a .gitignore for a Go project"},
+	"append_file":                {"Add a new entry to CHANGELOG.md", "Append today's date to log.txt"},
+	"list_dir":                   {"What's in the src folder?", "List everything in the current directory"},
+	"make_dir":                   {"Create a folder called backups", "Make a nested dir build/output"},
+	"delete_file":                {"Delete the old.log file", "Remove tmp/scratch.txt"},
+	"search_files":               {"Find every file with \"config\" in the name", "Search this project for files named test"},
+	"copy_file":                  {"Copy README.md to README.bak", "Duplicate template.txt as new.txt"},
+	"move_file":                  {"Rename draft.txt to final.txt", "Move report.pdf into the archive folder"},
+	"count_lines":                {"How many lines are in main.go?", "Count lines in the log file"},
+	"file_hash":                  {"What's the SHA-256 of installer.exe?", "Checksum this download to verify it"},
+	"file_info":                  {"When was this file last modified?", "How big is the video file?"},
+	"compress_zip":               {"Zip up the dist folder", "Compress these logs into an archive"},
+	"extract_zip":                {"Extract release.zip into this folder", "Unzip the downloaded archive"},
+	"run_command":                {"Run \"dir\" and show me the output", "Check disk space with a shell command"},
+	"run_powershell":             {"List all running services via PowerShell", "Get the top 5 processes by memory"},
+	"run_python":                 {"Run a quick Python script to sum 1 to 100", "Use Python to check if a number is prime"},
+	"list_processes":             {"What processes are running right now?", "Is chrome.exe running?"},
+	"kill_process":               {"Kill the process called notepad.exe", "Stop PID 4821"},
+	"list_window_titles":         {"What windows do I have open?", "Is there a Notepad window open?"},
+	"web_search":                 {"Search the web for the latest Go release", "Look up how to install poppler on Windows"},
+	"read_webpage":               {"Summarize the article at this URL", "Read the docs page and tell me the API key format"},
+	"http_get":                   {"Fetch https://api.github.com/status", "Check what this API endpoint returns"},
+	"http_post":                  {"POST this JSON payload to my webhook URL", "Send a test request to the local API"},
+	"download_file":              {"Download this ZIP to the downloads folder", "Save this image to disk"},
+	"ping_host":                  {"Is 8.8.8.8 reachable?", "Ping github.com to check connectivity"},
+	"get_public_ip":              {"What's my public IP address?", "Check what IP this machine shows on the internet"},
+	"ssh_run":                    {"Run \"uptime\" on my home server", "SSH into the pi and check disk usage"},
+	"list_network_interfaces":    {"What's my local IP address?", "Show all network adapters and their config"},
+	"system_info":                {"What OS and CPU does this machine have?", "How many cores does this computer have?"},
+	"list_env_vars":              {"What environment variables are set?", "List all env var names"},
+	"get_env":                    {"What's the value of PATH?", "Check the JAVA_HOME environment variable"},
+	"get_clipboard":              {"What's currently on my clipboard?", "Read what I just copied"},
+	"set_clipboard":              {"Copy \"hello world\" to my clipboard", "Put this generated password on the clipboard"},
+	"get_datetime":               {"What time is it right now?", "What's today's date?"},
+	"disk_usage":                 {"How much free disk space do I have?", "Check space on all drives"},
+	"list_installed_programs":    {"What software is installed on this machine?", "Is Python installed?"},
+	"send_notification":          {"Show me a popup saying the build finished", "Notify me when this task is done"},
+	"read_registry":              {"What's in HKLM Software Microsoft Windows NT CurrentVersion?", "Check this registry key's values"},
+	"git_status":                 {"What's the git status of this repo?", "Are there any uncommitted changes?"},
+	"git_diff":                   {"Show me the unstaged changes", "What did I just edit?"},
+	"git_log":                    {"Show the last 5 commits", "What's the recent commit history?"},
+	"git_commit":                 {"Commit all changes with message \"fix bug\"", "Stage and commit my edits"},
+	"git_branch":                 {"What branches exist in this repo?", "Create a new branch called feature-x"},
+	"list_ollama_models":         {"What Ollama models are installed?", "List my local models"},
+	"list_running_ollama_models": {"What models are currently loaded?", "Is anything running in Ollama right now?"},
+	"pull_ollama_model":          {"Pull the llama3.2:1b model", "Download qwen2.5-coder:7b"},
+	"take_screenshot":            {"Take a screenshot and tell me what's on screen", "Capture my screen and describe it"},
+	"view_image":                 {"Look at screenshot.png and describe it", "What's in this diagram file?"},
+	"read_pdf":                   {"Extract the text from report.pdf", "What does this PDF say on page 1?"},
+	"run_sql":                    {"Query the users table for all rows", "Run SELECT COUNT(*) on my database"},
+	"read_csv":                   {"Show me the contents of data.csv as a table", "Read sales.csv"},
+	"read_json":                  {"Pretty-print config.json", "Validate and show this JSON file"},
+	"open_url":                   {"Open github.com in my browser", "Open the Ollama download page"},
+	"open_path":                  {"Open this folder in Explorer", "Open the PDF with its default app"},
 }
 
 // wrapLines does a plain rune-count wrap so a long chat/tool message doesn't
@@ -4954,6 +6228,7 @@ func (m model) renderCmdView(label string) string {
 }
 
 func main() {
+	cleanupOldExe()
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Println("error:", err)

@@ -12,10 +12,10 @@ Single static executable, no runtime dependencies.
 ## Building
 
 ```
-go build -ldflags "-X main.buildTime=$(date +%Y%m%d-%H%M%S)" -o llama-shell.exe .
+go build -ldflags "-X main.buildTime=$(date +%Y%m%d-%H%M%S) -X main.appVersion=v0.2.0" -o llama-shell.exe .
 ```
 
-The footer shows this build timestamp (there's no semantic version — it's a live build tag, not manually bumped).
+The footer shows the build timestamp (there's no user-facing semantic version display — it's a live build tag, not manually bumped). `appVersion` is separate and only used internally to check for updates — set it to match the git tag you're cutting the release from. Omitting it leaves the update checker permanently unable to tell if a newer release exists (it falls back to `"dev"`, which the checker always treats as "nothing to compare").
 
 ## Running
 
@@ -26,7 +26,7 @@ The footer shows this build timestamp (there's no semantic version — it's a li
 ## Layout
 
 - **Header** (fixed top): app title.
-- **Footer** (fixed bottom): purple bar matching the header. Build timestamp (left), a clickable GitHub repo link (OSC-8 terminal hyperlink, middle) or a context-specific key hint in the agentic chat/tools/help screens, and ollama installed/not-installed status with version (right, green if installed, red if not).
+- **Footer** (fixed bottom): purple bar matching the header. Build timestamp (left), a clickable GitHub repo link (OSC-8 terminal hyperlink, middle) or a context-specific key hint in the agentic chat/tools/help screens, and ollama installed/not-installed status with version (right, green if installed, red if not) — preceded by a blinking yellow `update` flag when a newer release is available.
 - **Body**: the current screen. All menus support Up/Down + Enter navigation as well as the letter shortcut shown in brackets.
 - **Banner**: "LLAMA-SHELL" rendered as solid-color block letters (blue, white, red, green, cyan, magenta, yellow, repeating by letter position — static, not animated) at the top of the main menu.
 
@@ -38,10 +38,10 @@ The footer shows this build timestamp (there's no semantic version — it's a li
 | `p` | Running models |
 | `s` | Show model info |
 | `d` | Device info |
-| `h` | Help / disclaimer / log |
+| `h` | Help / disclaimer / log / update |
 | `q` | Quit |
 
-On first launch, the app shows the disclaimer and requires `[a] I agree` before continuing — declining (any other key) quits the app.
+On first launch, the app shows the disclaimer and requires `[a] I agree` before continuing — declining (any other key) quits the app. If Ollama isn't installed, it then offers to install it: Linux runs the official one-line installer unattended, macOS/Windows open the correct download page (those are signed GUI installers, not scriptable).
 
 ### List models (`l`)
 
@@ -82,10 +82,14 @@ The list is also automatically invalidated (forced rescan) the next time you ope
 
 llama-shell's own built-in chat + tool-calling agent — no Aider/OpenCode/Claude Code needed, talks to Ollama's `/api/chat` directly.
 
-- **Streaming replies**: parses Ollama's newline-delimited JSON stream chunk-by-chunk, so replies type out token-by-token instead of appearing all at once.
-- **42 tools** across files & archives, shell & processes, networking & web (including `web_search` via a DuckDuckGo HTML scrape, no API key), system & environment, git & ollama, and open/launch. Press **Ctrl+T** to browse the full list grouped by category; the chat header just shows a one-line count.
-- **Keys**: `Enter` send, `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` scroll history (via a real `bubbles/viewport`, works even while the model is thinking), `Ctrl+T` tool categories, `Ctrl+H` this keybind help dialog, `Esc` back to the model actions menu, `Ctrl+C` quit.
+- **Streaming replies**: parses Ollama's newline-delimited JSON stream chunk-by-chunk, so replies type out token-by-token instead of appearing all at once. A stream that gets cut off mid-generation without a final `done:true` (e.g. the backend crashed) surfaces as a real error instead of silently looking like an empty, successful reply.
+- **Model warm-up status** shown in the banner: `○ waiting for model to finish loading...` while a background `ollama ps` poll hasn't seen it yet, flipping to `● model loaded and ready` the instant a real token, tool call, or completed turn arrives — typing is never blocked either way, this is purely informational for a cold-loading model that can otherwise look like the app is frozen.
+- **55 tools** across files & archives, shell & processes, networking & web (including `web_search` via a DuckDuckGo HTML scrape, no API key; `http_post`/`download_file`), system & environment (including `send_notification`/`read_registry`), git & ollama (including `git_commit`/`git_branch`/`pull_ollama_model`), vision & media (`take_screenshot`/`view_image`/`read_pdf`), data (`run_sql`/`read_csv`/`read_json`), and open/launch. Press **Alt+T** to browse the full list — numbered, grouped by category, `Tab`/`Shift+Tab` to select and auto-scroll, `Enter` for a detail view (real description + two example prompts), `Esc` back.
+- **Vision**: type/paste a path to an existing image file, or press **Alt+V** to attach an image straight from the clipboard (falls back to pasting clipboard text if there's no image) — both base64-attach via Ollama's `images` field.
+- **Tool mode (`Alt+M`)**, cycles `auto` (default) → `on` → `off`, shown live in the footer. `auto` skips tool-calling for any single message that attaches an image — at least `gemma4:e2b` garbles the image entirely when `tools` is also in the request, so a message can reliably have working vision or working tools, not both — then resumes tools on the next image-free message. `on` always tries tools anyway; `off` never sends them this chat.
+- **Keys**: `Enter` send, `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` scroll history (via a real `bubbles/viewport`, works even while the model is thinking), `Alt+V` paste, `Alt+T` tool categories, `Alt+M` cycle tool mode, `Alt+H` this keybind help dialog, `Esc` back to the model actions menu, `Ctrl+C` quit. `Alt+` instead of `Ctrl+` deliberately — browser-based terminals (e.g. viewing an LXC console over the web) often reserve `Ctrl+T`/`Ctrl+H`/`Ctrl+R`/`Ctrl+V` for tab/history/reload/paste at the browser level and never forward them to the app.
 - **Fixed layout**: the transcript viewport fills the space between the header and the input line; `you>` always sits exactly 3 rows above the very bottom (footer, one blank line, `you>`), regardless of conversation length or scroll position — the viewport's own output is manually padded to its declared height before being placed, since `bubbles/viewport` doesn't pad short content itself, and a global `clampToLastLines` safety net in `View()` guarantees no single frame can ever exceed the terminal's actual height (an earlier bug let a huge streamed reply overflow the frame, which permanently desynced the terminal's scroll position from bubbletea's cursor tracking until restart — the header would just vanish).
+- **`you>`/`modelName>` prefixes are colored, message bodies are grey** — the prefix is what tells you who's speaking, the text itself doesn't need to compete with it.
 - Tool-calling reliability depends entirely on the model — small/local models can refuse or hallucinate. The system prompt explicitly tells the model it has real file/system access and that tools are additive to normal conversation, not a replacement for it, after early tests showed models either refusing everything ("I'm just an AI") or refusing *everything else* once tools were mentioned ("I can only do file ops").
 
 ### Device info (`d`)
@@ -105,6 +109,16 @@ Static machine info: OS/arch, CPU model, logical core count, RAM, per-drive used
 
 **Match score** (0-100%): `0.7 × GPU-share + 0.3 × load-speed-score` (load speed scored against a 30-second-to-zero heuristic). Higher = better fit for this machine.
 
+### Update (`u` from the help menu)
+
+Checks `github.com/affigabmag/llama-shell`'s latest release on every startup and shows a blinking `update` flag in the footer (left of the ollama status) if a newer one is available for your OS/arch. Open `[u] update` from the help menu to see current vs. latest version and press `[u]` to download and install, or `[r]` to re-check.
+
+Self-update mechanism (differs by OS since a running executable can't be freely overwritten):
+- **Linux/macOS**: downloads the release zip, extracts the binary, and does one atomic rename over the running executable's file — allowed even while it's running.
+- **Windows**: a running exe can't be renamed *onto*, but *itself* can be renamed — so it renames the running exe aside to `<exe>.old`, then renames the newly-downloaded binary into place. The leftover `.old` file is cleaned up automatically on the next launch.
+
+Either way, you need to restart llama-shell afterward to run the new version — the update swaps the file on disk, it doesn't reload the already-running process. Requires the binary to have been built with `-X main.appVersion=vX.Y.Z` matching a real release tag (see Building); otherwise there's no baseline version to compare and the checker never reports an update.
+
 ## Known limitations
 
 - GPU detection for the benchmark's CPU/GPU split comes from `ollama ps`, which only reports an aggregate percentage — it doesn't distinguish which physical GPU on a multi-GPU machine. On Windows, ollama only has a CUDA backend, so in practice "GPU" always means the NVIDIA card if present; integrated GPUs (Intel, etc.) are listed in Device Info but never used by ollama.
@@ -112,4 +126,4 @@ Static machine info: OS/arch, CPU model, logical core count, RAM, per-drive used
 
 ## License
 
-Source-available, view-only — see [LICENSE](LICENSE). You can read the code and run it for personal use, but you may not modify it or redistribute a modified version. Provided with no warranty of any kind. Not affiliated with or endorsed by Ollama Inc. or Hugging Face. On first launch, the app requires you to accept this disclaimer before continuing (`help / disclaimer / log` in the main menu to review it again later).
+Source-available, view-only — see [LICENSE](LICENSE). You can read the code and run it for personal use, but you may not modify it or redistribute a modified version. Provided with no warranty of any kind. Not affiliated with or endorsed by Ollama Inc. or Hugging Face. On first launch, the app requires you to accept this disclaimer before continuing (`help / disclaimer / log / update` in the main menu to review it again later).

@@ -3,6 +3,155 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Self-update from GitHub releases — sixth session (2026-08-23)
+
+- **New `appVersion` build var**, parallel to the existing `buildTime` one:
+  set via `-X main.appVersion=vX.Y.Z` at build time, tied to the git tag a
+  release is cut from. Falls back to `"dev"` for a plain `go build`, in
+  which case the update checker never reports an update — there's no
+  tagged baseline to compare the latest release against.
+- **Update check on every startup** (`Init()` → `checkForUpdate()`): one
+  unauthenticated GET to `api.github.com/repos/affigabmag/llama-shell/releases/latest`.
+  Pull-based only — a copy that's already running won't notice a new
+  release until it's relaunched or `[r]` retry is pressed on the update
+  screen.
+- **New `[u] update` item** in the help menu (`h` → `u`), main-menu label
+  updated to `help / disclaimer / log / update`. Shows current vs. latest
+  version, `[u]` to download and install, `[r]` to re-check.
+- **Blinking `update` flag in the footer**, immediately left of the
+  ollama status, shown whenever a newer release is available — reuses the
+  same `lipgloss .Blink(true)` SGR trick already used for
+  "ollama: not installed" rather than a manual tick-driven blink loop.
+- **Release-asset convention discovered from the real repo, not assumed**:
+  `gh api repos/affigabmag/llama-shell/releases` showed `v0.2.0` assets are
+  zips (`llama-shell-<goos>-<goarch>.zip`, e.g.
+  `llama-shell-windows-amd64.zip`) containing the binary
+  (`llama-shell.exe` on Windows, `llama-shell` on macOS/Linux) —
+  **not** a raw binary per platform, which was the first (wrong,
+  never-shipped) implementation. `updateAssetName()`/
+  `updateBinaryNameInZip()` match this; `applyUpdateAt()` downloads to a
+  temp `.zip`, opens it with `archive/zip`, and extracts by base name so
+  it doesn't care whether the zip nests the binary in a subfolder.
+- **Self-swap mechanism differs by OS**, confirmed empirically rather than
+  assumed:
+  - **Linux/macOS**: a single `os.Rename(new, exePath)` — renaming over a
+    running executable's file is allowed; the kernel keeps the old inode
+    open (and running) until the process actually exits.
+  - **Windows**: a running exe is locked against a direct rename onto it,
+    but *renaming the running exe itself* is allowed — verified live with
+    a real running test binary (`Rename-Item` on a `Start-Process`'d exe
+    succeeded). So the swap is two steps: rename the running exe to
+    `<exe>.old`, then rename the newly-extracted binary into the original
+    path. The leftover `.old` is deleted on next launch (`cleanupOldExe()`,
+    called from `main()`), and also pre-emptively before each swap in case
+    a prior update's cleanup never ran.
+  - `applyUpdate()` is a thin `os.Executable()` wrapper around
+    `applyUpdateAt(exePath, assetURL)` — split out specifically so the
+    real production download/extract/rename code could be exercised in a
+    throwaway test against the actual live `v0.2.0` release and a real
+    running fake binary, instead of trusting the logic by inspection. Test
+    passed end-to-end (real download, real extraction, real swap over a
+    running process, swapped binary launches) and was deleted afterward —
+    it was a one-time verification, not a kept test file.
+- Update state lives on `model` (`updateChecked`, `updateAvailable`,
+  `updateLatest`, `updateAssetURL`, `updateCheckErr`, `updateDownloading`,
+  `updateResult`, `updateResultErr`) — same pattern as the existing ollama
+  install-prompt flow.
+
+## Tool browser overhaul, tool mode, stream-crash detection — fifth session (2026-08-23)
+
+- **Tool-categories screen (`Alt+T`) was silently dropping ~20 tools**: it had
+  no scrolling, so `clampToLastLines` cut whatever didn't fit off the *top* —
+  exactly the "Files & Archives" and "Shell & Processes" categories. Fixed:
+  - Every tool is now numbered (`1. read_file`, `2. write_file`, ...),
+    sequential across all categories, derived from a single
+    `flatToolNames()` source shared with the chat banner's tool count so the
+    two can't drift apart.
+  - `Tab` / `Shift+Tab` cycle a highlighted selection through all 55 tools,
+    auto-scrolling to keep it on screen; `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End`
+    still free-scroll independently.
+  - `Enter` opens a detail view for the selected tool: its real description
+    (pulled from the same `agentTools()` source sent to Ollama, not
+    duplicated) plus two example prompts, closed with `Esc`.
+- **Tool mode (`Alt+M`)**, cycles `auto` → `on` → `off` → `auto`, shown live
+  in the footer (`tool mode: auto  Alt+H: help`):
+  - `auto` (default): tools stay on normally but are automatically skipped
+    for any single message that attaches an image. Confirmed via direct
+    `/api/chat` testing that at least `gemma4:e2b` garbles the image
+    entirely when `tools` is also in the request (works fine without it,
+    "unreadable/corrupted characters" with it) — a message can reliably have
+    working vision or working tools, not both, so `auto` always prefers
+    vision when an image is present, then resumes tools on the next
+    image-free message. Implemented as a per-turn `suppressTools` flag on
+    `runAgentTurn` that never touches the model's actually-remembered
+    `agentToolsSupported` capability, so a suppressed turn can't
+    accidentally make the app forget the model supports tools.
+  - `on`: always tries tools even with an image attached (accepts the
+    vision-breaking tradeoff). `off`: never sends tools this chat.
+- **Fixed a silent-failure bug in `ollamaChatStream`**: if Ollama's response
+  stream got cut off mid-generation (backend crash, e.g. the `0xC0000409`
+  stack-overrun crash seen with some models) without ever sending its final
+  `done:true` chunk, the old code treated that as a normal, successful,
+  *empty* reply — no error, nothing shown, total silence. Now a stream that
+  ends without `done:true` surfaces a real error instead.
+- **Model warm-up status** in the chat banner: `○ waiting for model to
+  finish loading...` / `● model loaded and ready` / a red error. First
+  implementation fired its own throwaway generate request on chat open to
+  force a readiness check — that raced with a real message sent while the
+  model was still cold-loading/being swapped in and corrupted that turn
+  (reproduced: a working vision model started failing immediately after
+  this was added). Replaced with a passive `ollama ps` poll that only ever
+  reads state, plus marking the status "ready" the instant any real token,
+  tool round, or completed turn arrives — so a stale/never-matching poll
+  can't leave the banner stuck on "loading" while answers are visibly
+  streaming in.
+- **Chat text now reads prefix-colored, body-grey**: `you>` / `modelName>`
+  keep their bright colors so it's still obvious who's talking, but the
+  actual message text (typed input included, live while composing) renders
+  in plain grey instead of competing for attention.
+- **"list models" was leaving a dead gap above the footer**: its visible-row
+  count used a hardcoded `overhead = 12` guess; recomputed precisely from
+  the actual fixed lines (header/footer/box-padding/title/search/blank/
+  column-header = 8) so the table now uses all the space it actually has.
+- **First-run disclaimer**: the attention-grabbing lead-in of each paragraph
+  (`llama-shell is an independent, unofficial tool.`, `License.`,
+  `No warranty.`, `Use at your own risk`) and the "disclaimer" title itself
+  render in red; `[a] I agree, continue` is green, `[q] quit` is red — same
+  treatment on the `Ctrl+H` → disclaimer screen.
+- **Offers to install Ollama** right after agreeing to the disclaimer, if
+  it's not found: Linux runs the official one-line installer
+  (`curl -fsSL https://ollama.com/install.sh | sh`) unattended; macOS/Windows
+  open the correct download page instead, since those installs are signed
+  GUI installers, not scriptable. First run only.
+- **`ollama: not installed`** in the footer now blinks (and is bold) so it's
+  harder to miss; the header/footer bar itself was darkened
+  (`#5F5FAF` → `#3A3A66`) for more contrast against that red text.
+
+## 13 new tools, clipboard-paste fix, Alt-key rebind — fourth session (2026-08-23)
+
+- **Fixed clipboard image paste for real**: `System.Windows.Forms.Clipboard`
+  requires PowerShell to run in STA mode; the paste script was launched
+  without `-sta` and silently failed every time. Added it.
+- **Paste now gives visible feedback**: a "pasting from clipboard..." status
+  while running, then "pasted image: \<name\>" / "pasted clipboard text (N
+  chars)" shown above the input line until the next message is sent.
+- **All `Ctrl+<key>` chat/list/show-info shortcuts rebound to `Alt+<key>`**
+  (`Alt+H`/`Alt+T`/`Alt+V`/`Alt+R`) — browsers reserve `Ctrl+T`/`H`/`R`/`V`
+  for tab/history/reload/paste and never forward them to a web-based
+  terminal (e.g. viewing an LXC console through a browser). `Ctrl+C` stays,
+  since terminals reliably forward SIGINT even through a browser.
+- **CAPABILITIES help section reworked as an actual table** (`CODE | WORD |
+  MEANING`, one row per capability) instead of a run-on paragraph; the
+  inline mentions on "list models"/"show model info" now point at it
+  instead of duplicating a shorter, driftable copy.
+- **13 new agent tools** (55 total): `take_screenshot`/`view_image` (attach
+  image bytes directly to a tool result so a vision-capable model can see
+  them — required a new `executeAgentToolWithImages` wrapper since plain
+  tool results were text-only), `read_pdf` (via poppler's `pdftotext`),
+  `http_post`, `download_file`, `send_notification`, `read_registry`,
+  `run_sql` (via the `sqlite3` CLI), `read_csv`, `read_json`, `git_commit`,
+  `git_branch`, `pull_ollama_model`.
+
 ## Agentic chat polish, vision support, help overhaul — third session (2026-08-23)
 
 - **Capabilities column**: `list models` / `show model info` now show each
