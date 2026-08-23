@@ -5,6 +5,16 @@ versioning — the app footer shows a build timestamp instead (see README).
 
 ## Self-update from GitHub releases — sixth session (2026-08-23)
 
+- **Fixed a version-comparison bug found during a real end-to-end test**:
+  `isNewerVersion()` originally just compared the current and latest
+  version strings for *inequality*, which misfires whenever they differ in
+  either direction — a locally built `v0.2.1-test` running against a real
+  published `v0.2.0` was flagged as "update available" even though the
+  installed copy was actually newer. Verified against the real
+  `github.com/affigabmag/llama-shell` releases API (temporary `v0.2.1-test`
+  → `v0.2.2-test` prerelease/release pair, deleted afterward) before
+  fixing it. Replaced with `parseVersionParts()` + a real numeric
+  major/minor/patch comparison that ignores any `-suffix`.
 - **New `appVersion` build var**, parallel to the existing `buildTime` one:
   set via `-X main.appVersion=vX.Y.Z` at build time, tied to the git tag a
   release is cut from. Falls back to `"dev"` for a plain `go build`, in

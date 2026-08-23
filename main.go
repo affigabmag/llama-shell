@@ -112,14 +112,47 @@ func checkForUpdate() tea.Cmd {
 	}
 }
 
-// isNewerVersion reports whether latest differs from current, treating a
-// missing/"dev" current version as nothing to compare against.
+// parseVersionParts pulls the leading dotted numeric run out of a version
+// string, e.g. "v0.2.1-test" -> [0, 2, 1]. A trailing "-test"/"-beta" etc.
+// suffix is ignored; anything non-numeric truncates parsing at that point.
+func parseVersionParts(v string) []int {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if i := strings.IndexByte(v, '-'); i != -1 {
+		v = v[:i]
+	}
+	var parts []int
+	for _, s := range strings.Split(v, ".") {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			break
+		}
+		parts = append(parts, n)
+	}
+	return parts
+}
+
+// isNewerVersion does a real semantic comparison (not a string diff, which
+// would misfire on any mismatch regardless of direction — e.g. a locally
+// built "v0.2.1-test" vs. published "v0.2.0" is NOT an available update).
 func isNewerVersion(current, latest string) bool {
 	if current == "" || current == "dev" || latest == "" {
 		return false
 	}
-	norm := func(v string) string { return strings.TrimPrefix(strings.TrimSpace(v), "v") }
-	return norm(current) != norm(latest)
+	cur := parseVersionParts(current)
+	lat := parseVersionParts(latest)
+	for i := 0; i < len(cur) || i < len(lat); i++ {
+		var c, l int
+		if i < len(cur) {
+			c = cur[i]
+		}
+		if i < len(lat) {
+			l = lat[i]
+		}
+		if l != c {
+			return l > c
+		}
+	}
+	return false
 }
 
 type updateApplyResultMsg struct {
