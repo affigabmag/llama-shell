@@ -4,14 +4,18 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +26,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -354,11 +361,16 @@ const (
 	viewDisclaimerText
 	viewLogText
 	viewUpdateText
+	viewWizard
 	viewFirstRunDisclaimer
 	viewAgentChat
 	viewToolCategories
 	viewAgentHelp
 	viewOllamaInstallPrompt
+	viewTavilySettings
+	viewWebServerSettings
+	viewWebServerModelSelect
+	viewTelegramSettings
 )
 
 type cmdResultMsg struct {
@@ -736,6 +748,45 @@ func agentTools() []ollamaTool {
 			},
 		}},
 		{Type: "function", Function: ollamaToolFunction{
+			Name:        "rss_feed",
+			Description: "Fetch an RSS/Atom feed URL and return its items as a clean list of title / link / published date / summary, parsed from the XML. Use this instead of read_webpage for feed URLs (e.g. site.com/rss, feeds.*, /rssindex) — many news sites gate their HTML pages behind a cookie-consent wall but serve their RSS feed unrestricted.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"url": strProp("URL of the RSS or Atom feed.")},
+				"required":   []string{"url"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "find_rss_feed",
+			Description: "Discover a site's real RSS/Atom feed URL(s) by fetching a page and reading its <link rel=\"alternate\" type=\"application/rss+xml\"> / atom+xml tags — the standard way sites advertise their feed. Call this on a site's homepage or section page BEFORE guessing an RSS URL for rss_feed: a guessed path (e.g. /rss, /feed) is often wrong and just wastes a round trip, since not every site follows that convention.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"url": strProp("URL of a page on the site to scan for a feed link (e.g. the homepage).")},
+				"required":   []string{"url"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "tavily_search",
+			Description: "Search the web via the Tavily API (requires the TAVILY_API_KEY environment variable to be set) and return ranked results with title, URL, and a real content snippet — a paid, higher-quality alternative to web_search.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"query":       strProp("Search query."),
+					"max_results": strProp("Max results to return (default 5)."),
+				},
+				"required": []string{"query"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "tavily_extract",
+			Description: "Scrape a URL via the Tavily API (requires the TAVILY_API_KEY environment variable to be set) and return its clean extracted article text — no HTML tags, nav/ads clutter, or cookie-consent walls. Prefer this over read_webpage for a page that read_webpage returned as a consent wall, a JS-only shell, or an unusable jumble, IF a Tavily key is configured.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"url": strProp("URL of the page to scrape.")},
+				"required":   []string{"url"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
 			Name:        "get_public_ip",
 			Description: "Get this machine's public (internet-facing) IP address.",
 			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
@@ -898,6 +949,15 @@ func agentTools() []ollamaTool {
 			},
 		}},
 		{Type: "function", Function: ollamaToolFunction{
+			Name:        "read_document",
+			Description: "Extract plain text from a document so you can read and answer questions about it — .pdf (requires poppler's `pdftotext` on PATH), .docx (Word, parsed directly, no external tool needed), or any plain-text file (.txt/.md/etc, read as-is). Picks the right extraction method from the file extension.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"path": strProp("Document file path (.pdf, .docx, or plain text), relative to the working directory or absolute.")},
+				"required":   []string{"path"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
 			Name:        "http_post",
 			Description: "POST a request body to a URL over HTTP(S) and return the response as text (truncated if large).",
 			Parameters: map[string]interface{}{
@@ -1019,6 +1079,67 @@ func truncateToolOutput(s string) string {
 	return s
 }
 
+// readDocxText extracts plain text from a .docx file. Word's format is a
+// zip archive of XML parts — the visible document text lives in
+// word/document.xml as a sequence of <w:t> runs grouped into <w:p>
+// paragraphs (table cells are just paragraphs nested one level deeper, so
+// no special-casing is needed to pick up table text too).
+func readDocxText(path string) (string, error) {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+
+	var docFile *zip.File
+	for _, f := range zr.File {
+		if strings.ReplaceAll(f.Name, "\\", "/") == "word/document.xml" {
+			docFile = f
+			break
+		}
+	}
+	if docFile == nil {
+		return "", fmt.Errorf("word/document.xml not found — not a valid .docx")
+	}
+
+	rc, err := docFile.Open()
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+
+	var b strings.Builder
+	dec := xml.NewDecoder(rc)
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch el := tok.(type) {
+		case xml.StartElement:
+			if el.Name.Local == "t" {
+				var text string
+				if err := dec.DecodeElement(&text, &el); err != nil {
+					return "", err
+				}
+				b.WriteString(text)
+			} else if el.Name.Local == "tab" {
+				b.WriteString("\t")
+			} else if el.Name.Local == "br" || el.Name.Local == "cr" {
+				b.WriteString("\n")
+			}
+		case xml.EndElement:
+			if el.Name.Local == "p" {
+				b.WriteString("\n")
+			}
+		}
+	}
+	return b.String(), nil
+}
+
 func resolveAgentPath(workDir, p string) string {
 	if p == "" {
 		p = "."
@@ -1042,19 +1163,242 @@ func toolArgString(args map[string]interface{}, key string) string {
 // executeAgentTool runs one tool call locally and returns its text result,
 // which is fed back to the model as a "tool" role message.
 var (
-	htmlTagRe = regexp.MustCompile(`(?is)<script.*?</script>|<style.*?</style>|<[^>]+>`)
-	htmlWSRe  = regexp.MustCompile(`\s+`)
+	htmlWSRe = regexp.MustCompile(`\s+`)
 
 	ddgResultLinkRe = regexp.MustCompile(`(?s)<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>`)
 	ddgSnippetRe    = regexp.MustCompile(`(?s)<a class="result__snippet"[^>]*>(.*?)</a>`)
 )
 
-// stripHTMLTags turns raw HTML into plain readable text: script/style
-// blocks and tags are dropped, then whitespace is collapsed.
+// stripHTMLTags turns raw HTML into plain readable text. A regex-based
+// tag stripper breaks the moment an attribute value (e.g. a large inline
+// style="...") contains a literal '>', so this scans char-by-char instead,
+// tracking quote state inside tags and skipping script/style element
+// bodies entirely by their closing tag name.
 func stripHTMLTags(s string) string {
-	s = htmlTagRe.ReplaceAllString(s, " ")
-	s = htmlWSRe.ReplaceAllString(s, " ")
-	return strings.TrimSpace(s)
+	var out strings.Builder
+	lower := strings.ToLower(s)
+	i := 0
+	for i < len(s) {
+		if s[i] != '<' {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		// Comments (<!-- ... -->) can carry raw CSS/JS (fallback styles,
+		// conditional-comment hacks). Drop them verbatim by literal
+		// "-->" search — quote-tracking doesn't apply inside a comment.
+		if strings.HasPrefix(s[i:], "<!--") {
+			end := strings.Index(s[i+4:], "-->")
+			if end < 0 {
+				break // unterminated comment: drop the remainder of the document
+			}
+			i = i + 4 + end + 3
+			continue
+		}
+
+		// Identify the tag name to see if it opens a script/style block.
+		j := i + 1
+		for j < len(s) && s[j] != '>' && s[j] != ' ' && s[j] != '\t' && s[j] != '\n' && s[j] != '/' {
+			j++
+		}
+		tagName := lower[i+1 : j]
+
+		if tagName == "script" || tagName == "style" {
+			closer := "</" + tagName
+			end := strings.Index(lower[j:], closer)
+			if end < 0 {
+				break // unterminated block: drop the remainder of the document
+			}
+			i = j + end
+			// Skip past the closing tag itself (up to its '>').
+			for i < len(s) && s[i] != '>' {
+				i++
+			}
+			i++
+			continue
+		}
+
+		// Ordinary tag: skip to its unquoted '>', respecting quoted
+		// attribute values so an embedded '>' doesn't end the tag early.
+		var quote byte
+		for i < len(s) {
+			c := s[i]
+			if quote != 0 {
+				if c == quote {
+					quote = 0
+				}
+			} else if c == '"' || c == '\'' {
+				quote = c
+			} else if c == '>' {
+				i++
+				break
+			}
+			i++
+		}
+	}
+	return strings.TrimSpace(htmlWSRe.ReplaceAllString(out.String(), " "))
+}
+
+var htmlLinkTagRe = regexp.MustCompile(`(?is)<link\s[^>]*>`)
+
+type discoveredFeed struct {
+	title string
+	url   string
+}
+
+// htmlTagAttr pulls one attribute's value out of a raw <tag ...> string,
+// accepting either single or double quotes.
+func htmlTagAttr(tag, attr string) string {
+	re := regexp.MustCompile(`(?i)` + attr + `\s*=\s*"([^"]*)"|` + attr + `\s*=\s*'([^']*)'`)
+	m := re.FindStringSubmatch(tag)
+	if m == nil {
+		return ""
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return m[2]
+}
+
+// findRSSFeedLinks scans raw HTML for <link rel="alternate" type=".../rss+xml
+// or .../atom+xml" href="..."> tags — the standard mechanism a site uses to
+// advertise its feed(s) to browsers/readers — and resolves each href
+// against pageURL (feeds are commonly linked with a relative path).
+func findRSSFeedLinks(html, pageURL string) []discoveredFeed {
+	base, err := url.Parse(pageURL)
+	var feeds []discoveredFeed
+	for _, tag := range htmlLinkTagRe.FindAllString(html, -1) {
+		rel := strings.ToLower(htmlTagAttr(tag, "rel"))
+		typ := strings.ToLower(htmlTagAttr(tag, "type"))
+		if !strings.Contains(rel, "alternate") {
+			continue
+		}
+		if !strings.Contains(typ, "rss") && !strings.Contains(typ, "atom") && !strings.Contains(typ, "xml") {
+			continue
+		}
+		href := htmlTagAttr(tag, "href")
+		if href == "" {
+			continue
+		}
+		resolved := href
+		if err == nil {
+			if u, uerr := url.Parse(href); uerr == nil {
+				resolved = base.ResolveReference(u).String()
+			}
+		}
+		title := htmlTagAttr(tag, "title")
+		if title == "" {
+			title = "feed"
+		}
+		feeds = append(feeds, discoveredFeed{title: title, url: resolved})
+	}
+	return feeds
+}
+
+// rssItem is one parsed feed entry, normalized across RSS 2.0's <item> and
+// Atom's <entry> shapes.
+type rssItem struct {
+	Title     string
+	Link      string
+	Published string
+	Summary   string
+}
+
+// parseRSSFeed parses either RSS 2.0 (<rss><channel><item>) or Atom
+// (<feed><entry>) XML into a normalized item list.
+func parseRSSFeed(data []byte) ([]rssItem, error) {
+	var rss struct {
+		Channel struct {
+			Items []struct {
+				Title       string `xml:"title"`
+				Link        string `xml:"link"`
+				PubDate     string `xml:"pubDate"`
+				Description string `xml:"description"`
+			} `xml:"item"`
+		} `xml:"channel"`
+	}
+	if err := xml.Unmarshal(data, &rss); err == nil && len(rss.Channel.Items) > 0 {
+		items := make([]rssItem, len(rss.Channel.Items))
+		for i, it := range rss.Channel.Items {
+			items[i] = rssItem{Title: it.Title, Link: it.Link, Published: it.PubDate, Summary: it.Description}
+		}
+		return items, nil
+	}
+
+	var atom struct {
+		Entries []struct {
+			Title   string `xml:"title"`
+			Link    struct {
+				Href string `xml:"href,attr"`
+			} `xml:"link"`
+			Updated string `xml:"updated"`
+			Summary string `xml:"summary"`
+		} `xml:"entry"`
+	}
+	if err := xml.Unmarshal(data, &atom); err != nil {
+		return nil, err
+	}
+	items := make([]rssItem, len(atom.Entries))
+	for i, it := range atom.Entries {
+		items[i] = rssItem{Title: it.Title, Link: it.Link.Href, Published: it.Updated, Summary: it.Summary}
+	}
+	return items, nil
+}
+
+// tavilyPost POSTs a JSON body to a Tavily API endpoint and returns the raw
+// response body, erroring on a non-2xx status.
+func tavilyPost(endpoint string, body []byte) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("POST", endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Tavily API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return data, nil
+}
+
+// fetchURL issues a GET with browser-like headers and retries once after a
+// short backoff on 429, since many sites (e.g. Yahoo Finance) block Go's
+// default User-Agent outright.
+func fetchURL(target string) (*http.Response, []byte, error) {
+	client := &http.Client{Timeout: 20 * time.Second}
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequest("GET", target, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		if resp.StatusCode == 429 && attempt == 0 {
+			resp.Body.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return resp, nil, err
+		}
+		return resp, data, nil
+	}
 }
 
 // webSearch scrapes DuckDuckGo's no-JS HTML results page — no API key
@@ -1082,7 +1426,7 @@ func webSearch(query string) (string, error) {
 	links := ddgResultLinkRe.FindAllStringSubmatch(page, -1)
 	snippets := ddgSnippetRe.FindAllStringSubmatch(page, -1)
 
-	const maxResults = 8
+	const maxResults = 15
 	var b strings.Builder
 	for i := 0; i < len(links) && i < maxResults; i++ {
 		title := strings.TrimSpace(stripHTMLTags(links[i][2]))
@@ -1336,13 +1680,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		return truncateToolOutput(result)
 
 	case "http_get":
-		client := &http.Client{Timeout: 20 * time.Second}
-		resp, err := client.Get(toolArgString(args, "url"))
-		if err != nil {
-			return "error: " + err.Error()
-		}
-		defer resp.Body.Close()
-		data, err := io.ReadAll(resp.Body)
+		resp, data, err := fetchURL(toolArgString(args, "url"))
 		if err != nil {
 			return "error: " + err.Error()
 		}
@@ -1393,17 +1731,126 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		return result
 
 	case "read_webpage":
-		client := &http.Client{Timeout: 20 * time.Second}
-		resp, err := client.Get(toolArgString(args, "url"))
-		if err != nil {
-			return "error: " + err.Error()
-		}
-		defer resp.Body.Close()
-		data, err := io.ReadAll(resp.Body)
+		_, data, err := fetchURL(toolArgString(args, "url"))
 		if err != nil {
 			return "error: " + err.Error()
 		}
 		return truncateToolOutput(stripHTMLTags(string(data)))
+
+	case "rss_feed":
+		_, data, err := fetchURL(toolArgString(args, "url"))
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		items, err := parseRSSFeed(data)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		if len(items) == 0 {
+			return "feed fetched but no items found — it may not be a valid RSS/Atom feed"
+		}
+		var b strings.Builder
+		for i, it := range items {
+			fmt.Fprintf(&b, "%d. %s\n   %s\n", i+1, strings.TrimSpace(it.Title), strings.TrimSpace(it.Link))
+			if pub := strings.TrimSpace(it.Published); pub != "" {
+				fmt.Fprintf(&b, "   %s\n", pub)
+			}
+			if sum := strings.TrimSpace(stripHTMLTags(it.Summary)); sum != "" {
+				fmt.Fprintf(&b, "   %s\n", sum)
+			}
+		}
+		return truncateToolOutput(b.String())
+
+	case "find_rss_feed":
+		pageURL := toolArgString(args, "url")
+		_, data, err := fetchURL(pageURL)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		feeds := findRSSFeedLinks(string(data), pageURL)
+		if len(feeds) == 0 {
+			return "no RSS/Atom <link> tag found on that page — this site may not expose a feed, or advertises it somewhere else (try the homepage if this was a section page, or fall back to web_search/tavily_extract/read_webpage)"
+		}
+		var b strings.Builder
+		for _, f := range feeds {
+			fmt.Fprintf(&b, "%s — %s\n", f.title, f.url)
+		}
+		return truncateToolOutput(b.String())
+
+	case "tavily_search":
+		apiKey := os.Getenv("TAVILY_API_KEY")
+		if apiKey == "" {
+			return "error: TAVILY_API_KEY environment variable is not set — get a key at https://www.tavily.com/ and set it to use this tool"
+		}
+		maxResults := toolArgString(args, "max_results")
+		if maxResults == "" {
+			maxResults = "5"
+		}
+		n, err := strconv.Atoi(maxResults)
+		if err != nil || n <= 0 {
+			n = 5
+		}
+		body, _ := json.Marshal(map[string]interface{}{
+			"api_key":     apiKey,
+			"query":       toolArgString(args, "query"),
+			"max_results": n,
+		})
+		data, err := tavilyPost("https://api.tavily.com/search", body)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		var resp struct {
+			Results []struct {
+				Title   string `json:"title"`
+				URL     string `json:"url"`
+				Content string `json:"content"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return "error: couldn't parse Tavily response: " + err.Error()
+		}
+		if len(resp.Results) == 0 {
+			return "no results"
+		}
+		var b strings.Builder
+		for i, r := range resp.Results {
+			fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n", i+1, strings.TrimSpace(r.Title), strings.TrimSpace(r.URL), strings.TrimSpace(r.Content))
+		}
+		return truncateToolOutput(b.String())
+
+	case "tavily_extract":
+		apiKey := os.Getenv("TAVILY_API_KEY")
+		if apiKey == "" {
+			return "error: TAVILY_API_KEY environment variable is not set — get a key at https://www.tavily.com/ and set it to use this tool"
+		}
+		body, _ := json.Marshal(map[string]interface{}{
+			"api_key": apiKey,
+			"urls":    []string{toolArgString(args, "url")},
+		})
+		data, err := tavilyPost("https://api.tavily.com/extract", body)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		var resp struct {
+			Results []struct {
+				URL        string `json:"url"`
+				RawContent string `json:"raw_content"`
+			} `json:"results"`
+			FailedResults []struct {
+				URL   string `json:"url"`
+				Error string `json:"error"`
+			} `json:"failed_results"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return "error: couldn't parse Tavily response: " + err.Error()
+		}
+		if len(resp.Results) == 0 {
+			if len(resp.FailedResults) > 0 {
+				return "error: Tavily couldn't extract that URL: " + resp.FailedResults[0].Error
+			}
+			return "error: Tavily returned no content for that URL"
+		}
+		return truncateToolOutput(strings.TrimSpace(resp.Results[0].RawContent))
 
 	case "get_public_ip":
 		client := &http.Client{Timeout: 10 * time.Second}
@@ -1575,6 +2022,41 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 			return "error: " + err.Error() + " (requires poppler's pdftotext on PATH)\n" + string(out)
 		}
 		return truncateToolOutput(string(out))
+
+	case "read_document":
+		full := resolveAgentPath(workDir, toolArgString(args, "path"))
+		const maxLen = 40000
+		switch strings.ToLower(filepath.Ext(full)) {
+		case ".pdf":
+			out, err := exec.Command("pdftotext", full, "-").CombinedOutput()
+			if err != nil {
+				return "error: " + err.Error() + " (requires poppler's pdftotext on PATH)\n" + string(out)
+			}
+			if len(out) > maxLen {
+				return string(out[:maxLen]) + "\n...(truncated)"
+			}
+			return string(out)
+		case ".doc":
+			return "error: legacy .doc isn't supported — convert it to .docx or .pdf first"
+		case ".docx":
+			text, err := readDocxText(full)
+			if err != nil {
+				return "error: " + err.Error()
+			}
+			if len(text) > maxLen {
+				return text[:maxLen] + "\n...(truncated)"
+			}
+			return text
+		default:
+			data, err := os.ReadFile(full)
+			if err != nil {
+				return "error: " + err.Error()
+			}
+			if len(data) > maxLen {
+				return string(data[:maxLen]) + "\n...(truncated)"
+			}
+			return string(data)
+		}
 
 	case "http_post":
 		contentType := toolArgString(args, "content_type")
@@ -1877,6 +2359,29 @@ func waitForAgentStream(ch chan tea.Msg) tea.Cmd {
 // is thinking/calling tools so the screen doesn't look frozen.
 var agentSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// agentThinkingPhrase rotates the status text alongside the spinner so a
+// long wait doesn't just sit on a static "thinking..." — it reads as
+// progress toward a finish, not a stall. The first few stages are one-shot
+// ("almost done" included on purpose, so waiting reads as nearly over
+// rather than open-ended); past that it cycles a small set of longer-wait
+// phrases every few seconds so it keeps feeling alive.
+func agentThinkingPhrase(elapsed time.Duration) string {
+	switch {
+	case elapsed < 4*time.Second:
+		return "is thinking..."
+	case elapsed < 8*time.Second:
+		return "is reasoning..."
+	case elapsed < 14*time.Second:
+		return "is working..."
+	case elapsed < 20*time.Second:
+		return "is almost done..."
+	default:
+		phrases := []string{"is still going...", "is taking a while...", "is almost done..."}
+		idx := int((elapsed - 20*time.Second) / (6 * time.Second))
+		return phrases[idx%len(phrases)]
+	}
+}
+
 type agentTickMsg struct{}
 
 func agentTickCmd() tea.Cmd {
@@ -1895,6 +2400,82 @@ func agentTickCmd() tea.Cmd {
 // mode, which skips tools on any turn that attaches an image (see the call
 // site for why) but must not let that turn's request permanently forget the
 // model actually does support tools once no image is involved.
+// agentSystemPrompt builds the system message for a fresh agentic chat,
+// shared by the TUI's own chat and the local web server so both get the
+// exact same tool-usage rules (file access, web/RSS/Tavily fallback
+// order, etc.) rather than two prompts drifting apart over time.
+func agentSystemPrompt(wd string) string {
+	return fmt.Sprintf(
+		"You are a local coding assistant with REAL file system access via read_file, "+
+			"write_file, append_file, list_dir, make_dir, delete_file, search_files — these "+
+			"reach any path on disk, not just one folder. Relative paths resolve against %s; "+
+			"absolute paths (C:\\..., D:\\...) work as given, unrestricted. Never claim you lack "+
+			"file access or are sandboxed to one directory — you're not. Use list_dir for "+
+			"directory contents, read_file for one file's contents. On any file/fs request, "+
+			"call the matching tool immediately and report the real result (errors included) "+
+			"— don't ask for clarification or describe what the user should do manually. "+
+			"Tools ADD to your abilities, they don't replace normal chat — only use one when "+
+			"the request actually needs file/system/network access; never refuse a normal "+
+			"request by claiming you're 'only' a tool assistant. "+
+			"Web tools: web_search gives snippets only, never full article text — for a "+
+			"specific story or 'top N' request, follow up with read_webpage or rss_feed on "+
+			"the best result and answer from that; don't stop at a link list. "+
+			"HARD RULE for ALL web results, not just 'top N': every item in ANY answer built "+
+			"from web_search/tavily_search/read_webpage/rss_feed must include BOTH the actual "+
+			"URL AND a one-to-two-sentence summary of what it's actually about, taken from the "+
+			"snippet/content the tool gave you — a bare link, or a title with no summary, is "+
+			"NEVER an acceptable answer on its own; the user wants to know what the content "+
+			"actually says without clicking through. "+
+			"For ANY 'top N' request specifically (a site's headlines, or a general topic like "+
+			"'top 10 news about X'), your final answer MUST additionally list exactly N distinct "+
+			"items (same URL+summary rule applies to each). If web_search's first batch has fewer than N usable "+
+			"results, call it again with a broader/different query instead of quietly stopping "+
+			"short or padding with vague unsourced claims. "+
+			"HARD RULE, no exceptions: NEVER call read_webpage on finance.yahoo.com or "+
+			"ynet.co.il, no matter how the user phrases the request (news, topics, headlines, "+
+			"stories, top N, or just mentioning the site) and even if you already have an older "+
+			"read_webpage result for that site earlier in this conversation — that old result is "+
+			"a vague unusable blob, not real headlines, so don't reuse or re-summarize it. "+
+			"Always call rss_feed fresh instead: finance.yahoo.com -> "+
+			"https://finance.yahoo.com/news/rssindex, ynet.co.il -> "+
+			"https://www.ynet.co.il/Integration/StoryRss2.xml (both sites show a cookie-consent "+
+			"wall via plain GET, which is exactly why read_webpage on them only ever produces "+
+			"vague theme summaries instead of actual news items). For any other site, call "+
+			"find_rss_feed first to discover its real feed — do not guess a path, and do not "+
+			"fall back to read_webpage on that site's raw HTML for a 'topics'/'themes' summary "+
+			"either, since that produces the same vague, no-real-items failure. If find_rss_feed "+
+			"finds nothing, fall back to tavily_extract/web_search — read_webpage's stripped "+
+			"text can't be split into an exact count of items, so treat it as a last resort, "+
+			"not a first choice, for any 'top N' or 'topics/themes' request. Prefer tavily_extract "+
+			"over read_webpage when TAVILY_API_KEY is set (cleaner text, no consent walls); "+
+			"if it errors for a missing key, just fall back silently. Every web-sourced item "+
+			"in your answer MUST cite its actual URL, formatted as a markdown link wrapped "+
+			"around the item's own headline/title text — e.g. "+
+			"'[Stanley Druckenmiller and Cathie Wood agree on 2 tech giant stocks]"+
+			"(https://finance.yahoo.com/markets/stocks/articles/...)' — never print the raw URL "+
+			"as separate visible text like 'URL: https://...' or on its own line, and never "+
+			"write '(Source: MSN)'/'(Bloomberg)' alone with no link at all: the headline text "+
+			"itself IS the clickable citation.", wd,
+	)
+}
+
+// shouldRetryWithoutTools reports whether a chat error means "give up on
+// tools for this turn and retry plain" rather than a real failure worth
+// surfacing as-is. Covers two distinct cases: (1) Ollama flatly rejects
+// models with no tool-calling capability, and (2) some models (seen with
+// gemma4:e2b) crash their native llama-server backend outright — exit
+// 0xc0000409, GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS) — when
+// handed this app's full tool list (60+ schemas) in one request. That's a
+// fixed scheduler limit in the backend, not something a bigger/smaller
+// prompt fixes, so the only working mitigation is dropping tools entirely
+// for this turn and answering without them instead of hard-failing.
+func shouldRetryWithoutTools(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "does not support tools") ||
+		strings.Contains(msg, "GGML_SCHED_MAX_SPLIT_INPUTS") ||
+		strings.Contains(msg, "llama-server process has terminated")
+}
+
 func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool, suppressTools bool) tea.Cmd {
 	ch := make(chan tea.Msg)
 	go func() {
@@ -1931,7 +2512,7 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 			// tool list. Downgrade to a plain chat (no file/tool access)
 			// instead of hard-failing, and remember the downgrade so later
 			// turns in this same chat skip straight to the plain request.
-			if err != nil && toolsSupported && strings.Contains(err.Error(), "does not support tools") {
+			if err != nil && toolsSupported && shouldRetryWithoutTools(err) {
 				toolsSupported = false
 				reply, err = attempt(nil)
 			}
@@ -1952,6 +2533,37 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 		ch <- agentTurnDoneMsg{messages: msgs, toolsSupported: toolsSupported}
 	}()
 	return waitForAgentStream(ch)
+}
+
+// runAgentTurnSync is the same tool-calling loop as runAgentTurn, blocking
+// instead of streaming through bubbletea messages — for callers with no
+// tea.Program to drive, like the local web server's HTTP handler.
+func runAgentTurnSync(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool) ([]ollamaChatMsg, error) {
+	msgs := append([]ollamaChatMsg(nil), history...)
+	const maxSteps = 8
+	for i := 0; i < maxSteps; i++ {
+		var tools []ollamaTool
+		if toolsSupported {
+			tools = agentTools()
+		}
+		reply, err := ollamaChatStream(modelName, msgs, tools, nil)
+		if err != nil && toolsSupported && shouldRetryWithoutTools(err) {
+			toolsSupported = false
+			reply, err = ollamaChatStream(modelName, msgs, nil, nil)
+		}
+		if err != nil {
+			return msgs, err
+		}
+		msgs = append(msgs, reply)
+		if len(reply.ToolCalls) == 0 {
+			break
+		}
+		for _, tc := range reply.ToolCalls {
+			toolResult, toolImages := executeAgentToolWithImages(workDir, tc.Function.Name, tc.Function.Arguments)
+			msgs = append(msgs, ollamaChatMsg{Role: "tool", Content: toolResult, Images: toolImages})
+		}
+	}
+	return msgs, nil
 }
 
 type modelRow struct {
@@ -2003,6 +2615,1148 @@ func markDisclaimerAccepted() {
 		return
 	}
 	_ = os.WriteFile(path, []byte(time.Now().Format(time.RFC3339)), 0o644)
+}
+
+// tavilyKeyFilePath is where the Tavily API key is persisted locally, so
+// the user only has to enter it once via the settings screen instead of
+// setting an environment variable by hand every session.
+func tavilyKeyFilePath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "tavily_api_key")
+}
+
+// saveTavilyKey persists the key to disk and makes it immediately usable
+// in this process (the tool handlers read it via os.Getenv), so a restart
+// isn't needed after saving.
+func saveTavilyKey(key string) error {
+	// Defense in depth: strip any non-printable rune (a stray control
+	// character slipping in during a paste is exactly what made
+	// os.Setenv fail with "invalid argument" before the input filter
+	// existed) so a bad paste can't silently corrupt the saved key either.
+	key = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, key)
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("key is empty after removing invalid characters")
+	}
+	path := tavilyKeyFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
+		return err
+	}
+	return os.Setenv("TAVILY_API_KEY", key)
+}
+
+// webServerConfig persists across restarts: whether the local web server
+// should be running and which model it serves.
+type webServerConfig struct {
+	Enabled bool   `json:"enabled"`
+	Model   string `json:"model"`
+	Token   string `json:"token"`
+}
+
+// genWebServerToken makes a random per-install access token, embedded as
+// a query param in the URL shown to the user. Binding to 127.0.0.1 keeps
+// this off the network, but it's not a security boundary against other
+// software/browser tabs on the same machine — this token is the actual
+// gate: without it every request gets a 403, since the API underneath
+// grants full local tool access (files, commands, network).
+func genWebServerToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+func webServerConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "webserver_config.json")
+}
+
+func loadWebServerConfig() webServerConfig {
+	data, err := os.ReadFile(webServerConfigPath())
+	if err != nil {
+		return webServerConfig{}
+	}
+	var cfg webServerConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveWebServerConfig(cfg webServerConfig) error {
+	path := webServerConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+const webServerPort = 8787
+
+var (
+	webServerMu      sync.Mutex
+	webServerHTTP    *http.Server
+	webServerModel   string
+	webServerWorkDir string
+	// webServerLastErr holds the reason the most recent start attempt
+	// failed (e.g. auto-start at launch racing a port already in use), so
+	// the settings screen can show WHY it's "enabled but not running"
+	// instead of leaving that a silent mystery.
+	webServerLastErr string
+)
+
+// isWebServerRunning reports whether the local web server is currently
+// listening in this process.
+func isWebServerRunning() bool {
+	webServerMu.Lock()
+	defer webServerMu.Unlock()
+	return webServerHTTP != nil
+}
+
+// webServerURL is what gets shown to the user — the token is a required
+// query param, not decoration, so a bare link with no token 403s.
+func webServerURL(token string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/?token=%s", webServerPort, token)
+}
+
+// startWebServer starts (or is a no-op if already running) the local
+// chat server bound to 127.0.0.1 only — never 0.0.0.0 — so it's reachable
+// from this machine alone, never the local network.
+func startWebServer(cfg webServerConfig, workDir string) error {
+	webServerMu.Lock()
+	defer webServerMu.Unlock()
+	if webServerHTTP != nil {
+		return nil
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", webServerPort))
+	if err != nil {
+		webServerLastErr = err.Error()
+		return err
+	}
+	webServerLastErr = ""
+	webServerModel = cfg.Model
+	webServerWorkDir = workDir
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", webRequireToken(cfg.Token, webHandleChatPage))
+	mux.HandleFunc("/api/chat", webRequireToken(cfg.Token, webHandleChatAPI))
+	mux.HandleFunc("/api/tools", webRequireToken(cfg.Token, webHandleTools))
+	mux.HandleFunc("/api/warmup", webRequireToken(cfg.Token, webHandleWarmup))
+	mux.HandleFunc("/api/status", webRequireToken(cfg.Token, webHandleStatus))
+	srv := &http.Server{Handler: mux}
+	webServerHTTP = srv
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	appendLog("web server started on %s (model %s)", webServerURL(cfg.Token), cfg.Model)
+	return nil
+}
+
+// stopWebServer shuts the server down if running; a no-op otherwise.
+func stopWebServer() {
+	webServerMu.Lock()
+	srv := webServerHTTP
+	webServerHTTP = nil
+	webServerMu.Unlock()
+	if srv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	appendLog("web server stopped")
+}
+
+// webRequireToken gates every route behind the configured access token —
+// see genWebServerToken's comment for why this matters even bound to
+// localhost.
+func webRequireToken(token string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := r.URL.Query().Get("token")
+		if got == "" {
+			got = r.Header.Get("X-Auth-Token")
+		}
+		if token == "" || got != token {
+			http.Error(w, "forbidden — missing or wrong token", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// webChatPageHTML is a minimal, self-contained chat UI: no build step, no
+// external assets — just enough to drive the same tool-calling agent as
+// the TUI's own agentic chat, from a browser.
+const webChatPageHTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llama-shell</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦙</text></svg>">
+<style>
+  :root {
+    --bg: #212123; --bg-raised: #2a2a2d; --bg-inset: #1a1a1c;
+    --text: #e8e8ea; --text-dim: #98989e; --border: #38383c;
+    --accent: #8b7cf6; --accent-dim: #635a9e;
+    --user-tint: rgba(139,124,246,0.08);
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); margin: 0; padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 15px; line-height: 1.6;
+  }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, Menlo, monospace; }
+
+  #topbar {
+    position: fixed; top:0; left:0; right:0; height: 56px; z-index: 5;
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 0 20px; background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  #topbar .brand { display:flex; align-items:center; gap:10px; font-weight:600; }
+  #topbar .brand .dot { width:8px; height:8px; border-radius:50%; background: var(--accent); }
+  #topbar .meta { color: var(--text-dim); font-size: 13px; margin-left: 8px; }
+  #topbar .meta .mono { color: var(--text); }
+  #topbar .icons { display:flex; gap:8px; }
+  .iconbtn {
+    display:flex; align-items:center; gap:6px; cursor:pointer; padding:7px 12px; border-radius:8px;
+    color: var(--text-dim); font-size: 13px; border: 1px solid transparent;
+  }
+  .iconbtn:hover { background: var(--bg-raised); color: var(--text); border-color: var(--border); }
+  .badge { font-size: 12px; padding: 4px 9px; border-radius: 6px; margin-right: 6px; white-space: nowrap; }
+  .badge.on { background: rgba(74,222,128,0.12); color: #4ade80; }
+  .badge.warn { background: rgba(255,215,0,0.12); color: #FFD700; }
+  .badge.off { background: var(--bg-raised); color: var(--text-dim); }
+
+  #chatWrap { padding-top: 56px; padding-bottom: 140px; min-height: 100vh; }
+  #chat { max-width: 720px; margin: 0 auto; padding: 8px 24px; }
+
+  .msg { padding: 22px 0; }
+  .msg.assistant { }
+  .msg .role { font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px;
+               text-transform: uppercase; letter-spacing: 0.03em; }
+  .msg.user .role { color: var(--accent); }
+  .msg .content { white-space: normal; word-wrap: break-word; }
+  .msg .content p { margin: 0 0 12px 0; }
+  .msg .content p:last-child { margin-bottom: 0; }
+  .msg .content a { color: var(--accent); text-decoration: none; }
+  .msg .content a:hover { text-decoration: underline; }
+  .msg .content code { background: var(--bg-inset); padding: 2px 5px; border-radius: 4px; font-size: 13px; }
+  .msg .content pre { background: var(--bg-inset); padding: 12px 14px; border-radius: 8px; overflow-x: auto;
+                       border: 1px solid var(--border); }
+  .msg .content pre code { background: none; padding: 0; }
+  .msg .content ul, .msg .content ol { margin: 0 0 12px 0; padding-left: 22px; }
+  .msg.error .content { color: #ff8080; }
+
+  .step {
+    margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-raised);
+    overflow: hidden;
+  }
+  .step summary {
+    cursor: pointer; padding: 9px 12px; font-size: 13px; color: var(--text-dim);
+    display: flex; align-items: center; gap: 8px; list-style: none;
+  }
+  .step summary::-webkit-details-marker { display: none; }
+  .step summary::before { content: '▸'; font-size: 11px; }
+  .step[open] summary::before { content: '▾'; }
+  .step summary .toolname { color: var(--accent); font-weight: 600; }
+  .step .stepbody { padding: 0 12px 12px 12px; }
+  .step .stepbody pre { margin: 6px 0 0 0; background: var(--bg-inset); padding: 10px 12px;
+                          border-radius: 6px; font-size: 12.5px; max-height: 320px; overflow: auto;
+                          white-space: pre-wrap; word-wrap: break-word; }
+
+  .thinking { display:flex; align-items:center; gap:10px; padding: 22px 0; color: var(--text-dim); font-size: 14px; }
+  .thinking .dots span { display:inline-block; width:6px; height:6px; border-radius:50%; background: var(--accent);
+                          margin-right: 3px; animation: pulse 1.2s infinite ease-in-out; }
+  .thinking .dots span:nth-child(2) { animation-delay: 0.15s; }
+  .thinking .dots span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes pulse { 0%,80%,100% { opacity: 0.25; } 40% { opacity: 1; } }
+
+  #composerWrap {
+    position: fixed; bottom: 0; left: 0; right: 0; padding: 16px 24px 20px 24px;
+    background: linear-gradient(to top, var(--bg) 60%, transparent);
+  }
+  #composer {
+    max-width: 720px; margin: 0 auto; display:flex; align-items:flex-end; gap:10px;
+    background: var(--bg-raised); border: 1px solid var(--border); border-radius: 16px; padding: 10px 10px 10px 16px;
+  }
+  #input {
+    flex:1; background: transparent; color: var(--text); border: none; outline: none;
+    font: inherit; resize: none; max-height: 200px; padding: 6px 0;
+  }
+  #send {
+    background: var(--accent); color: #fff; border: none; border-radius: 10px; width: 36px; height: 36px;
+    cursor: pointer; font-size: 16px; flex-shrink: 0;
+  }
+  #send.stop { background: #c25050; }
+  #hint { text-align:center; font-size: 11px; color: var(--text-dim); margin-top: 8px; }
+
+  #overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.6);
+             z-index:10; align-items:center; justify-content:center; }
+  #overlay.open { display:flex; }
+  #panel { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; max-width:720px;
+           max-height:80vh; width:90%; display:flex; flex-direction:column; overflow:hidden; }
+  #panelHeader { flex-shrink:0; padding: 20px 24px 14px 24px; border-bottom: 1px solid var(--border); }
+  #panelHeader h2 { margin: 0; }
+  #panelHeader p { color: var(--text-dim); margin: 8px 0 0 0; font-size: 13px; }
+  #toolSearch { width: 100%; margin-top: 10px; background: var(--bg-inset); color: var(--text);
+                border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit;
+                font-size: 13px; outline: none; }
+  #toolSearch:focus { border-color: var(--accent); }
+  #panelClose { float:right; cursor:pointer; color: var(--text-dim); }
+  #panelClose:hover { color: var(--text); }
+  #panelBody { overflow-y:auto; padding: 8px 24px 24px 24px; flex:1; }
+  .catGroup { margin-top: 14px; }
+  .catGroup summary::-webkit-details-marker { display: none; }
+  .catHeading { color: #4ade80; font-weight: 700; font-size: 12px; text-transform: uppercase;
+                letter-spacing: 0.04em; cursor: pointer; list-style: none; padding: 4px 0;
+                display: flex; align-items: center; gap: 6px; }
+  .catHeading::before { content: '▸'; font-size: 10px; color: #4ade80; }
+  .catGroup[open] > .catHeading::before { content: '▾'; }
+  .catBody { padding-left: 2px; }
+  .catHeading:first-child { margin-top: 12px; }
+  .toolRow { padding:10px 0; border-bottom:1px solid var(--border); cursor:pointer; display:flex; gap:10px; }
+  .toolRow:hover { background: var(--bg-raised); }
+  .toolRow .num { color: var(--text-dim); font-size: 13px; flex-shrink:0; width: 22px; padding-top: 1px; }
+  .toolRow .body { flex:1; min-width:0; }
+  .toolRow .name { color: var(--accent); font-weight:600; }
+  .toolRow .desc { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+  .toolRow .ex { color: var(--text-dim); font-size: 12px; margin-top: 4px; font-style: italic;
+                 display:flex; align-items:center; gap:6px; }
+  .toolRow .ex .copyIcon { cursor:pointer; color: var(--text-dim); flex-shrink:0; display:flex; }
+  .toolRow .ex .copyIcon:hover { color: var(--accent); }
+  .toolRow .ex .copyIcon.copied { color: #5fd7a0; }
+
+  @media (max-width: 640px) {
+    #topbar { padding: 0 12px; }
+    /* Hidden rather than wrapped: a wrapping topbar has variable height,
+       which would desync #chatWrap's fixed padding-top and #log's fixed
+       top offset, shifting content under the bar. The model/cwd meta is
+       nice-to-have on desktop, not essential on a phone. */
+    #topbar .meta { display: none; }
+    .iconbtn { padding: 6px 9px; font-size: 12px; gap: 4px; }
+    #chat { padding: 8px 14px; }
+    .msg { padding: 16px 0; }
+    #composerWrap { padding: 10px 12px 14px 12px; }
+    #composer { border-radius: 14px; padding: 8px 8px 8px 14px; }
+    /* 16px, not the body's 15px: iOS Safari auto-zooms the page on focusing
+       any input under 16px, which is jarring in a chat composer. */
+    #input { font-size: 16px; }
+    #hint { font-size: 10px; padding: 0 6px; }
+    #panel { width: 94vw; max-height: 85vh; }
+    #panelHeader { padding: 16px 16px 12px 16px; }
+    #panelBody { padding: 8px 16px 20px 16px; }
+  }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <div class="brand">
+    <span class="dot"></span> llama-shell
+    <span class="meta">model: <span class="mono">__MODEL__</span> · cwd: <span class="mono">__CWD__</span></span>
+  </div>
+  <div class="icons">
+    <span id="badges"></span>
+    <a class="iconbtn" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener" style="text-decoration:none">GitHub</a>
+    <span class="iconbtn" id="toolsBtn">🛠 Tools</span>
+    <span class="iconbtn" id="helpBtn">❓ Help</span>
+  </div>
+</div>
+<div id="chatWrap"><div id="chat"></div></div>
+<div id="composerWrap">
+  <div id="composer">
+    <textarea id="input" rows="1" autofocus placeholder="Message llama-shell..."></textarea>
+    <button id="send">➤</button>
+  </div>
+  <div id="hint">Enter to send · Shift+Enter for a new line · tools run on the host machine, not your browser</div>
+</div>
+<div id="overlay">
+  <div id="panel">
+    <div id="panelHeader"><span id="panelClose">✕</span></div>
+    <div id="panelBody"></div>
+  </div>
+</div>
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+let messages = [];
+let warmupTimer = null;
+const chat = document.getElementById('chat');
+const overlay = document.getElementById('overlay');
+const panelBody = document.getElementById('panelBody');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// Minimal markdown: fenced code blocks, inline code, bold, links, bare URLs,
+// paragraphs. Escapes first, then injects tags around already-safe text.
+const BT = String.fromCharCode(96); // backtick — can't appear literally in a Go raw string
+function renderMarkdown(raw) {
+  let s = esc(raw);
+  s = s.replace(new RegExp(BT+BT+BT+'([a-zA-Z0-9]*)\\n([\\s\\S]*?)'+BT+BT+BT, 'g'), (m, lang, code) => '<pre><code>' + code + '</code></pre>');
+  s = s.replace(new RegExp(BT+'([^'+BT+'\\n]+)'+BT, 'g'), '<code>$1</code>');
+  // Collapse "**Headline**\n[url](url)" (bold title followed by a
+  // redundant link whose visible label IS the url) into one real link —
+  // a small model reliably does this instead of "[Headline](url)" no
+  // matter how the prompt asks, so handle it here rather than keep
+  // fighting it with more prompt tuning.
+  s = s.replace(/\*\*([^*\n]+)\*\*\s*\n+\s*\[(https?:\/\/[^\]]+)\]\(\2\)/g,
+    '<strong><a href="$2" target="_blank" rel="noopener">$1</a></strong>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Autolink bare URLs, but skip ones already inside an href="..." from the pass above.
+  const parts = s.split(/(<a [^>]*>.*?<\/a>)/g);
+  s = parts.map((part, i) => {
+    if (i % 2 === 1) return part; // already an anchor tag, leave as-is
+    return part.replace(/https?:\/\/[^\s<)]+/g, u => '<a href="' + u + '" target="_blank" rel="noopener">' + u + '</a>');
+  }).join('');
+  const paras = s.split(/\n\n+/).map(p => '<p>' + p.replace(/\n/g, '<br>') + '</p>');
+  return paras.join('');
+}
+
+// Groups the flat message list into display items: user turns, assistant
+// text, and tool-call "steps" (each paired with its result message) shown
+// as a collapsed trace — the same "progress steps" pattern real agent UIs
+// use, so tool activity is inspectable without cluttering the main thread.
+function buildDisplayItems(msgs) {
+  const items = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.role === 'system' || m.role === 'tool') continue;
+    if (m.role === 'user') { items.push({ type: 'user', content: m.content }); continue; }
+    if (m.role === 'assistant') {
+      if (m.tool_calls && m.tool_calls.length) {
+        let j = i + 1;
+        const steps = m.tool_calls.map(tc => {
+          const result = (msgs[j] && msgs[j].role === 'tool') ? msgs[j].content : null;
+          j++;
+          return { name: tc.function.name, args: tc.function.arguments, result };
+        });
+        items.push({ type: 'steps', steps });
+      }
+      if (m.content && m.content.trim() !== '') {
+        items.push({ type: 'assistant', content: m.content });
+      }
+    }
+  }
+  return items;
+}
+
+function renderStep(step) {
+  const argsStr = JSON.stringify(step.args || {});
+  return '<details class="step">' +
+    '<summary><span class="toolname">' + esc(step.name) + '</span><span class="mono">(' + esc(argsStr) + ')</span></summary>' +
+    '<div class="stepbody"><pre class="mono">' + esc(step.result == null ? '(no result yet)' : step.result) + '</pre></div>' +
+    '</details>';
+}
+
+function render() {
+  const items = buildDisplayItems(messages);
+  chat.innerHTML = items.map(it => {
+    if (it.type === 'user') {
+      return '<div class="msg user"><div class="role">You</div><div class="content">' + renderMarkdown(it.content) + '</div></div>';
+    }
+    if (it.type === 'steps') {
+      return '<div class="msg assistant"><div class="role">Assistant</div><div class="content">' +
+        it.steps.map(renderStep).join('') + '</div></div>';
+    }
+    const isErr = it.content.startsWith('(error)');
+    return '<div class="msg assistant' + (isErr ? ' error' : '') + '"><div class="role">Assistant</div><div class="content">' +
+      renderMarkdown(it.content) + '</div></div>';
+  }).join('');
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+const panelHeader = document.getElementById('panelHeader');
+function closeOverlay() { overlay.classList.remove('open'); }
+document.getElementById('panelClose').onclick = closeOverlay;
+overlay.addEventListener('click', e => { if (e.target === overlay) closeOverlay(); });
+function setPanelHeader(html) {
+  panelHeader.innerHTML = '<span id="panelClose">✕</span>' + html;
+  document.getElementById('panelClose').onclick = closeOverlay;
+}
+
+const COPY_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<rect x="9" y="9" width="13" height="13" rx="2"></rect>' +
+  '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+
+async function openTools() {
+  setPanelHeader('<h2>Tools</h2><p>Loading…</p>');
+  panelBody.innerHTML = '';
+  overlay.classList.add('open');
+  try {
+    const resp = await fetch('/api/tools?token=' + encodeURIComponent(token));
+    const tools = await resp.json();
+    setPanelHeader('<h2>Tools (' + tools.length + ')</h2>' +
+      '<input id="toolSearch" placeholder="Search tools by name or description..." />' +
+      '<p>Click a row to fill the input with an example prompt, or the copy icon to copy it '+
+      'without filling the box.</p>');
+    let html = '';
+    let lastCat = null;
+    let num = 0;
+    let catCount = 0;
+    tools.forEach(t => {
+      if (t.category !== lastCat) {
+        if (lastCat !== null) html += '</div></details>';
+        catCount++;
+        html += '<details class="catGroup"><summary class="catHeading">' + esc(t.category) + '</summary><div class="catBody">';
+        lastCat = t.category;
+      }
+      num++;
+      const exHtml = (t.examples || []).map(e =>
+        '<div class="ex"><span class="copyText">"' + esc(e) + '"</span>' +
+        '<span class="copyIcon" data-copy="' + esc(e) + '" title="Copy">' + COPY_SVG + '</span></div>'
+      ).join('');
+      const searchHay = (t.name + ' ' + t.description + ' ' + (t.examples || []).join(' ')).toLowerCase();
+      html += '<div class="toolRow" data-example="' + esc((t.examples || [])[0] || '') + '" ' +
+        'data-search="' + esc(searchHay) + '">' +
+        '<div class="num">' + num + '.</div>' +
+        '<div class="body"><div class="name">' + esc(t.name) + '</div>' +
+        '<div class="desc">' + esc(t.description) + '</div>' + exHtml + '</div></div>';
+    });
+    if (catCount > 0) html += '</div></details>';
+    panelBody.innerHTML = html;
+    panelBody.querySelectorAll('.copyIcon').forEach(icon => {
+      icon.onclick = (e) => {
+        e.stopPropagation();
+        const text = icon.getAttribute('data-copy');
+        navigator.clipboard.writeText(text).then(() => {
+          icon.classList.add('copied');
+          setTimeout(() => icon.classList.remove('copied'), 1200);
+        }).catch(() => {});
+      };
+    });
+    panelBody.querySelectorAll('.toolRow').forEach(row => {
+      row.onclick = () => {
+        const ex = row.getAttribute('data-example');
+        if (ex) { input.value = ex; input.dispatchEvent(new Event('input')); }
+        closeOverlay();
+        input.focus();
+      };
+    });
+    const groups = panelBody.querySelectorAll('.catGroup');
+    document.getElementById('toolSearch').addEventListener('input', (e) => {
+      const q = e.target.value.trim().toLowerCase();
+      groups.forEach(group => {
+        let anyVisible = false;
+        group.querySelectorAll('.toolRow').forEach(row => {
+          const match = !q || row.getAttribute('data-search').includes(q);
+          row.style.display = match ? '' : 'none';
+          if (match) anyVisible = true;
+        });
+        group.style.display = anyVisible ? '' : 'none';
+        group.open = q !== '' && anyVisible;
+      });
+    });
+  } catch (e) {
+    setPanelHeader('<h2>Tools</h2>');
+    panelBody.innerHTML = '<p style="color:#ff8080">failed to load: ' + esc(String(e)) + '</p>';
+  }
+}
+function openHelp() {
+  setPanelHeader('<h2>Help</h2>');
+  panelBody.innerHTML =
+    '<p>This is the same agentic chat as llama-shell\'s terminal UI, running in a browser.</p>' +
+    '<p><b>Enter</b> sends your message, <b>Shift+Enter</b> adds a new line.<br>' +
+    '<b>🛠 Tools</b> browses every tool available to the model, grouped by category — click a row for an ' +
+    'example prompt, or its copy icon to copy the prompt text.<br>' +
+    'Each assistant turn shows any tool calls as a collapsed step you can expand to inspect.</p>' +
+    '<p style="color:var(--text-dim)">All tool calls (file read/write, commands, web, etc.) run on the ' +
+    'machine hosting this server, not your browser.</p>';
+  overlay.classList.add('open');
+}
+document.getElementById('toolsBtn').onclick = openTools;
+document.getElementById('helpBtn').onclick = openHelp;
+
+async function loadStatusBadges() {
+  const el = document.getElementById('badges');
+  try {
+    const resp = await fetch('/api/status?token=' + encodeURIComponent(token));
+    const s = await resp.json();
+    const badge = (cls, text) => '<span class="badge ' + cls + '">' + esc(text) + '</span>';
+    let html = '';
+    html += s.ollamaInstalled ? badge('on', 'ollama: ' + (s.ollamaVersion || 'installed')) : badge('warn', 'ollama: not installed');
+    html += s.tavilyConfigured ? badge('on', 'tavily: set') : badge('off', 'tavily: off');
+    if (s.telegramBound) html += badge('on', 'tg: bound');
+    else if (s.telegramRunning) html += badge('warn', 'tg: running, not bound');
+    else html += badge('off', 'tg: off');
+    el.innerHTML = html;
+  } catch (e) { /* leave badges as they were */ }
+}
+loadStatusBadges();
+setInterval(loadStatusBadges, 15000);
+
+let warmupLoaded = true;
+async function pollWarmup() {
+  try {
+    const resp = await fetch('/api/warmup?token=' + encodeURIComponent(token));
+    const data = await resp.json();
+    warmupLoaded = !!data.loaded;
+  } catch (e) { /* keep last known state */ }
+}
+
+// Mirrors the TUI's agentThinkingPhrase ladder: elapsed time reads as
+// progress toward a finish instead of one static, seemingly-stuck label.
+function thinkingPhrase(elapsedMs) {
+  if (!warmupLoaded) return 'Loading model into memory';
+  const s = elapsedMs / 1000;
+  if (s < 4) return 'Thinking';
+  if (s < 8) return 'Reasoning';
+  if (s < 14) return 'Working through it';
+  if (s < 20) return 'Almost done';
+  const phrases = ['Still going', 'Taking a while', 'Almost done'];
+  return phrases[Math.floor((s - 20) / 6) % phrases.length];
+}
+
+function autoGrow() {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+}
+input.addEventListener('input', autoGrow);
+
+let busy = false;
+let currentController = null;
+function setBusy(b) {
+  busy = b;
+  sendBtn.textContent = b ? '■' : '➤';
+  sendBtn.title = b ? 'Stop' : 'Send';
+  sendBtn.classList.toggle('stop', b);
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  autoGrow();
+  setBusy(true);
+  currentController = new AbortController();
+  messages.push({ role: 'user', content: text });
+  render();
+  const thinkingRow = document.createElement('div');
+  thinkingRow.className = 'thinking';
+  thinkingRow.innerHTML = '<span class="dots"><span></span><span></span><span></span></span><span id="thinkingLabel">Thinking</span>';
+  chat.appendChild(thinkingRow);
+  window.scrollTo(0, document.body.scrollHeight);
+  const label = document.getElementById('thinkingLabel');
+  const startedAt = Date.now();
+  warmupLoaded = true;
+  pollWarmup();
+  const warmupPollTimer = setInterval(pollWarmup, 1500);
+  warmupTimer = setInterval(() => {
+    if (label) label.textContent = thinkingPhrase(Date.now() - startedAt);
+  }, 1000);
+  try {
+    const resp = await fetch('/api/chat?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: messages }),
+      signal: currentController.signal,
+    });
+    const data = await resp.json();
+    if (data.error) {
+      messages.push({ role: 'assistant', content: '(error) ' + data.error });
+    } else {
+      messages = data.messages;
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      messages.push({ role: 'assistant', content: '(stopped)' });
+    } else {
+      messages.push({ role: 'assistant', content: '(error) ' + e });
+    }
+  }
+  clearInterval(warmupTimer);
+  clearInterval(warmupPollTimer);
+  setBusy(false);
+  currentController = null;
+  render();
+  input.focus();
+}
+sendBtn.onclick = () => {
+  if (busy) {
+    if (currentController) currentController.abort();
+    return;
+  }
+  send();
+};
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !busy) { e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>`
+
+// listInstalledModelNames returns the NAME column of `ollama list` — the
+// set of models actually available locally, so the web server settings
+// screen can offer a real choice instead of guessing.
+func listInstalledModelNames() ([]string, error) {
+	out, err := exec.Command("ollama", "list").CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	var names []string
+	for i, line := range lines {
+		if i == 0 {
+			continue // header
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		names = append(names, fields[0])
+	}
+	return names, nil
+}
+
+// pickDefaultModelIndex picks the web server's default model selection:
+// whatever was configured last time if it's still installed, else
+// gemma4:e2b (this app's recommended default), else the other two
+// wizard-known small models, else just the first installed model.
+func pickDefaultModelIndex(names []string, preferred string) int {
+	priority := []string{preferred, "gemma4:e2b", "gemma2:2b", "qwen2.5:1.5b"}
+	for _, p := range priority {
+		if p == "" {
+			continue
+		}
+		for i, n := range names {
+			if n == p {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+type webServerPullDoneMsg struct {
+	err string
+}
+
+// pullModelForWebServer downloads gemma4:e2b (this app's default) when
+// the web server is being enabled with no local model installed at all.
+// No live progress bar here (unlike the setup wizard's pull) — this is a
+// one-off fallback path, not worth duplicating that machinery for.
+func pullModelForWebServer(name string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := exec.Command("ollama", "pull", name).CombinedOutput()
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			return webServerPullDoneMsg{err: msg}
+		}
+		return webServerPullDoneMsg{}
+	}
+}
+
+func webHandleChatPage(w http.ResponseWriter, r *http.Request) {
+	webServerMu.Lock()
+	modelName, workDir := webServerModel, webServerWorkDir
+	webServerMu.Unlock()
+	page := strings.ReplaceAll(webChatPageHTML, "__MODEL__", modelName)
+	page = strings.ReplaceAll(page, "__CWD__", workDir)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(page))
+}
+
+type webChatRequest struct {
+	Messages []ollamaChatMsg `json:"messages"`
+}
+
+type webChatResponse struct {
+	Messages []ollamaChatMsg `json:"messages,omitempty"`
+	Error    string          `json:"error,omitempty"`
+}
+
+func webHandleChatAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req webChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(webChatResponse{Error: "bad request: " + err.Error()})
+		return
+	}
+	webServerMu.Lock()
+	modelName, workDir := webServerModel, webServerWorkDir
+	webServerMu.Unlock()
+
+	history := req.Messages
+	if len(history) == 0 || history[0].Role != "system" {
+		history = append([]ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(workDir)}}, history...)
+	}
+	updated, err := runAgentTurnSync(modelName, history, workDir, true)
+	if err != nil {
+		json.NewEncoder(w).Encode(webChatResponse{Error: err.Error(), Messages: updated})
+		return
+	}
+	json.NewEncoder(w).Encode(webChatResponse{Messages: updated})
+}
+
+type webToolInfo struct {
+	Name        string   `json:"name"`
+	Category    string   `json:"category"`
+	Description string   `json:"description"`
+	Examples    []string `json:"examples"`
+}
+
+// webHandleTools lists every tool available to the model, grouped by the
+// same categories as the TUI's Alt+T tool browser (agentToolCategories),
+// with descriptions and example prompts.
+func webHandleTools(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var out []webToolInfo
+	for _, cat := range agentToolCategories {
+		for _, name := range cat.tools {
+			info := webToolInfo{Name: name, Category: cat.name, Description: toolDescription(name)}
+			if ex, ok := toolExamples[name]; ok {
+				info.Examples = []string{ex[0], ex[1]}
+			}
+			out = append(out, info)
+		}
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+type webWarmupResponse struct {
+	Loaded bool `json:"loaded"`
+}
+
+// webHandleWarmup lets the page distinguish "the model is still loading
+// into memory" from "the model is actually thinking about my message" —
+// the same distinction the TUI shows via `ollama ps` polling — instead of
+// a single generic "thinking..." that's misleading during a cold load.
+func webHandleWarmup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	webServerMu.Lock()
+	modelName := webServerModel
+	webServerMu.Unlock()
+	out, err := exec.Command("ollama", "ps").CombinedOutput()
+	if err != nil {
+		json.NewEncoder(w).Encode(webWarmupResponse{Loaded: false})
+		return
+	}
+	json.NewEncoder(w).Encode(webWarmupResponse{Loaded: strings.Contains(string(out), modelName)})
+}
+
+type webStatusResponse struct {
+	TavilyConfigured bool   `json:"tavilyConfigured"`
+	TelegramRunning  bool   `json:"telegramRunning"`
+	TelegramBound    bool   `json:"telegramBound"`
+	OllamaInstalled  bool   `json:"ollamaInstalled"`
+	OllamaVersion    string `json:"ollamaVersion"`
+}
+
+// webHandleStatus surfaces the same integration state the TUI's footer
+// shows (ollama installed? Tavily key set? Telegram bot running/bound?),
+// so the web UI isn't blind to state that only has a screen in the
+// terminal app.
+func webHandleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	tgCfg := loadTelegramConfig()
+	ollama := checkOllama()
+	json.NewEncoder(w).Encode(webStatusResponse{
+		TavilyConfigured: os.Getenv("TAVILY_API_KEY") != "",
+		TelegramRunning:  isTelegramRunning(),
+		TelegramBound:    isTelegramRunning() && tgCfg.ChatID != 0,
+		OllamaInstalled:  ollama.installed,
+		OllamaVersion:    ollama.version,
+	})
+}
+
+// telegramConfig persists across restarts: the bot token, which model
+// answers, and the chat this bot is bound to (0 = not yet bound — it
+// auto-binds to whichever chat messages it first, see runTelegramPollLoop).
+type telegramConfig struct {
+	Token  string `json:"token"`
+	Model  string `json:"model"`
+	ChatID int64  `json:"chat_id"`
+}
+
+func telegramConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "telegram_config.json")
+}
+
+func loadTelegramConfig() telegramConfig {
+	data, err := os.ReadFile(telegramConfigPath())
+	if err != nil {
+		return telegramConfig{}
+	}
+	var cfg telegramConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveTelegramConfig(cfg telegramConfig) error {
+	path := telegramConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+var (
+	telegramMu      sync.Mutex
+	telegramCancel  context.CancelFunc
+	telegramRunning bool
+	telegramLastErr string
+)
+
+func isTelegramRunning() bool {
+	telegramMu.Lock()
+	defer telegramMu.Unlock()
+	return telegramRunning
+}
+
+// startTelegramBot launches (or is a no-op if already running) the
+// long-polling loop against Telegram's getUpdates — no incoming webhook,
+// no public URL, nothing reachable from outside this machine, unlike the
+// web server. That's the whole reason Telegram was chosen over WhatsApp.
+func startTelegramBot(cfg telegramConfig, workDir string) {
+	telegramMu.Lock()
+	if telegramRunning {
+		telegramMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	telegramCancel = cancel
+	telegramRunning = true
+	telegramLastErr = ""
+	telegramMu.Unlock()
+	go runTelegramPollLoop(ctx, cfg, workDir)
+	appendLog("telegram bot started (model %s)", cfg.Model)
+}
+
+func stopTelegramBot() {
+	telegramMu.Lock()
+	cancel := telegramCancel
+	telegramRunning = false
+	telegramMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	appendLog("telegram bot stopped")
+}
+
+type tgChat struct {
+	ID int64 `json:"id"`
+}
+
+type tgMessage struct {
+	Chat tgChat `json:"chat"`
+	Text string `json:"text"`
+}
+
+type tgUpdate struct {
+	UpdateID int64      `json:"update_id"`
+	Message  *tgMessage `json:"message"`
+}
+
+type tgGetUpdatesResp struct {
+	OK     bool       `json:"ok"`
+	Result []tgUpdate `json:"result"`
+}
+
+// telegramGetUpdates long-polls up to 30s for new messages — Telegram
+// holds the connection open server-side and returns early the moment a
+// message arrives, so this isn't a tight busy-loop despite running
+// continuously.
+func telegramGetUpdates(token string, offset int64) ([]tgUpdate, error) {
+	client := &http.Client{Timeout: 35 * time.Second}
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", token, offset)
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("telegram getUpdates returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var parsed tgGetUpdatesResp
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, err
+	}
+	if !parsed.OK {
+		return nil, fmt.Errorf("telegram getUpdates: not ok")
+	}
+	return parsed.Result, nil
+}
+
+func telegramSendMessage(token string, chatID int64, text string) error {
+	body, _ := json.Marshal(map[string]interface{}{"chat_id": chatID, "text": text})
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Post(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("telegram sendMessage returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return nil
+}
+
+// telegramSendChatAction shows Telegram's native "typing..." indicator.
+// It only lasts ~5s per call, so the caller needs to re-send it on a
+// ticker for as long as it's actually working.
+func telegramSendChatAction(token string, chatID int64) error {
+	body, _ := json.Marshal(map[string]interface{}{"chat_id": chatID, "action": "typing"})
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(fmt.Sprintf("https://api.telegram.org/bot%s/sendChatAction", token), "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("telegram sendChatAction returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return nil
+}
+
+// runTelegramPollLoop is the bot's whole lifetime: poll, answer, repeat.
+// It auto-binds to the first chat that ever messages it (cfg.ChatID == 0)
+// and persists that binding, then rejects any other chat ID from then on
+// — otherwise anyone who discovers the bot's @username would get the same
+// full local tool access (files, commands, network) you have here.
+func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string) {
+	var offset int64
+	history := []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(workDir)}}
+	boundChatID := cfg.ChatID
+	consecutiveErrs := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		updates, err := telegramGetUpdates(cfg.Token, offset)
+		if err != nil {
+			consecutiveErrs++
+			telegramMu.Lock()
+			telegramLastErr = err.Error()
+			telegramMu.Unlock()
+			appendLog("telegram: getUpdates error: %s", err.Error())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(min(consecutiveErrs, 6)) * 5 * time.Second):
+			}
+			continue
+		}
+		consecutiveErrs = 0
+		for _, u := range updates {
+			offset = u.UpdateID + 1
+			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
+				continue
+			}
+			chatID := u.Message.Chat.ID
+			if boundChatID == 0 {
+				boundChatID = chatID
+				cfg.ChatID = chatID
+				_ = saveTelegramConfig(cfg)
+				appendLog("telegram: bound to chat %d", chatID)
+			} else if chatID != boundChatID {
+				_ = telegramSendMessage(cfg.Token, chatID, "This bot is bound to a different chat.")
+				continue
+			}
+			history = append(history, ollamaChatMsg{Role: "user", Content: u.Message.Text})
+
+			// Instant ack so the chat doesn't look like a dead end while a
+			// small model + tool calls can take anywhere from seconds to a
+			// couple minutes — plus Telegram's native "typing..." indicator,
+			// refreshed on a ticker since it only lasts ~5s per call.
+			_ = telegramSendMessage(cfg.Token, chatID, "⏳ Got it — working on it...")
+			typingDone := make(chan struct{})
+			go func() {
+				_ = telegramSendChatAction(cfg.Token, chatID)
+				ticker := time.NewTicker(4 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-typingDone:
+						return
+					case <-ticker.C:
+						_ = telegramSendChatAction(cfg.Token, chatID)
+					}
+				}
+			}()
+
+			updated, err := runAgentTurnSync(cfg.Model, history, workDir, true)
+			close(typingDone)
+			if err != nil {
+				_ = telegramSendMessage(cfg.Token, chatID, "error: "+err.Error())
+				continue
+			}
+			history = updated
+			var reply string
+			for _, m := range updated {
+				if m.Role == "assistant" && strings.TrimSpace(m.Content) != "" {
+					reply = m.Content
+				}
+			}
+			if reply == "" {
+				reply = "(no reply)"
+			}
+			if err := telegramSendMessage(cfg.Token, chatID, cleanMarkdownForDisplay(reply)); err != nil {
+				appendLog("telegram: sendMessage error: %s", err.Error())
+			}
+		}
+	}
+}
+
+// loadTavilyKey reads a previously saved key (if any) into this process's
+// environment on startup, without overriding a key the user already set
+// externally (e.g. via setx) for this session.
+func loadTavilyKey() {
+	if os.Getenv("TAVILY_API_KEY") != "" {
+		return
+	}
+	data, err := os.ReadFile(tavilyKeyFilePath())
+	if err != nil {
+		return
+	}
+	if key := strings.TrimSpace(string(data)); key != "" {
+		os.Setenv("TAVILY_API_KEY", key)
+	}
 }
 
 func logFilePath() string {
@@ -2616,6 +4370,298 @@ func waitForDownloadMsg(ch chan tea.Msg) tea.Cmd {
 	}
 }
 
+// Setup wizard: a guided disclaimer-accept + install-ollama +
+// download-starter-models flow, reached from the help menu. Every
+// question is asked up front, then the selected actions run in sequence
+// — this is deliberately separate from startDownload()'s own state (used
+// by the "list models" screen) even though it reuses the same
+// stripANSI/cleanPullLine parsing, so a wizard run can't collide with an
+// unrelated download the user might have already had in progress.
+
+type wizardQuestion struct {
+	id     string
+	prompt string
+}
+
+type wizardAction struct {
+	kind  string // "install_ollama" | "pull"
+	model string // set for "pull"
+}
+
+type wizardPullChanMsg struct {
+	ch  chan tea.Msg
+	cmd *exec.Cmd
+}
+
+type wizardPullLineMsg struct {
+	line string
+	pct  int
+}
+
+type wizardPullDoneMsg struct {
+	model string
+	err   error
+}
+
+func wizardPullModel(model string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("ollama", "pull", model)
+		pr, pw := io.Pipe()
+		cmd.Stdout = pw
+		cmd.Stderr = pw
+		ch := make(chan tea.Msg, 8)
+
+		if err := cmd.Start(); err != nil {
+			pw.Close()
+			go func() { ch <- wizardPullDoneMsg{model: model, err: err}; close(ch) }()
+			return wizardPullChanMsg{ch: ch, cmd: cmd}
+		}
+
+		go func() {
+			err := cmd.Wait()
+			pw.CloseWithError(err)
+		}()
+
+		go func() {
+			scanner := bufio.NewScanner(pr)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			scanner.Split(splitCROrLF)
+			for scanner.Scan() {
+				line := cleanPullLine(stripANSI(scanner.Text()))
+				if line == "" {
+					continue
+				}
+				pct := -1
+				if mm := pullPctRe.FindStringSubmatch(line); mm != nil {
+					if v, convErr := strconv.Atoi(mm[1]); convErr == nil {
+						pct = v
+					}
+				}
+				ch <- wizardPullLineMsg{line: line, pct: pct}
+			}
+			ch <- wizardPullDoneMsg{model: model, err: scanner.Err()}
+			close(ch)
+		}()
+
+		return wizardPullChanMsg{ch: ch, cmd: cmd}
+	}
+}
+
+func waitForWizardPullMsg(ch chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return wizardPullDoneMsg{}
+		}
+		return msg
+	}
+}
+
+func startWizardAction(a wizardAction) tea.Cmd {
+	switch a.kind {
+	case "install_ollama":
+		return installOllama()
+	case "pull":
+		return wizardPullModel(a.model)
+	}
+	return nil
+}
+
+func buildWizardActions(answers map[string]bool) []wizardAction {
+	var actions []wizardAction
+	if answers["ollama"] {
+		actions = append(actions, wizardAction{kind: "install_ollama"})
+	}
+	if answers["qwen"] {
+		actions = append(actions, wizardAction{kind: "pull", model: "qwen2.5:1.5b"})
+	}
+	if answers["gemma2"] {
+		actions = append(actions, wizardAction{kind: "pull", model: "gemma2:2b"})
+	}
+	if answers["gemma4"] {
+		actions = append(actions, wizardAction{kind: "pull", model: "gemma4:e2b"})
+	}
+	return actions
+}
+
+// advanceWizard moves to the next queued action, or to the "done" phase
+// if that was the last one.
+func advanceWizard(m model) (tea.Model, tea.Cmd) {
+	m.wizardActionIdx++
+	if m.wizardActionIdx >= len(m.wizardActions) {
+		m.wizardPhase = "done"
+		return m, nil
+	}
+	return m, startWizardAction(m.wizardActions[m.wizardActionIdx])
+}
+
+// finishWizardQuestions is called once every question has an answer —
+// builds the action list and, if any of it downloads a model, checks
+// real free disk space before starting anything. A model half-downloaded
+// because the disk filled up mid-pull is a worse experience than telling
+// the user up front and not starting at all.
+func finishWizardQuestions(m model) (tea.Model, tea.Cmd) {
+	// The disclaimer question only blocks anything if it was actually
+	// asked THIS run (skipDisclaimer runs never add it, and a Go map
+	// defaults a missing key to false — so check presence, not just the
+	// answer, or a skipped disclaimer would wrongly read as "declined").
+	for _, q := range m.wizardQuestions {
+		if q.id == "disclaimer" && !m.wizardAnswers["disclaimer"] {
+			m.wizardPhase = "done"
+			m.wizardLog = append(m.wizardLog, "disclaimer declined — no actions were taken")
+			appendLog("wizard: disclaimer declined, no actions taken")
+			return m, nil
+		}
+	}
+	m.wizardActions = buildWizardActions(m.wizardAnswers)
+	m.wizardActionIdx = 0
+	if len(m.wizardActions) == 0 {
+		m.wizardPhase = "done"
+		return m, nil
+	}
+	ok, free, needed, msg := checkWizardDiskSpace(m.wizardActions)
+	m.wizardDiskFreeBytes = free
+	m.wizardDiskNeededBytes = needed
+	if !ok {
+		m.wizardPhase = "blocked"
+		m.wizardDiskMsg = msg
+		return m, nil
+	}
+	m.wizardPhase = "run"
+	return m, startWizardAction(m.wizardActions[0])
+}
+
+// approxModelSizeBytes are the real download sizes from ollama.com's own
+// library pages (qwen2.5:1.5b, gemma2:2b) and the user's own local
+// install (gemma4:e2b, confirmed 7.2 GB via `ollama list`) — not guesses.
+var approxModelSizeBytes = map[string]uint64{
+	"qwen2.5:1.5b": 986 * 1000 * 1000,
+	"gemma2:2b":    1600 * 1000 * 1000,
+	"gemma4:e2b":   7200 * 1000 * 1000,
+}
+
+// ollamaModelsDir is where `ollama pull` actually writes blobs — needed
+// so the disk-space check below looks at the right drive/filesystem, not
+// just wherever llama-shell happens to be running from.
+func ollamaModelsDir() string {
+	if v := os.Getenv("OLLAMA_MODELS"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return filepath.Join(home, ".ollama", "models")
+}
+
+// diskFreeBytes reports free space on the drive/filesystem holding dir.
+// Shells out rather than using syscall.Statfs, since that type doesn't
+// exist when this same file is cross-compiled for windows — matches the
+// existing pattern elsewhere in this file (installOllama, openInBrowser)
+// of branching per-OS command instead of per-OS build-tagged files.
+func diskFreeBytes(dir string) (uint64, error) {
+	if runtime.GOOS == "windows" {
+		vol := filepath.VolumeName(dir)
+		driveLetter := strings.TrimSuffix(vol, ":")
+		if driveLetter == "" {
+			driveLetter = "C"
+		}
+		out, err := exec.Command("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("(Get-PSDrive -Name %q).Free", driveLetter)).Output()
+		if err != nil {
+			return 0, err
+		}
+		return strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	}
+	out, err := exec.Command("df", "-Pk", dir).Output()
+	if err != nil {
+		return 0, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("unexpected df output: %q", string(out))
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 4 {
+		return 0, fmt.Errorf("unexpected df output line: %q", lines[len(lines)-1])
+	}
+	availKB, err := strconv.ParseUint(fields[3], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return availKB * 1024, nil
+}
+
+// checkWizardDiskSpace sums the estimated size of every selected pull
+// action and compares it against real free space on the drive Ollama
+// actually stores models on. A 20% safety margin is added on top of the
+// raw download total since ollama's blob store briefly holds compressed
+// and decompressed data at once mid-pull.
+func checkWizardDiskSpace(actions []wizardAction) (ok bool, freeBytes, neededBytes uint64, msg string) {
+	var needed uint64
+	for _, a := range actions {
+		if a.kind == "pull" {
+			needed += approxModelSizeBytes[a.model]
+		}
+	}
+	if needed == 0 {
+		return true, 0, 0, ""
+	}
+	needed = needed + needed/5 // +20% margin
+
+	dir := ollamaModelsDir()
+	free, err := diskFreeBytes(dir)
+	if err != nil {
+		// Can't verify — don't block the wizard over a check that itself
+		// failed, just proceed without the guarantee.
+		return true, 0, needed, ""
+	}
+	if free >= needed {
+		return true, free, needed, ""
+	}
+	toGB := func(b uint64) float64 { return float64(b) / 1e9 }
+	return false, free, needed, fmt.Sprintf(
+		"Not enough free disk space on %s: need ~%.1f GB (incl. margin), only %.1f GB free.",
+		dir, toGB(needed), toGB(free))
+}
+
+// enterWizard builds the setup-wizard question list and switches to it.
+// skipDisclaimer omits the disclaimer question — used when the wizard is
+// entered right after the first-run disclaimer gate already accepted it
+// a moment earlier, so it isn't asked twice in the same flow.
+func (m model) enterWizard(skipDisclaimer bool) model {
+	m.wizardQuestions = nil
+	if !skipDisclaimer {
+		m.wizardQuestions = append(m.wizardQuestions, wizardQuestion{id: "disclaimer", prompt: "Accept the disclaimer to continue with setup?"})
+	}
+	if !m.ollama.installed {
+		m.wizardQuestions = append(m.wizardQuestions, wizardQuestion{id: "ollama", prompt: "Install Ollama now?"})
+		m.wizardOllamaSkipNote = ""
+	} else {
+		m.wizardOllamaSkipNote = fmt.Sprintf("install ollama: already installed (%s) — skipped", m.ollama.version)
+	}
+	m.wizardQuestions = append(m.wizardQuestions,
+		wizardQuestion{id: "qwen", prompt: "Download qwen2.5:1.5b (small, fast, ~1 GB)?"},
+		wizardQuestion{id: "gemma2", prompt: "Download gemma2:2b (~1.6 GB)?"},
+		wizardQuestion{id: "gemma4", prompt: "Download gemma4:e2b (~7 GB)?"},
+		wizardQuestion{id: "tavily", prompt: "Set up a Tavily API key now, for web-search/scraping tools in agentic chat?"},
+		wizardQuestion{id: "telegram", prompt: "Set up a Telegram bot now, to chat with the agent from your phone?"},
+	)
+	m.wizardQIndex = 0
+	m.wizardAnswers = map[string]bool{}
+	m.wizardActions = nil
+	m.wizardActionIdx = 0
+	m.wizardLog = nil
+	m.wizardPhase = "ask"
+	m.wizardCancelled = false
+	m.wizardPullCh = nil
+	m.wizardPullCmd = nil
+	m.wizardPullPct = 0
+	m.wizardPullLine = ""
+	m.view = viewWizard
+	return m
+}
+
 // markInstalled cross-references huggingface catalog entries against the
 // locally installed ollama models and sets Installed accordingly. ollama
 // rows are already local by definition.
@@ -3077,9 +5123,9 @@ type menuItem struct {
 var menuItems = []menuItem{
 	{"l", "list models      (ollama + library + huggingface)"},
 	{"p", "running models    (ollama ps)"},
-	{"s", "show model info   (scan all + cache)"},
+	{"s", "Select Model      (scan all + cache)"},
 	{"d", "device info       (cpu/ram/disk/gpu)"},
-	{"h", "help / disclaimer / log / update"},
+	{"h", "help / settings"},
 	{"q", "quit"},
 }
 
@@ -3094,6 +5140,10 @@ var helpMenuItems = []helpMenuItem{
 	{"d", "disclaimer (no warranty)", viewDisclaimerText},
 	{"g", "view log", viewLogText},
 	{"u", "update", viewUpdateText},
+	{"w", "setup wizard (install ollama + download starter models)", viewWizard},
+	{"t", "tavily API key (enables tavily_search/tavily_extract tools)", viewTavilySettings},
+	{"b", "web server (browser access to agentic chat)", viewWebServerSettings},
+	{"m", "telegram bot (chat with the agent from your phone)", viewTelegramSettings},
 }
 
 type model struct {
@@ -3130,6 +5180,23 @@ type model struct {
 	ollamaInstallResult  string
 	ollamaInstallErr     string
 
+	wizardPhase           string // "", "ask", "blocked", "run", "done"
+	wizardQuestions       []wizardQuestion
+	wizardQIndex          int
+	wizardAnswers         map[string]bool
+	wizardActions         []wizardAction
+	wizardActionIdx       int
+	wizardLog             []string
+	wizardCancelled       bool
+	wizardDiskMsg         string
+	wizardDiskFreeBytes   uint64
+	wizardDiskNeededBytes uint64
+	wizardOllamaSkipNote  string
+	wizardPullCh          chan tea.Msg
+	wizardPullCmd         *exec.Cmd
+	wizardPullPct         int
+	wizardPullLine        string
+
 	updateChecked     bool
 	updateAvailable   bool
 	updateLatest      string
@@ -3163,6 +5230,20 @@ type model struct {
 	catalogErrs   []string
 	catalogCursor int
 	catalogSearch string
+
+	tavilyKeyInput string
+	tavilyKeyMsg   string
+
+	webServerBusy        bool
+	webServerMsg         string
+	webServerAwaitingDL  bool
+	webServerModelList   []string
+	webServerModelCursor int
+
+	telegramTokenInput string
+	telegramMsg        string
+
+	wizardPendingTelegram bool // chain from wizard: tavily screen's exit routes to telegram next
 
 	downloadConfirm  *catalogRow
 	downloading      bool
@@ -3200,6 +5281,7 @@ type model struct {
 	agentErr            string
 	agentSpinner        int
 	agentStarted        time.Time
+	agentWarmupStarted  time.Time
 	agentScroll         int // lines scrolled back from the bottom; 0 = live/latest
 	agentStreamBuf      string
 	agentViewport       viewport.Model
@@ -3207,11 +5289,28 @@ type model struct {
 }
 
 func initialModel() model {
+	loadTavilyKey()
 	m := model{
 		ollama: checkOllama(),
 	}
 	if !isDisclaimerAccepted() {
 		m.view = viewFirstRunDisclaimer
+	}
+	if cfg := loadWebServerConfig(); cfg.Enabled && cfg.Model != "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			wd = "."
+		}
+		if err := startWebServer(cfg, wd); err != nil {
+			appendLog("web server: failed to auto-start: %s", err.Error())
+		}
+	}
+	if tgCfg := loadTelegramConfig(); tgCfg.Token != "" && tgCfg.Model != "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			wd = "."
+		}
+		startTelegramBot(tgCfg, wd)
 	}
 	return m
 }
@@ -3350,6 +5449,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, fetchCatalogStage(m.catalogStage)
+
+	case webServerPullDoneMsg:
+		m.webServerBusy = false
+		if msg.err != "" {
+			m.webServerMsg = "download failed: " + msg.err
+			appendLog("web server: gemma4:e2b download failed: %s", msg.err)
+			return m, nil
+		}
+		m.webServerMsg = "gemma4:e2b downloaded — press 'e' to enable now"
+		appendLog("web server: gemma4:e2b downloaded")
+		return m, nil
 
 	case psFetchMsg:
 		m.loading = false
@@ -3546,6 +5656,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ollamaInstallResultMsg:
 		m.ollamaInstallRunning = false
+		if m.view == viewWizard {
+			m.ollama = checkOllama()
+			if msg.err != "" {
+				m.wizardLog = append(m.wizardLog, "install ollama: FAILED — "+strings.TrimSpace(msg.output+" "+msg.err))
+				appendLog("wizard: ollama install failed: %s", msg.err)
+			} else {
+				m.wizardLog = append(m.wizardLog, "install ollama: done")
+				appendLog("wizard: ollama installed")
+			}
+			return advanceWizard(m)
+		}
 		if msg.err != "" {
 			m.ollamaInstallErr = strings.TrimSpace(msg.output + "\n" + msg.err)
 			appendLog("ollama install failed: %s", msg.err)
@@ -3554,6 +5675,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			appendLog("ollama install finished")
 		}
 		return m, nil
+
+	case wizardPullChanMsg:
+		m.wizardPullCh = msg.ch
+		m.wizardPullCmd = msg.cmd
+		m.wizardPullPct = 0
+		m.wizardPullLine = ""
+		return m, waitForWizardPullMsg(m.wizardPullCh)
+
+	case wizardPullLineMsg:
+		m.wizardPullLine = msg.line
+		if msg.pct >= 0 {
+			m.wizardPullPct = msg.pct
+		}
+		return m, waitForWizardPullMsg(m.wizardPullCh)
+
+	case wizardPullDoneMsg:
+		status := "done"
+		if m.wizardCancelled {
+			status = "aborted"
+		} else if msg.err != nil {
+			status = "FAILED — " + msg.err.Error()
+		}
+		m.wizardLog = append(m.wizardLog, fmt.Sprintf("download %s: %s", msg.model, status))
+		appendLog("wizard: %s pull %s", msg.model, status)
+		m.wizardPullCh = nil
+		m.wizardPullCmd = nil
+		if m.wizardCancelled {
+			m.wizardPhase = "done"
+			return m, nil
+		}
+		return advanceWizard(m)
 
 	case agentWarmupMsg:
 		if msg.err != "" {
@@ -3640,7 +5792,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case agentTickMsg:
-		if !m.agentBusy {
+		if !m.agentBusy && m.agentWarmup != "pending" {
 			return m, nil
 		}
 		m.agentSpinner++
@@ -3715,45 +5867,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.agentToolMode = "auto"
 						m.agentWarmup = "pending"
 						m.agentMessages = []ollamaChatMsg{
-							{Role: "system", Content: fmt.Sprintf(
-								"You are a coding assistant running locally with REAL, WORKING file system access "+
-									"through the tools read_file, write_file, append_file, list_dir, make_dir, "+
-									"delete_file, and search_files. These tools run on the actual local machine and "+
-									"can reach ANY path on this computer's disks — not just one folder. A relative "+
-									"path (no drive letter) resolves against the working directory %s; an absolute "+
-									"path (e.g. C:\\, C:\\Users\\name\\file.txt, D:\\projects) is used exactly as given "+
-									"and is NOT restricted to the working directory. There is no sandbox or "+
-									"permission wall here beyond normal OS file permissions. "+
-									"You are NOT a hosted AI with no file access — that is false for this session. "+
-									"Never say you cannot access files, cannot read a given path, or are restricted "+
-									"to one directory: you are not. "+
-									"Note the tool distinction: list_dir(path) lists a directory's contents; "+
-									"read_file(path) reads one file's contents — pick whichever matches what the "+
-									"user asked for. "+
-									"Whenever the user asks you to read, inspect, list, create, or write to a file "+
-									"or the file system, you MUST call the matching tool immediately instead of "+
-									"asking for clarification or describing what the user should do manually — try "+
-									"it, then report the actual tool result (including any error it returns) in "+
-									"plain text. "+
-									"The tools are an ADDITION to your normal abilities, not a replacement: you can "+
-									"still chat normally, answer questions, brainstorm, write essays, summaries, "+
-									"lists, code, or any other text content directly from your own knowledge, with "+
-									"no tool call needed, exactly like any other assistant. Only reach for a tool "+
-									"when the request actually needs file access or one of the other listed "+
-									"system actions (running a command, opening something, networking, etc). "+
-									"Never refuse a normal request by claiming you're 'only' a file/tool assistant "+
-									"— that is false.", wd,
-							)},
+							{Role: "system", Content: agentSystemPrompt(wd)},
 						}
 						m.agentInput = ""
 						m.agentErr = ""
 						m.agentBusy = false
+						m.agentStarted = time.Now()
+						m.agentWarmupStarted = time.Now()
 						m.agentViewport = viewport.New(agentViewportWidth(m.width), agentViewportHeight(m.height))
 						m.agentVPReady = true
 						m.syncAgentViewport()
 						m.view = viewAgentChat
 						appendLog("started agentic chat with %s", name)
-						return m, warmupPollOllama(name)
+						return m, tea.Batch(warmupPollOllama(name), agentTickCmd())
 					case 1:
 						m.scanBusy = true
 						m.scanBusyLabel = fmt.Sprintf("running %s...", name)
@@ -4126,11 +6252,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "a", "enter":
 				markDisclaimerAccepted()
-				if m.ollama.installed {
-					m.view = viewMenu
-				} else {
-					m.view = viewOllamaInstallPrompt
-				}
+				m = m.enterWizard(true)
+				appendLog("first run: disclaimer accepted, opening setup wizard")
 			case "q", "esc", "ctrl+c":
 				appendLog("quit")
 				return m, tea.Quit
@@ -4182,17 +6305,358 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.helpMenuCursor = 0
 				}
 			case "enter":
-				m.view = helpMenuItems[m.helpMenuCursor].dest
-				m.helpScroll = 0
-				appendLog("opened %s", helpMenuItems[m.helpMenuCursor].label)
+				it := helpMenuItems[m.helpMenuCursor]
+				if it.dest == viewWizard {
+					m = m.enterWizard(false)
+				} else {
+					m.view = it.dest
+					m.helpScroll = 0
+				}
+				appendLog("opened %s", it.label)
 			default:
 				for _, it := range helpMenuItems {
 					if key == it.key {
-						m.view = it.dest
-						m.helpScroll = 0
+						if it.dest == viewWizard {
+							m = m.enterWizard(false)
+						} else {
+							m.view = it.dest
+							m.helpScroll = 0
+						}
 						appendLog("opened %s", it.label)
 					}
 				}
+			}
+			return m, nil
+
+		case viewTavilySettings:
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				if m.wizardPendingTelegram {
+					m.wizardPendingTelegram = false
+					m.view = viewTelegramSettings
+				} else {
+					m.view = viewHelpMenu
+				}
+				m.tavilyKeyInput = ""
+				m.tavilyKeyMsg = ""
+				return m, nil
+			case "enter":
+				trimmed := strings.TrimSpace(m.tavilyKeyInput)
+				if trimmed == "" {
+					m.tavilyKeyMsg = "type a key first, or Esc to cancel"
+					return m, nil
+				}
+				if err := saveTavilyKey(trimmed); err != nil {
+					m.tavilyKeyMsg = "error saving key: " + err.Error()
+					m.tavilyKeyInput = ""
+					return m, nil
+				}
+				m.tavilyKeyMsg = "saved — tavily_search/tavily_extract are ready to use"
+				appendLog("tavily API key saved")
+				m.tavilyKeyInput = ""
+				if m.wizardPendingTelegram {
+					m.wizardPendingTelegram = false
+					m.view = viewTelegramSettings
+				}
+				return m, nil
+			case "backspace":
+				if len(m.tavilyKeyInput) > 0 {
+					m.tavilyKeyInput = m.tavilyKeyInput[:len(m.tavilyKeyInput)-1]
+				}
+				return m, nil
+			case "up":
+				m.helpScroll--
+				m.clampHelpScroll()
+				return m, nil
+			case "down":
+				m.helpScroll++
+				m.clampHelpScroll()
+				return m, nil
+			case "pgup":
+				m.helpScroll -= helpPageLines(m.height)
+				m.clampHelpScroll()
+				return m, nil
+			case "pgdown":
+				m.helpScroll += helpPageLines(m.height)
+				m.clampHelpScroll()
+				return m, nil
+			case "home":
+				m.helpScroll = 0
+				return m, nil
+			case "end":
+				m.helpScroll = 1 << 30
+				m.clampHelpScroll()
+				return m, nil
+			default:
+				// Reject anything that isn't one printable rune — a fast
+				// paste burst on some Windows terminals can occasionally
+				// misfire an extra control keystroke (e.g. a stray NUL),
+				// and os.Setenv hard-errors ("invalid argument") if that
+				// ends up embedded in the value.
+				if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+					m.tavilyKeyInput += key
+				}
+				return m, nil
+			}
+
+		case viewTelegramSettings:
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				m.view = viewHelpMenu
+				m.telegramTokenInput = ""
+				m.telegramMsg = ""
+				return m, nil
+			case "enter":
+				trimmed := strings.TrimSpace(m.telegramTokenInput)
+				if trimmed == "" {
+					stopTelegramBot()
+					cfg := loadTelegramConfig()
+					cfg.Token = ""
+					_ = saveTelegramConfig(cfg)
+					m.telegramMsg = "disabled"
+					m.telegramTokenInput = ""
+					return m, nil
+				}
+				names, err := listInstalledModelNames()
+				if err != nil || len(names) == 0 {
+					m.telegramMsg = "no local model installed — run the setup wizard ([h] help/settings -> [w]) to download one first"
+					return m, nil
+				}
+				existing := loadTelegramConfig()
+				model := names[pickDefaultModelIndex(names, existing.Model)]
+				cfg := telegramConfig{Token: trimmed, Model: model, ChatID: existing.ChatID}
+				if existing.Token != trimmed {
+					cfg.ChatID = 0 // a new token is a new bot identity — don't carry over the old binding
+				}
+				if err := saveTelegramConfig(cfg); err != nil {
+					m.telegramMsg = "error saving token: " + err.Error()
+					return m, nil
+				}
+				stopTelegramBot()
+				wd, err := os.Getwd()
+				if err != nil {
+					wd = "."
+				}
+				startTelegramBot(cfg, wd)
+				m.telegramMsg = "saved — bot is running, model " + model + ". Message it on Telegram to bind this chat."
+				m.telegramTokenInput = ""
+				appendLog("telegram bot token saved")
+				return m, nil
+			case "backspace":
+				if len(m.telegramTokenInput) > 0 {
+					m.telegramTokenInput = m.telegramTokenInput[:len(m.telegramTokenInput)-1]
+				}
+				return m, nil
+			case "up":
+				m.helpScroll--
+				m.clampHelpScroll()
+				return m, nil
+			case "down":
+				m.helpScroll++
+				m.clampHelpScroll()
+				return m, nil
+			case "pgup":
+				m.helpScroll -= helpPageLines(m.height)
+				m.clampHelpScroll()
+				return m, nil
+			case "pgdown":
+				m.helpScroll += helpPageLines(m.height)
+				m.clampHelpScroll()
+				return m, nil
+			case "home":
+				m.helpScroll = 0
+				return m, nil
+			case "end":
+				m.helpScroll = 1 << 30
+				m.clampHelpScroll()
+				return m, nil
+			default:
+				if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+					m.telegramTokenInput += key
+				}
+				return m, nil
+			}
+
+		case viewWebServerSettings:
+			if key == "ctrl+c" {
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			if m.webServerAwaitingDL {
+				switch key {
+				case "y", "enter":
+					m.webServerAwaitingDL = false
+					m.webServerBusy = true
+					m.webServerMsg = "downloading gemma4:e2b... this can take a while depending on your connection"
+					appendLog("web server: no local model, downloading gemma4:e2b")
+					return m, pullModelForWebServer("gemma4:e2b")
+				case "n", "esc":
+					m.webServerAwaitingDL = false
+					m.webServerMsg = "cancelled — enable again once you have a model installed"
+				}
+				return m, nil
+			}
+			if m.webServerBusy {
+				return m, nil // busy downloading — ignore keys except ctrl+c above
+			}
+			switch key {
+			case "esc":
+				m.view = viewHelpMenu
+				m.webServerMsg = ""
+				return m, nil
+			case "e":
+				names, err := listInstalledModelNames()
+				if err != nil {
+					m.webServerMsg = "error listing models: " + err.Error()
+					return m, nil
+				}
+				if len(names) == 0 {
+					m.webServerAwaitingDL = true
+					m.webServerMsg = ""
+					return m, nil
+				}
+				cfg := loadWebServerConfig()
+				m.webServerModelList = names
+				m.webServerModelCursor = pickDefaultModelIndex(names, cfg.Model)
+				m.view = viewWebServerModelSelect
+				return m, nil
+			case "d":
+				stopWebServer()
+				cfg := loadWebServerConfig()
+				cfg.Enabled = false
+				if err := saveWebServerConfig(cfg); err != nil {
+					m.webServerMsg = "error saving config: " + err.Error()
+				} else {
+					m.webServerMsg = "disabled"
+				}
+				appendLog("web server disabled")
+				return m, nil
+			}
+			return m, nil
+
+		case viewWebServerModelSelect:
+			if key == "ctrl+c" {
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			switch key {
+			case "esc":
+				m.view = viewWebServerSettings
+				return m, nil
+			case "up", "k":
+				m.webServerModelCursor--
+				if m.webServerModelCursor < 0 {
+					m.webServerModelCursor = len(m.webServerModelList) - 1
+				}
+			case "down", "j":
+				m.webServerModelCursor++
+				if m.webServerModelCursor >= len(m.webServerModelList) {
+					m.webServerModelCursor = 0
+				}
+			case "enter":
+				selected := m.webServerModelList[m.webServerModelCursor]
+				cfg := loadWebServerConfig()
+				if cfg.Token == "" {
+					cfg.Token = genWebServerToken()
+				}
+				cfg.Enabled = true
+				cfg.Model = selected
+				if err := saveWebServerConfig(cfg); err != nil {
+					m.webServerMsg = "error saving config: " + err.Error()
+					m.view = viewWebServerSettings
+					return m, nil
+				}
+				wd, err := os.Getwd()
+				if err != nil {
+					wd = "."
+				}
+				if err := startWebServer(cfg, wd); err != nil {
+					m.webServerMsg = "failed to start server: " + err.Error()
+				} else {
+					m.webServerMsg = ""
+				}
+				appendLog("web server enabled with model %s", selected)
+				m.view = viewWebServerSettings
+				return m, nil
+			}
+			return m, nil
+
+		case viewWizard:
+			switch m.wizardPhase {
+			case "ask":
+				if key == "ctrl+c" {
+					appendLog("quit")
+					return m, tea.Quit
+				}
+				if key == "esc" || key == "q" {
+					appendLog("wizard cancelled")
+					m.view = viewMenu
+					m.wizardPhase = ""
+					return m, nil
+				}
+				q := m.wizardQuestions[m.wizardQIndex]
+				switch key {
+				case "y", "enter":
+					m.wizardAnswers[q.id] = true
+				case "n":
+					m.wizardAnswers[q.id] = false
+				default:
+					return m, nil
+				}
+				m.wizardQIndex++
+				if m.wizardQIndex >= len(m.wizardQuestions) {
+					return finishWizardQuestions(m)
+				}
+				return m, nil
+
+			case "blocked":
+				// any key just leaves — nothing to run until there's
+				// room, and re-entering the wizard re-asks everything.
+				m.view = viewMenu
+				m.wizardPhase = ""
+				return m, nil
+
+			case "run":
+				if key == "ctrl+c" {
+					appendLog("quit")
+					return m, tea.Quit
+				}
+				if key == "esc" || key == "a" {
+					if m.wizardPullCmd != nil && m.wizardPullCmd.Process != nil {
+						_ = m.wizardPullCmd.Process.Kill()
+					}
+					appendLog("wizard aborted")
+					m.wizardCancelled = true
+					m.wizardPhase = "done"
+					return m, nil
+				}
+				return m, nil
+
+			case "done":
+				if m.wizardAnswers["tavily"] {
+					m.wizardAnswers["tavily"] = false // consume so the next keypress here goes to the menu, not a loop
+					if m.wizardAnswers["telegram"] {
+						m.wizardPendingTelegram = true // chain: tavily screen's exit routes to telegram next
+					}
+					m.view = viewTavilySettings
+					appendLog("wizard: opening tavily key setup")
+					return m, nil
+				}
+				if m.wizardAnswers["telegram"] {
+					m.wizardAnswers["telegram"] = false
+					m.view = viewTelegramSettings
+					appendLog("wizard: opening telegram bot setup")
+					return m, nil
+				}
+				m.view = viewMenu
+				m.wizardPhase = ""
+				return m, nil
 			}
 			return m, nil
 
@@ -4560,6 +7024,10 @@ func (m *model) clampHelpScroll() {
 		content = renderLogText()
 	case viewToolCategories:
 		content, _ = m.renderToolCategories()
+	case viewTavilySettings:
+		content = m.renderTavilySettings()
+	case viewTelegramSettings:
+		content = m.renderTelegramSettings()
 	default:
 		return
 	}
@@ -4658,6 +7126,17 @@ func (m model) renderHeader() string {
 	return style.Render("llama-shell — Ollama TUI")
 }
 
+// footerOSC8Re matches an OSC 8 hyperlink escape sequence, so its bytes
+// can be stripped before measuring visible width — lipgloss.Width()
+// doesn't recognize OSC 8 (only standard SGR color codes), so a string
+// containing one would otherwise be over-counted as wider than it really
+// renders, breaking the footer's centering/gap math.
+var footerOSC8Re = regexp.MustCompile(`\x1b\]8;;[^\x07]*(?:\x1b\\|\x07)`)
+
+func footerVisibleWidth(s string) int {
+	return lipgloss.Width(footerOSC8Re.ReplaceAllString(s, ""))
+}
+
 func (m model) renderFooter() string {
 	const footerBG = "#3A3A66"
 	status := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("ollama: not installed")
@@ -4670,6 +7149,53 @@ func (m model) renderFooter() string {
 		updateFlag := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("update")
 		status = updateFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 	}
+	// Always show explicit web-server state, not just when it's running —
+	// no indicator at all reads as ambiguous (off? unknown? crashed?)
+	// rather than a clear "off".
+	var webFlag string
+	switch {
+	case isWebServerRunning():
+		cfg := loadWebServerConfig()
+		webURL := webServerURL(cfg.Token)
+		linkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Underline(true)
+		// OSC 8 hyperlink so clicking "web: running" opens the server URL —
+		// lipgloss.Width() doesn't understand this escape, so any width math
+		// over a string containing webFlag must use footerVisibleWidth
+		// (below), not lipgloss.Width, or the gap/padding math miscounts.
+		webFlag = "\x1b]8;;" + webURL + "\x1b\\" + linkStyle.Render("web: running") + "\x1b]8;;\x1b\\"
+	case loadWebServerConfig().Enabled:
+		webFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("web: enabled, not running")
+	default:
+		webFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("web: off")
+	}
+	status = webFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
+
+	// Same "always show explicit state" reasoning for Telegram: distinguish
+	// bound (actually reachable) from merely running (started but nobody's
+	// messaged it yet) from configured-but-dead from never set up.
+	var tgFlag string
+	switch {
+	case isTelegramRunning():
+		tgCfg := loadTelegramConfig()
+		if tgCfg.ChatID != 0 {
+			tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tg: bound")
+		} else {
+			tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("tg: running, not bound")
+		}
+	case loadTelegramConfig().Token != "":
+		tgFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("tg: not running")
+	default:
+		tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tg: off")
+	}
+	status = tgFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
+
+	var tavilyFlag string
+	if os.Getenv("TAVILY_API_KEY") != "" {
+		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tavily: set")
+	} else {
+		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tavily: off")
+	}
+	status = tavilyFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 
 	// Every fragment placed on the footer line — including plain filler
 	// spaces — must carry its own Background explicitly. Each styled
@@ -4704,7 +7230,7 @@ func (m model) renderFooter() string {
 			hintText = "Esc: back to chat  Ctrl+C: quit"
 		}
 		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA500")).Background(lipgloss.Color(footerBG)).Render(hintText)
-		totalGap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - lipgloss.Width(hint) - 4
+		totalGap := m.width - lipgloss.Width(left) - footerVisibleWidth(right) - lipgloss.Width(hint) - 4
 		if totalGap < 2 {
 			totalGap = 2
 		}
@@ -4716,14 +7242,15 @@ func (m model) renderFooter() string {
 	}
 
 	const githubURL = "https://github.com/affigabmag/llama-shell"
-	linkText := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Underline(true).Render(githubURL)
+	const githubLabel = "GitHub"
+	linkText := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Underline(true).Render(githubLabel)
 	// OSC 8 terminal hyperlink escape: wraps linkText so terminals that
 	// support it (Windows Terminal, iTerm2, most modern ones) make it
 	// clickable. lipgloss.Width() doesn't understand OSC 8, so the gap math
-	// below uses len(githubURL) — the link's actual visible width — instead.
+	// below uses len(githubLabel) — the link's actual visible width — instead.
 	link := "\x1b]8;;" + githubURL + "\x1b\\" + linkText + "\x1b]8;;\x1b\\"
 
-	totalGap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - len(githubURL) - 4
+	totalGap := m.width - lipgloss.Width(left) - footerVisibleWidth(right) - len(githubLabel) - 4
 	if totalGap < 2 {
 		totalGap = 2
 	}
@@ -4747,8 +7274,12 @@ var (
 
 	agentUserStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
 	agentReplyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F"))
-	agentToolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#808080"))
+	agentToolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#A6A6A6"))
 	agentHeadStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF"))
+	// agentLinkStyle is the "you>" prompt color (#FFD700) 10% darker, so URLs
+	// read as links without competing with the prompt itself.
+	agentLinkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6C200")).Underline(true)
+	greenLinkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F")).Underline(true)
 
 	helpKeyStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FFF5F"))
 	helpDescStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#808080"))
@@ -4824,6 +7355,14 @@ func (m model) renderBody() string {
 		return box.Render(m.renderDeviceInfo())
 	case viewHelpMenu:
 		return box.Render(m.renderHelpMenu())
+	case viewTavilySettings:
+		return box.Render(m.scrollHelpBody(m.renderTavilySettings()))
+	case viewTelegramSettings:
+		return box.Render(m.scrollHelpBody(m.renderTelegramSettings()))
+	case viewWebServerSettings:
+		return box.Render(m.renderWebServerSettings())
+	case viewWebServerModelSelect:
+		return box.Render(m.renderWebServerModelSelect())
 	case viewHelpText:
 		return box.Render(m.scrollHelpBody(renderHelpText()))
 	case viewDisclaimerText:
@@ -4832,6 +7371,8 @@ func (m model) renderBody() string {
 		return box.Render(m.scrollHelpBody(renderLogText()))
 	case viewUpdateText:
 		return box.Render(m.renderUpdateText())
+	case viewWizard:
+		return box.Render(m.renderWizard())
 	case viewFirstRunDisclaimer:
 		return box.Render(renderFirstRunDisclaimer())
 	case viewOllamaInstallPrompt:
@@ -4926,7 +7467,7 @@ func (m model) renderBenchTable(count int) string {
 
 func (m model) renderHelpMenu() string {
 	var b strings.Builder
-	b.WriteString("help / disclaimer / log\n\n")
+	b.WriteString("help\n\n")
 	for i, it := range helpMenuItems {
 		line := fmt.Sprintf("[%s] %s", it.key, it.label)
 		if i == m.helpMenuCursor {
@@ -4940,10 +7481,167 @@ func (m model) renderHelpMenu() string {
 	return b.String()
 }
 
+// renderTavilySettings shows the current key status (masked, if set) and
+// lets the user type a new one to save. Tavily (tavily.com) is a search +
+// web-scraping API built for LLM agents — tavily_search returns ranked
+// results with real content snippets, tavily_extract turns a URL into
+// clean article text (bypassing cookie walls/JS shells read_webpage
+// can't). Both tools need this key to do anything.
+// hyperlink wraps text in an OSC 8 terminal hyperlink escape (so terminals
+// that support it, like Windows Terminal, make it Ctrl+click-able) styled
+// with the given color.
+func hyperlink(url string, style lipgloss.Style) string {
+	return "\x1b]8;;" + url + "\x1b\\" + style.Render(url) + "\x1b]8;;\x1b\\"
+}
+
+func (m model) renderTavilySettings() string {
+	var b strings.Builder
+	b.WriteString("tavily API key\n\n")
+	b.WriteString("HOW TO GET A KEY (takes 2 minutes, free):\n")
+	b.WriteString("  1. Open " + hyperlink("https://app.tavily.com/", greenLinkStyle) + " and sign up (email or Google).\n")
+	b.WriteString("  2. It opens straight to \"API Playground\". In the \"API key\" box, top\n")
+	b.WriteString("     right, click the eye icon to reveal it, then the copy icon next to it\n")
+	b.WriteString("     (it looks like tvly-dev-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx).\n")
+	b.WriteString("  3. Come back here, right-click to paste it into the box below, then\n")
+	b.WriteString("     press Enter to save.\n\n")
+	b.WriteString("WHAT THIS IS FOR:\n")
+	b.WriteString("Tavily (" + hyperlink("https://www.tavily.com/", greenLinkStyle) + ") is a search + web-scraping service built for\n")
+	b.WriteString("AI agents. Setting a key here enables two extra tools in agentic chat:\n")
+	b.WriteString("  tavily_search   — web search with real result content, not just snippets\n")
+	b.WriteString("  tavily_extract  — scrape a URL's clean article text (handles pages\n")
+	b.WriteString("                    read_webpage can't: cookie walls, JS-only shells)\n")
+	b.WriteString("Nothing else in this app needs a key — skip this screen if you don't want it.\n\n")
+
+	current := os.Getenv("TAVILY_API_KEY")
+	if current != "" {
+		masked := current
+		if len(masked) > 8 {
+			masked = masked[:4] + strings.Repeat("*", len(masked)-8) + masked[len(masked)-4:]
+		}
+		b.WriteString(helpKeyStyle.Render("current key: "+masked) + "\n\n")
+	} else {
+		b.WriteString(agentToolStyle.Render("no key set — tavily_search/tavily_extract will return an error until one is") + "\n\n")
+	}
+
+	b.WriteString(fmt.Sprintf("new key: %s_\n", m.tavilyKeyInput))
+	if m.tavilyKeyMsg != "" {
+		b.WriteString("\n" + m.tavilyKeyMsg + "\n")
+	}
+	b.WriteString("\nEnter: save   Esc: back (discards what you typed)\n")
+	return b.String()
+}
+
+func (m model) renderTelegramSettings() string {
+	var b strings.Builder
+	b.WriteString("telegram bot\n\n")
+
+	cfg := loadTelegramConfig()
+	running := isTelegramRunning()
+
+	if running {
+		// Already set up — the step-by-step guide is just noise once it's
+		// working, so show a short status instead of repeating it.
+		b.WriteString(helpKeyStyle.Render("● running") + fmt.Sprintf("  —  model: %s", cfg.Model))
+		if cfg.ChatID != 0 {
+			b.WriteString(fmt.Sprintf("  —  bound to chat %d\n\n", cfg.ChatID))
+		} else {
+			b.WriteString("\n\nNot bound yet: open a chat with your bot on Telegram and send it any\nmessage — that's what binds it.\n\n")
+		}
+		b.WriteString("Paste a new token below to switch bots, or clear the box and press\nEnter to disable.\n\n")
+	} else {
+		b.WriteString("3 steps:\n")
+		b.WriteString("  1. In Telegram, message " + hyperlink("https://t.me/BotFather", greenLinkStyle) + " with  /newbot\n")
+		b.WriteString("     then answer its two questions (a name, then a username ending\n")
+		b.WriteString("     in \"bot\").\n")
+		b.WriteString("  2. It replies with a token. Copy it, paste it below, press Enter.\n")
+		b.WriteString("  3. Open a chat with your new bot on Telegram and send it any\n")
+		b.WriteString("     message — that binds it to you (and locks out everyone else).\n\n")
+		b.WriteString(agentToolStyle.Render("(needs a local model already installed — [w] setup wizard if you don't have one)") + "\n\n")
+		if cfg.Token != "" {
+			b.WriteString(redStyle.Render("● token saved but not running — re-paste it below to restart") + "\n\n")
+		} else {
+			b.WriteString(agentToolStyle.Render("○ disabled — no token set") + "\n\n")
+		}
+	}
+
+	b.WriteString(fmt.Sprintf("new token: %s_\n", m.telegramTokenInput))
+	if m.telegramMsg != "" {
+		b.WriteString("\n" + m.telegramMsg + "\n")
+	}
+	b.WriteString("\nEnter: save (empty box + Enter disables)   Esc: back (discards what you typed)\n")
+	return b.String()
+}
+
+func (m model) renderWebServerSettings() string {
+	var b strings.Builder
+	b.WriteString("web server\n\n")
+	b.WriteString("WHAT THIS DOES:\n")
+	b.WriteString("Runs the same agentic chat (all tools: files, commands, web, etc.) as a\n")
+	b.WriteString("page in any browser, instead of only in this terminal. Bound to\n")
+	b.WriteString("127.0.0.1 only — never reachable from your local network, only this\n")
+	b.WriteString("machine — and gated behind a random access token baked into the URL,\n")
+	b.WriteString("since anyone who can open that URL gets the same full tool access you\n")
+	b.WriteString("have here (reading/writing files, running commands, etc).\n\n")
+
+	cfg := loadWebServerConfig()
+	running := isWebServerRunning()
+	switch {
+	case running:
+		b.WriteString(helpKeyStyle.Render("● running") + fmt.Sprintf("  —  model: %s\n\n", cfg.Model))
+		b.WriteString("  " + hyperlink(webServerURL(cfg.Token), greenLinkStyle) + "\n\n")
+	case cfg.Enabled:
+		b.WriteString(redStyle.Render("● enabled in settings, but not running right now") + "\n")
+		webServerMu.Lock()
+		lastErr := webServerLastErr
+		webServerMu.Unlock()
+		if lastErr != "" {
+			b.WriteString(redStyle.Render("  reason: "+lastErr) + "\n")
+		}
+		b.WriteString("  press " + helpKeyStyle.Render("[e]") + " to retry starting it\n\n")
+	default:
+		b.WriteString(agentToolStyle.Render("○ disabled") + "\n\n")
+	}
+
+	if m.webServerAwaitingDL {
+		b.WriteString(redStyle.Render("no local model installed.") + "\n")
+		b.WriteString("Download gemma4:e2b (this app's default, ~7 GB) now?\n\n")
+		b.WriteString(helpKeyStyle.Render("[y] yes") + "    " + helpKeyStyle.Render("[n] no") + "\n")
+		return b.String()
+	}
+	if m.webServerBusy {
+		b.WriteString(m.webServerMsg + "\n")
+		return b.String()
+	}
+
+	if m.webServerMsg != "" {
+		b.WriteString(m.webServerMsg + "\n\n")
+	}
+	b.WriteString(helpKeyStyle.Render("[e] enable") + " (choose/confirm model)    " + helpKeyStyle.Render("[d] disable") + "\n")
+	b.WriteString("Esc: back\n")
+	return b.String()
+}
+
+func (m model) renderWebServerModelSelect() string {
+	var b strings.Builder
+	b.WriteString("web server — choose a model\n\n")
+	for i, name := range m.webServerModelList {
+		line := name
+		if i == m.webServerModelCursor {
+			b.WriteString(selectedStyle.Render("> " + line))
+		} else {
+			b.WriteString(unselectedStyle.Render("  " + line))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\nUp/Down + Enter to confirm and start the server. Esc: cancel.\n")
+	return b.String()
+}
+
 func renderHelpText() string {
-	return styleHelpLines(`help
+	body := styleHelpLines(`help
 
 llama-shell is a terminal UI shell for ollama.
+Project: __GITHUB_LINK__
 
 Every screen supports Up/Down + Enter for navigation, in addition to the
 letter shortcut shown in brackets. Esc goes back one level; ctrl+c always
@@ -5073,6 +7771,9 @@ Agent help (Alt+H from agentic chat)
 
 Esc: back
 `)
+	linkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Underline(true).Render("GitHub")
+	link := "\x1b]8;;https://github.com/affigabmag/llama-shell\x1b\\" + linkStyle + "\x1b]8;;\x1b\\"
+	return strings.Replace(body, "__GITHUB_LINK__", link, 1)
 }
 
 const disclaimerBody = `llama-shell is an independent, unofficial tool. It is not affiliated
@@ -5187,6 +7888,106 @@ func (m model) renderUpdateText() string {
 	}
 
 	b.WriteString("\nEsc: back\n")
+	return b.String()
+}
+
+func (m model) renderWizard() string {
+	var b strings.Builder
+	b.WriteString(helpKeyStyle.Render("setup wizard") + "\n\n")
+
+	switch m.wizardPhase {
+	case "ask":
+		if m.wizardOllamaSkipNote != "" {
+			b.WriteString("  " + m.wizardOllamaSkipNote + "\n")
+		}
+		for i := 0; i < m.wizardQIndex; i++ {
+			q := m.wizardQuestions[i]
+			ans := "no"
+			if m.wizardAnswers[q.id] {
+				ans = "yes"
+			}
+			b.WriteString(fmt.Sprintf("  %s  [%s]\n", q.prompt, ans))
+		}
+		if len(m.wizardQuestions) > 0 {
+			b.WriteString("\n" + m.wizardQuestions[m.wizardQIndex].prompt + "\n\n")
+		}
+		b.WriteString(helpKeyStyle.Render("[y] yes") + "    " + helpKeyStyle.Render("[n] no") + "    " + redStyle.Render("[esc] cancel wizard") + "\n")
+
+	case "blocked":
+		b.WriteString(redStyle.Render("not enough disk space") + "\n\n")
+		b.WriteString(m.wizardDiskMsg + "\n\n")
+		b.WriteString("Free up space and open the wizard again — nothing was downloaded.\n\n")
+		b.WriteString("(press any key to continue)\n")
+
+	case "run":
+		if m.wizardOllamaSkipNote != "" {
+			b.WriteString("  " + m.wizardOllamaSkipNote + "\n")
+		}
+		if m.wizardDiskNeededBytes > 0 {
+			b.WriteString(fmt.Sprintf("  disk: %.1f GB free, ~%.1f GB needed (incl. margin) — %s\n",
+				float64(m.wizardDiskFreeBytes)/1e9, float64(m.wizardDiskNeededBytes)/1e9,
+				helpKeyStyle.Render("OK")))
+		}
+		for _, l := range m.wizardLog {
+			b.WriteString("  " + l + "\n")
+		}
+		if m.wizardActionIdx < len(m.wizardActions) {
+			a := m.wizardActions[m.wizardActionIdx]
+			b.WriteString("\n")
+			switch a.kind {
+			case "install_ollama":
+				b.WriteString("Installing Ollama...\n")
+			case "pull":
+				const barWidth = 30
+				pct := m.wizardPullPct
+				if pct < 0 {
+					pct = 0
+				}
+				filled := barWidth * pct / 100
+				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+				b.WriteString(fmt.Sprintf("Downloading %s\n[%s] %d%%\n%s\n", a.model, bar, pct, m.wizardPullLine))
+			}
+		}
+		b.WriteString("\n" + redStyle.Render("[esc] abort") + "\n")
+
+	case "done":
+		if m.wizardCancelled {
+			b.WriteString(redStyle.Render("wizard aborted") + "\n\n")
+		} else {
+			b.WriteString("wizard finished\n\n")
+		}
+
+		questionW := 0
+		for _, q := range m.wizardQuestions {
+			if len(q.prompt) > questionW {
+				questionW = len(q.prompt)
+			}
+		}
+		b.WriteString(headerRowStyle.Render(fmt.Sprintf("  %-*s  %s", questionW, "question", "answer")) + "\n")
+		for _, q := range m.wizardQuestions {
+			ans := "no"
+			if m.wizardAnswers[q.id] {
+				ans = "yes"
+			}
+			b.WriteString(fmt.Sprintf("  %-*s  %s\n", questionW, q.prompt, ans))
+		}
+		b.WriteString("\n")
+
+		for _, l := range m.wizardLog {
+			b.WriteString("  " + l + "\n")
+		}
+		switch {
+		case m.wizardAnswers["tavily"] && m.wizardAnswers["telegram"]:
+			b.WriteString("\n(press any key to continue to Tavily key setup, then Telegram bot setup)\n")
+		case m.wizardAnswers["tavily"]:
+			b.WriteString("\n(press any key to continue to Tavily key setup)\n")
+		case m.wizardAnswers["telegram"]:
+			b.WriteString("\n(press any key to continue to Telegram bot setup)\n")
+		default:
+			b.WriteString("\n(press any key to continue)\n")
+		}
+	}
+
 	return b.String()
 }
 
@@ -5769,14 +8570,20 @@ func renderCapabilityBadges(caps string) string {
 // request yet — cold-loading a large model can take a minute or more with
 // zero other feedback, which reads as the app being frozen even though
 // typing still works the whole time.
-func renderWarmupStatus(warmup string) string {
+func renderWarmupStatus(warmup string, spinnerFrame int, elapsed time.Duration) string {
 	switch {
 	case warmup == "ready":
 		return helpKeyStyle.Render("● model loaded and ready")
 	case strings.HasPrefix(warmup, "error: "):
 		return redStyle.Render("● couldn't reach the model: " + strings.TrimPrefix(warmup, "error: "))
 	case warmup == "pending":
-		return agentToolStyle.Render("○ waiting for model to finish loading... (a large model can take a while — you can type while you wait; sending a message will trigger loading if it hasn't started)")
+		// Deliberately NOT agentThinkingPhrase's escalating "almost done"
+		// ladder: that's honest only when tied to an actual in-flight
+		// request. Here we have zero real progress signal — just
+		// pending-vs-ready from polling `ollama ps` — so claiming "almost
+		// done" would be a guess dressed up as a status.
+		frame := agentSpinnerFrames[spinnerFrame%len(agentSpinnerFrames)]
+		return agentToolStyle.Render(fmt.Sprintf("%s loading model into memory... (%s)", frame, elapsed.Round(time.Second)))
 	default:
 		return ""
 	}
@@ -5787,25 +8594,188 @@ func renderWarmupStatus(warmup string) string {
 // while the message body itself (first line's remainder, plus every
 // continuation line) renders in plain grey — the prefix is what tells you
 // who's speaking, the actual text doesn't need to compete with it.
+var chatURLRe = regexp.MustCompile(`https?://[^\s)\]}>"']+`)
+
+// linkifyLine renders a plain (unstyled) line with base, except any URL
+// substring, which gets agentLinkStyle plus an OSC 8 hyperlink escape so
+// terminals that support it (Windows Terminal, iTerm2, etc.) make it
+// clickable. Must run on already-wrapped plain text — lipgloss.Width()
+// doesn't understand OSC 8, so linkifying before wrapping would throw off
+// the wrap math.
+// isRTLRune reports whether r belongs to a right-to-left script (Hebrew or
+// Arabic and its extensions).
+func isRTLRune(r rune) bool {
+	return (r >= 0x0590 && r <= 0x05FF) || // Hebrew
+		(r >= 0x0600 && r <= 0x06FF) || // Arabic
+		(r >= 0x0750 && r <= 0x077F) || // Arabic Supplement
+		(r >= 0xFB1D && r <= 0xFB4F) || // Hebrew presentation forms
+		(r >= 0xFB50 && r <= 0xFDFF) || // Arabic presentation forms A
+		(r >= 0xFE70 && r <= 0xFEFF) // Arabic presentation forms B
+}
+
+func containsRTL(s string) bool {
+	for _, r := range s {
+		if isRTLRune(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func reverseRunes(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
+}
+
+// fixRTLDisplay makes Hebrew/Arabic readable on a terminal with no bidi
+// support. Such text is stored in logical (reading) order — first letter
+// typed is the rightmost glyph — but a plain terminal just prints runes
+// left to right in array order, which comes out backwards for RTL scripts
+// (each word's letters reversed, and word order reversed within the
+// sentence). This finds the span from the first to the last RTL-containing
+// word on the line, reverses that span's word order, and reverses the
+// characters within each RTL word — leaving any interior non-RTL token
+// (a number, a URL) in its own correct character order but relocated to
+// its new position, exactly like a real bidi renderer would lay it out.
+// Runs per rendered (already width-wrapped) line, so a paragraph that
+// wraps across multiple terminal rows still gets each row's RTL span laid
+// out correctly.
+func fixRTLDisplay(line string) string {
+	if !containsRTL(line) {
+		return line
+	}
+
+	type token struct {
+		text    string
+		isSpace bool
+	}
+	var tokens []token
+	runes := []rune(line)
+	i := 0
+	for i < len(runes) {
+		start := i
+		isSpace := runes[i] == ' '
+		for i < len(runes) && (runes[i] == ' ') == isSpace {
+			i++
+		}
+		tokens = append(tokens, token{text: string(runes[start:i]), isSpace: isSpace})
+	}
+
+	firstRTL, lastRTL := -1, -1
+	for idx, t := range tokens {
+		if !t.isSpace && containsRTL(t.text) {
+			if firstRTL == -1 {
+				firstRTL = idx
+			}
+			lastRTL = idx
+		}
+	}
+	if firstRTL == -1 {
+		return line
+	}
+
+	run := make([]token, lastRTL-firstRTL+1)
+	copy(run, tokens[firstRTL:lastRTL+1])
+	for a, b := 0, len(run)-1; a < b; a, b = a+1, b-1 {
+		run[a], run[b] = run[b], run[a]
+	}
+	for idx := range run {
+		if !run[idx].isSpace && containsRTL(run[idx].text) {
+			run[idx].text = reverseRunes(run[idx].text)
+		}
+	}
+
+	var b strings.Builder
+	for _, t := range tokens[:firstRTL] {
+		b.WriteString(t.text)
+	}
+	for _, t := range run {
+		b.WriteString(t.text)
+	}
+	for _, t := range tokens[lastRTL+1:] {
+		b.WriteString(t.text)
+	}
+	return b.String()
+}
+
+func linkifyLine(l string, base lipgloss.Style) string {
+	l = fixRTLDisplay(l)
+	matches := chatURLRe.FindAllStringIndex(l, -1)
+	if len(matches) == 0 {
+		return base.Render(l)
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		if m[0] > last {
+			b.WriteString(base.Render(l[last:m[0]]))
+		}
+		u := l[m[0]:m[1]]
+		b.WriteString("\x1b]8;;" + u + "\x1b\\" + agentLinkStyle.Render(u) + "\x1b]8;;\x1b\\")
+		last = m[1]
+	}
+	if last < len(l) {
+		b.WriteString(base.Render(l[last:]))
+	}
+	return b.String()
+}
+
+// stripMarkdownBold drops literal "**" markdown bold markers. This is a
+// plain-text terminal, not a markdown renderer, so "**text**" just showed
+// up as literal asterisks (worse, unpaired ones after RTL reordering) —
+// removing them outright reads cleaner than trying to preserve pairing.
+func stripMarkdownBold(s string) string {
+	return strings.ReplaceAll(s, "**", "")
+}
+
+// mdLinkRe matches markdown link syntax [label](url). This plain-text
+// terminal doesn't render it into a hyperlink, so it just showed up as
+// literal brackets/parens — and when the model sets label==url (common),
+// the URL appeared twice, once from each half.
+var mdLinkRe = regexp.MustCompile(`\[([^\]]*)\]\((https?://[^)\s]+)\)`)
+
+// stripMarkdownLinks collapses "[label](url)" down to one clean form: just
+// the URL if the label IS the url (or empty), otherwise "label: url".
+func stripMarkdownLinks(s string) string {
+	return mdLinkRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := mdLinkRe.FindStringSubmatch(m)
+		label, url := strings.TrimSpace(sub[1]), sub[2]
+		if label == "" || label == url {
+			return url
+		}
+		return label + ": " + url
+	})
+}
+
+// cleanMarkdownForDisplay strips the markdown constructs this plain-text
+// terminal can't render (bold markers, link syntax) before a message is
+// shown.
+func cleanMarkdownForDisplay(s string) string {
+	return stripMarkdownBold(stripMarkdownLinks(s))
+}
+
 func renderPrefixedChatLines(prefix, content string, width int, prefixStyle lipgloss.Style) []string {
 	wrapped := wrapLines(prefix+content, width)
 	out := make([]string, len(wrapped))
 	for i, l := range wrapped {
 		if i == 0 && strings.HasPrefix(l, prefix) {
-			out[i] = prefixStyle.Render(prefix) + agentToolStyle.Render(l[len(prefix):])
+			out[i] = prefixStyle.Render(prefix) + linkifyLine(l[len(prefix):], agentToolStyle)
 		} else {
-			out[i] = agentToolStyle.Render(l)
+			out[i] = linkifyLine(l, agentToolStyle)
 		}
 	}
 	return out
 }
 
-func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string) []string {
+func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string, spinnerFrame int, warmupElapsed time.Duration) []string {
 	var lines []string
 	toolNames := flatToolNames()
 	lines = append(lines, agentHeadStyle.Render(fmt.Sprintf("%d tools available — Alt+T to browse by category", len(toolNames))))
 	lines = append(lines, renderCapabilityBadges(capabilities))
-	if s := renderWarmupStatus(warmup); s != "" {
+	if s := renderWarmupStatus(warmup, spinnerFrame, warmupElapsed); s != "" {
 		lines = append(lines, s)
 	}
 	lines = append(lines, "")
@@ -5817,18 +8787,14 @@ func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, 
 		case "user":
 			lines = append(lines, renderPrefixedChatLines("you> ", msg.Content, width, agentUserStyle)...)
 		case "tool":
-			for _, l := range wrapLines("  [tool result] "+msg.Content, width) {
-				lines = append(lines, agentToolStyle.Render(l))
-			}
+			// Tool calls/results are process, not the answer — the model
+			// still gets the full msg.Content for its own reasoning
+			// (unaffected, this is render-only), but the transcript only
+			// shows the user's messages and the model's actual replies.
+			continue
 		case "assistant":
-			for _, tc := range msg.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Function.Arguments)
-				for _, l := range wrapLines(fmt.Sprintf("  [calling %s%s]", tc.Function.Name, string(argsJSON)), width) {
-					lines = append(lines, agentToolStyle.Render(l))
-				}
-			}
 			if strings.TrimSpace(msg.Content) != "" {
-				lines = append(lines, renderPrefixedChatLines(modelName+"> ", msg.Content, width, agentReplyStyle)...)
+				lines = append(lines, renderPrefixedChatLines(modelName+"> ", cleanMarkdownForDisplay(msg.Content), width, agentReplyStyle)...)
 			}
 		}
 		// Only add a separating blank line for messages that actually
@@ -5848,7 +8814,7 @@ func (m *model) syncAgentViewport() {
 	if !m.agentVPReady {
 		return
 	}
-	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup)
+	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup, m.agentSpinner, time.Since(m.agentWarmupStarted))
 	m.agentViewport.SetContent(strings.Join(lines, "\n"))
 	m.agentViewport.GotoBottom()
 }
@@ -5869,7 +8835,7 @@ func (m model) renderAgentChat() string {
 		frame := agentSpinnerFrames[m.agentSpinner%len(agentSpinnerFrames)]
 		elapsed := time.Since(m.agentStarted).Round(time.Second)
 		if strings.TrimSpace(m.agentStreamBuf) == "" {
-			bottom.WriteString(fmt.Sprintf("%s %s is thinking... (%s)\n", frame, m.agentModelName, elapsed))
+			bottom.WriteString(fmt.Sprintf("%s %s %s (%s)\n", frame, m.agentModelName, agentThinkingPhrase(elapsed), elapsed))
 		} else {
 			// Cap the live preview: an unbounded growing reply (the model
 			// can stream thousands of characters before it's done) must
@@ -5877,7 +8843,7 @@ func (m model) renderAgentChat() string {
 			// reserved budget (agentBottomReserve), or the layout
 			// overflows and the header scrolls off the top.
 			const maxPreviewLines = 6
-			streamLines := wrapLines(m.agentModelName+"> "+m.agentStreamBuf+"▌", agentViewportWidth(m.width))
+			streamLines := wrapLines(m.agentModelName+"> "+cleanMarkdownForDisplay(m.agentStreamBuf)+"▌", agentViewportWidth(m.width))
 			shown := streamLines
 			truncatedAbove := 0
 			if len(shown) > maxPreviewLines {
@@ -5888,11 +8854,16 @@ func (m model) renderAgentChat() string {
 				bottom.WriteString(agentToolStyle.Render(fmt.Sprintf("  ... (%d more line(s) so far)", truncatedAbove)) + "\n")
 			}
 			for _, l := range shown {
-				bottom.WriteString(agentReplyStyle.Render(l) + "\n")
+				bottom.WriteString(agentReplyStyle.Render(fixRTLDisplay(l)) + "\n")
 			}
 			bottom.WriteString(fmt.Sprintf("%s (%s)\n", frame, elapsed))
 		}
 	} else {
+		// Not reordered here on purpose: this is the live, still-being-typed
+		// input line, and flipping word/character order on every keystroke
+		// would make the cursor position and text jump around as you type.
+		// Once the message is sent it renders through linkifyLine (via
+		// renderPrefixedChatLines), which does apply the RTL fix.
 		bottom.WriteString(agentUserStyle.Render("you> ") + agentToolStyle.Render(m.agentInput+"█") + "\n")
 	}
 
@@ -6052,7 +9023,7 @@ var agentToolCategories = []toolCategory{
 		"list_window_titles",
 	}},
 	{"Networking & Web", []string{
-		"web_search", "read_webpage", "http_get", "http_post", "download_file", "ping_host",
+		"web_search", "read_webpage", "rss_feed", "find_rss_feed", "tavily_search", "tavily_extract", "http_get", "http_post", "download_file", "ping_host",
 		"get_public_ip", "ssh_run", "list_network_interfaces",
 	}},
 	{"System & Environment", []string{
@@ -6064,7 +9035,7 @@ var agentToolCategories = []toolCategory{
 		"git_status", "git_diff", "git_log", "git_commit", "git_branch",
 		"list_ollama_models", "list_running_ollama_models", "pull_ollama_model",
 	}},
-	{"Vision & Media", []string{"take_screenshot", "view_image", "read_pdf"}},
+	{"Vision & Media", []string{"take_screenshot", "view_image", "read_pdf", "read_document"}},
 	{"Data", []string{"run_sql", "read_csv", "read_json"}},
 	{"Open / Launch", []string{"open_url", "open_path"}},
 }
@@ -6115,6 +9086,10 @@ var toolExamples = map[string][2]string{
 	"list_window_titles":         {"What windows do I have open?", "Is there a Notepad window open?"},
 	"web_search":                 {"Search the web for the latest Go release", "Look up how to install poppler on Windows"},
 	"read_webpage":               {"Summarize the article at this URL", "Read the docs page and tell me the API key format"},
+	"rss_feed":                   {"What are the top stories on finance.yahoo.com/news/rssindex?", "Get the latest posts from this blog's RSS feed"},
+	"find_rss_feed":              {"Does globes.co.il have an RSS feed?", "Find the real RSS feed URL for this blog"},
+	"tavily_search":              {"Search for the latest news on the Fed rate decision", "Find recent articles about the new Go release"},
+	"tavily_extract":             {"Scrape the clean article text from this URL", "Extract the real content from this page — read_webpage just gave me a cookie wall"},
 	"http_get":                   {"Fetch https://api.github.com/status", "Check what this API endpoint returns"},
 	"http_post":                  {"POST this JSON payload to my webhook URL", "Send a test request to the local API"},
 	"download_file":              {"Download this ZIP to the downloads folder", "Save this image to disk"},
@@ -6143,6 +9118,7 @@ var toolExamples = map[string][2]string{
 	"take_screenshot":            {"Take a screenshot and tell me what's on screen", "Capture my screen and describe it"},
 	"view_image":                 {"Look at screenshot.png and describe it", "What's in this diagram file?"},
 	"read_pdf":                   {"Extract the text from report.pdf", "What does this PDF say on page 1?"},
+	"read_document":              {"What does this Word doc say: notes.docx", "Summarize contract.pdf and readme.txt"},
 	"run_sql":                    {"Query the users table for all rows", "Run SELECT COUNT(*) on my database"},
 	"read_csv":                   {"Show me the contents of data.csv as a table", "Read sales.csv"},
 	"read_json":                  {"Pretty-print config.json", "Validate and show this JSON file"},

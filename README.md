@@ -1,8 +1,14 @@
 # llama-shell
 
+[![Latest release](https://img.shields.io/github/v/release/affigabmag/llama-shell)](https://github.com/affigabmag/llama-shell/releases/latest)
+
 A terminal UI (TUI) shell for [Ollama](https://ollama.com), written in Go with 
 [Bubble Tea](https://github.com/charmbracelet/bubbletea) + [Lipgloss](https://github.com/charmbracelet/lipgloss).
 Single static executable, no runtime dependencies.
+
+Talk to your local model from wherever you actually are: the terminal, a
+browser tab, or Telegram on your phone — all three are the same agentic
+chat, same tools, same conversation loop underneath.
 
 <img width="1113" height="626" alt="image" src="https://github.com/user-attachments/assets/14a70184-6333-44b4-8992-7f8b92d9bd38" />
 <img width="1113" height="626" alt="image" src="https://github.com/user-attachments/assets/71dcccef-e5c3-4dcf-a1d0-29b2fac7bedf" />
@@ -12,7 +18,7 @@ Single static executable, no runtime dependencies.
 ## Building
 
 ```
-go build -ldflags "-X main.buildTime=$(date +%Y%m%d-%H%M%S) -X main.appVersion=v0.2.0" -o llama-shell.exe .
+go build -ldflags "-X main.buildTime=$(date +%Y%m%d-%H%M%S) -X main.appVersion=v0.4.0" -o llama-shell.exe .
 ```
 
 The footer shows the build timestamp (there's no user-facing semantic version display — it's a live build tag, not manually bumped). `appVersion` is separate and only used internally to check for updates — set it to match the git tag you're cutting the release from. Omitting it leaves the update checker permanently unable to tell if a newer release exists (it falls back to `"dev"`, which the checker always treats as "nothing to compare").
@@ -26,7 +32,7 @@ The footer shows the build timestamp (there's no user-facing semantic version di
 ## Layout
 
 - **Header** (fixed top): app title.
-- **Footer** (fixed bottom): purple bar matching the header. Build timestamp (left), a clickable GitHub repo link (OSC-8 terminal hyperlink, middle) or a context-specific key hint in the agentic chat/tools/help screens, and ollama installed/not-installed status with version (right, green if installed, red if not) — preceded by a blinking yellow `update` flag when a newer release is available.
+- **Footer** (fixed bottom): purple bar matching the header. Build timestamp (left), a clickable "GitHub" repo link (OSC-8 terminal hyperlink, middle) or a context-specific key hint in the agentic chat/tools/help screens, and on the right: Tavily/Telegram/web-server status flags (grey=off, yellow=configured-but-not-running, cyan=running/bound), then ollama installed/not-installed status with version (green if installed, red if not) — preceded by a blinking yellow `update` flag when a newer release is available.
 - **Body**: the current screen. All menus support Up/Down + Enter navigation as well as the letter shortcut shown in brackets.
 - **Banner**: "LLAMA-SHELL" rendered as solid-color block letters (blue, white, red, green, cyan, magenta, yellow, repeating by letter position — static, not animated) at the top of the main menu.
 
@@ -38,7 +44,7 @@ The footer shows the build timestamp (there's no user-facing semantic version di
 | `p` | Running models |
 | `s` | Show model info |
 | `d` | Device info |
-| `h` | Help / disclaimer / log / update |
+| `h` | Help |
 | `q` | Quit |
 
 On first launch, the app shows the disclaimer and requires `[a] I agree` before continuing — declining (any other key) quits the app. If Ollama isn't installed, it then offers to install it: Linux runs the official one-line installer unattended, macOS/Windows open the correct download page (those are signed GUI installers, not scriptable).
@@ -84,7 +90,7 @@ llama-shell's own built-in chat + tool-calling agent — no Aider/OpenCode/Claud
 
 - **Streaming replies**: parses Ollama's newline-delimited JSON stream chunk-by-chunk, so replies type out token-by-token instead of appearing all at once. A stream that gets cut off mid-generation without a final `done:true` (e.g. the backend crashed) surfaces as a real error instead of silently looking like an empty, successful reply.
 - **Model warm-up status** shown in the banner: `○ waiting for model to finish loading...` while a background `ollama ps` poll hasn't seen it yet, flipping to `● model loaded and ready` the instant a real token, tool call, or completed turn arrives — typing is never blocked either way, this is purely informational for a cold-loading model that can otherwise look like the app is frozen.
-- **55 tools** across files & archives, shell & processes, networking & web (including `web_search` via a DuckDuckGo HTML scrape, no API key; `http_post`/`download_file`), system & environment (including `send_notification`/`read_registry`), git & ollama (including `git_commit`/`git_branch`/`pull_ollama_model`), vision & media (`take_screenshot`/`view_image`/`read_pdf`), data (`run_sql`/`read_csv`/`read_json`), and open/launch. Press **Alt+T** to browse the full list — numbered, grouped by category, `Tab`/`Shift+Tab` to select and auto-scroll, `Enter` for a detail view (real description + two example prompts), `Esc` back.
+- **60 tools** across files & archives, shell & processes, networking & web (`web_search` via a DuckDuckGo HTML scrape — no API key; `read_webpage`; `rss_feed`/`find_rss_feed` for structured headlines from a feed, discovered via a page's `<link rel="alternate">` tag rather than a guessed URL; `tavily_search`/`tavily_extract` when a Tavily key is set — see below; `http_post`/`download_file`), system & environment (including `send_notification`/`read_registry`), git & ollama (including `git_commit`/`git_branch`/`pull_ollama_model`), vision & media (`take_screenshot`/`view_image`/`read_pdf`/`read_document`), data (`run_sql`/`read_csv`/`read_json`), and open/launch. Press **Alt+T** to browse the full list — numbered, grouped by category, `Tab`/`Shift+Tab` to select and auto-scroll, `Enter` for a detail view (real description + two example prompts), `Esc` back.
 - **Vision**: type/paste a path to an existing image file, or press **Alt+V** to attach an image straight from the clipboard (falls back to pasting clipboard text if there's no image) — both base64-attach via Ollama's `images` field.
 - **Tool mode (`Alt+M`)**, cycles `auto` (default) → `on` → `off`, shown live in the footer. `auto` skips tool-calling for any single message that attaches an image — at least `gemma4:e2b` garbles the image entirely when `tools` is also in the request, so a message can reliably have working vision or working tools, not both — then resumes tools on the next image-free message. `on` always tries tools anyway; `off` never sends them this chat.
 - **Keys**: `Enter` send, `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` scroll history (via a real `bubbles/viewport`, works even while the model is thinking), `Alt+V` paste, `Alt+T` tool categories, `Alt+M` cycle tool mode, `Alt+H` this keybind help dialog, `Esc` back to the model actions menu, `Ctrl+C` quit. `Alt+` instead of `Ctrl+` deliberately — browser-based terminals (e.g. viewing an LXC console over the web) often reserve `Ctrl+T`/`Ctrl+H`/`Ctrl+R`/`Ctrl+V` for tab/history/reload/paste at the browser level and never forward them to the app.
@@ -117,7 +123,37 @@ Self-update mechanism (differs by OS since a running executable can't be freely 
 - **Linux/macOS**: downloads the release zip, extracts the binary, and does one atomic rename over the running executable's file — allowed even while it's running.
 - **Windows**: a running exe can't be renamed *onto*, but *itself* can be renamed — so it renames the running exe aside to `<exe>.old`, then renames the newly-downloaded binary into place. The leftover `.old` file is cleaned up automatically on the next launch.
 
+### Setup wizard (`w` from the help menu)
+
+A guided first-time setup: accept the disclaimer, install Ollama if it's not already on `PATH`, then choose which starter models to pull — `qwen2.5:1.5b` (~1 GB), `gemma2:2b` (~1.6 GB), `gemma4:e2b` (~7 GB). Every question is asked up front (skipping the Ollama-install question entirely if it's already installed); only after all of them are answered does anything actually start. `[esc]`/`[q]` cancels at any point during the questions, `[esc]`/`[a]` aborts the currently-running install/download without touching what's left unselected.
+
+Before starting any download, it checks real free disk space on the drive Ollama actually stores models on (`~/.ollama/models`, or `$OLLAMA_MODELS` if set) against the combined size of everything selected plus a 20% margin — if there isn't enough room, it stops before downloading anything and says how much space is missing, rather than failing partway through a multi-gigabyte pull.
+
 Either way, you need to restart llama-shell afterward to run the new version — the update swaps the file on disk, it doesn't reload the already-running process. Requires the binary to have been built with `-X main.appVersion=vX.Y.Z` matching a real release tag (see Building); otherwise there's no baseline version to compare and the checker never reports an update.
+
+### Web UI (`b` from the help menu)
+
+Serves the same agentic chat — same tools, same system prompt, same conversation loop — as a page in any browser instead of only in the terminal.
+
+- Bound to `127.0.0.1` only, never your local network, and every request needs a random access token baked into the URL (shown once enabled) — without it every request gets a 403. Binding to localhost isn't a real security boundary against other software on the same machine, and the API underneath grants full local tool access (files, commands, network), so the token is the actual gate.
+- Enabling picks a model: your last choice if still installed, else `gemma4:e2b`, else whatever else is installed; offers to download `gemma4:e2b` if nothing's installed at all.
+- Modern chat layout (full-width messages, real markdown rendering, collapsible tool-call trace per turn) rather than a terminal-styled page — built after research into how Claude.ai/ChatGPT/Open WebUI actually lay out an agentic chat, not a straight skin of the TUI.
+- Tool browser (search, grouped by category, collapsed by default, copy-to-clipboard on each example prompt) and a help panel, both reachable from the top bar.
+- Status badges (ollama/Tavily/Telegram) and a rotating "thinking"/"loading model" indicator so a slow local model never just looks stuck.
+- Mobile-responsive; the composer has a stop button that aborts an in-flight reply client-side.
+
+### Telegram bot (`m` from the help menu)
+
+Same agentic chat again, reachable from Telegram on your phone.
+
+- Uses long-polling (`getUpdates`), not an incoming webhook — no public URL, no port forwarding, no tunnel, unlike the web server option. This is also why Telegram was picked over WhatsApp: WhatsApp's Cloud API needs a public HTTPS endpoint, and the unofficial alternative (Baileys) risks the account getting banned.
+- Get a token from [@BotFather](https://t.me/BotFather) (`/newbot`), paste it into the settings screen. It auto-binds to whichever chat messages it first and ignores every other chat after that, so a stranger who finds the bot's username can't drive your local agent.
+- Sends an instant "Got it — working on it..." acknowledgment plus Telegram's native "typing..." indicator (kept alive on a ticker) while a reply is in progress, so a slow model doesn't read as a dead bot.
+- Token, bound chat, and model persist across restarts (`%LocalAppData%\llama-shell\telegram_config.json`).
+
+### Tavily API key (`t` from the help menu)
+
+Tavily ([tavily.com](https://www.tavily.com/)) is a search + scraping API built for agents. Setting a key here (get one at [app.tavily.com](https://app.tavily.com/)) enables `tavily_search` (real result content, not just snippets) and `tavily_extract` (clean article text — handles pages `read_webpage` can't: cookie walls, JS-only shells). Nothing else needs it; skip the screen if you don't want it.
 
 ## Known limitations
 
@@ -126,4 +162,4 @@ Either way, you need to restart llama-shell afterward to run the new version —
 
 ## License
 
-Source-available, view-only — see [LICENSE](LICENSE). You can read the code and run it for personal use, but you may not modify it or redistribute a modified version. Provided with no warranty of any kind. Not affiliated with or endorsed by Ollama Inc. or Hugging Face. On first launch, the app requires you to accept this disclaimer before continuing (`help / disclaimer / log / update` in the main menu to review it again later).
+Source-available, view-only — see [LICENSE](LICENSE). You can read the code and run it for personal use, but you may not modify it or redistribute a modified version. Provided with no warranty of any kind. Not affiliated with or endorsed by Ollama Inc. or Hugging Face. On first launch, the app requires you to accept this disclaimer before continuing (`[h] help` in the main menu to review it again later).

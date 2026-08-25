@@ -3,6 +3,198 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Web UI, Telegram bot, Tavily, RSS tools — ninth session (2026-08-25)
+
+- **New: web UI** (`[b]` from the help menu) — the same agentic chat served
+  as a browser page. Bound to `127.0.0.1` only and gated behind a random
+  access-token query param (every request 403s without it) — binding to
+  localhost isn't a real security boundary against other local software,
+  and the API underneath grants full tool access, so the token is the
+  actual gate. Enabling picks a model (last choice → `gemma4:e2b` →
+  whatever's installed) and offers to pull `gemma4:e2b` if nothing's
+  installed.
+  - First cut mimicked the TUI's terminal look; explicitly redirected
+    after feedback ("this is not a tui... research how web agentic
+    should look like") — researched Open WebUI/ChatGPT/Claude.ai
+    conventions (full-width messages over bubbles, collapsed-by-default
+    tool-call trace, docked composer) and rebuilt around that instead.
+  - Real minimal markdown renderer (bold, inline/fenced code, links,
+    autolinked bare URLs) plus a specific normalization pass: a small
+    model reliably wrote `**Headline**` followed by a redundant
+    `[url](url)` line instead of `[Headline](url)`, so that exact shape
+    gets collapsed into one real link regardless of how much the prompt
+    asked it not to.
+  - Tool browser: search box, grouped by category (collapsible,
+    collapsed by default), numbered, copy-icon per example prompt.
+  - Rotating "Thinking → Reasoning → Working through it → Almost done →
+    (cycling)" status mirroring the TUI's ladder, switching to "loading
+    model into memory" via an `/api/warmup` poll (`ollama ps` check) —
+    same honesty principle as the TUI: no fake progress claims during
+    model load, since there's no real signal for it.
+  - Stop button (send button becomes ■ while busy) that aborts the
+    in-flight fetch client-side.
+  - Status badges (ollama/Tavily/Telegram) via a new `/api/status`
+    endpoint; mobile-responsive breakpoint at 640px; emoji favicon.
+- **New: Telegram bot** (`[m]` from the help menu) — same agentic chat,
+  reachable from Telegram. Chosen over WhatsApp specifically because it
+  supports long-polling (`getUpdates`): no incoming webhook, no public
+  URL, no tunnel — WhatsApp's Cloud API needs a public HTTPS endpoint,
+  and the unofficial Baileys alternative risks the account getting
+  banned. Get a token from `@BotFather` (`/newbot`), paste it into the
+  settings screen; the bot auto-binds to whichever chat messages it
+  first and rejects every other chat after that, so a stranger who
+  finds the bot's username can't drive the local agent. Sends an
+  instant "Got it — working on it..." ack plus Telegram's native
+  "typing..." indicator (refreshed on a ticker, since it only lasts
+  ~5s per call) while a reply is in progress. Token/model/bound chat
+  persist to `telegram_config.json` and auto-start on next launch.
+  Added to the setup wizard as a y/n question alongside Tavily, chained
+  so answering yes to both actually visits both settings screens in
+  sequence.
+- **New: Tavily integration** (`[t]` from the help menu) — `tavily_search`/
+  `tavily_extract` tools, gated on a `TAVILY_API_KEY` persisted via its
+  own settings screen (guide + masked key display), reused as the model
+  for the wizard's Tavily question too.
+- **New tools** (56 → 60): `rss_feed` (parses RSS/Atom into a clean
+  title/link/date/summary list — real `encoding/xml`, not another
+  regex scrape), `find_rss_feed` (discovers a site's real feed via its
+  `<link rel="alternate">` tag instead of guessing a path),
+  `tavily_search`, `tavily_extract`.
+- **Fixed a real HTML-tag-stripping bug** in `read_webpage`/
+  `stripHTMLTags`: the original regex tag-matcher broke the moment an
+  attribute value (e.g. a large inline `style="..."`) or an HTML
+  comment contained a literal `>` — Yahoo Finance/ynet pages leaked raw
+  CSS into the model's context this way. Replaced with a quote- and
+  comment-aware char-by-char scanner.
+- **Fixed a native backend crash** (`GGML_ASSERT(n_inputs <
+  GGML_SCHED_MAX_SPLIT_INPUTS)`, exit `0xc0000409`) hit by `gemma4:e2b`
+  when handed this app's full 60-tool schema list in one request — a
+  fixed scheduler limit in the backend, not a prompt-size issue. Now
+  auto-retries the same turn with tools stripped instead of hard-failing
+  (`shouldRetryWithoutTools`, extending the existing "model doesn't
+  support tools" downgrade path). Also shrank the system prompt itself
+  (~55-60%) as a second mitigation.
+- **System-prompt hard rules added after repeated real-model testing**,
+  each one verified against the actual model rather than assumed fixed:
+  finance.yahoo.com/ynet.co.il must go through `rss_feed` on their known
+  feed URLs, never `read_webpage` (both show a cookie-consent wall to a
+  plain GET); any other site must try `find_rss_feed` before guessing a
+  path; "top N" answers must contain exactly N items; every web-sourced
+  item must cite its real URL *and* a content summary, not a bare link
+  or a source name alone — broadened from "top N only" to "any web
+  result" after a follow-up correction.
+- **RTL (Hebrew/Arabic) display fix** in the TUI: such text is stored in
+  logical order, but this terminal just prints codepoints left-to-right
+  with no bidi support, so it rendered backwards. Fixed by reversing
+  word order and per-word character order within the RTL span of a
+  line (embedded numbers/URLs stay upright and just get repositioned) —
+  a real, if simplified, bidi pass, not just a cosmetic tweak, and only
+  touches lines that actually contain RTL characters.
+- **Wizard**: no longer short-circuits on the first "no" — every
+  question is asked through to the end regardless of any decline; only
+  the disclaimer's answer is checked afterward to gate whether any
+  actions run. Its own map-default-false trap (an unasked question
+  reading as "declined") is guarded against explicitly. "Done" screen
+  now shows a question/answer summary table before the action log.
+- **Footer**: added explicit-always-shown Tavily/Telegram/web-server
+  status flags (grey=off, yellow=configured-but-not-running,
+  cyan=running/bound) rather than showing nothing when off, which read
+  as ambiguous; the GitHub link now shows as "GitHub" instead of the
+  full raw URL (gap-math updated to the shorter visible width); the
+  same link added to the `[h] read help` screen.
+- Real credentials (a live Tavily key, a Telegram bot token) got pasted
+  into chat during this session by necessity of screen-sharing the
+  setup flow — both are called out as compromised/rotate-if-unsure in
+  the relevant commit context. Added a gitignored `CREDENTIALS.md` for
+  local setup notes since this is a public repo.
+
+## Setup wizard, disk-space gate, main-menu label simplified — eighth session (2026-08-23)
+
+- **New `[w]` setup wizard**, from the help menu: accept disclaimer →
+  install Ollama (question skipped entirely if already installed) →
+  pick which of `qwen2.5:1.5b` / `gemma2:2b` / `gemma4:e2b` to download.
+  Deliberately asks **every** question up front and only starts running
+  anything once all are answered, rather than interleaving prompts with
+  actions — a mid-run "install ollama?" prompt would block on user input
+  right when a later step (a multi-GB pull) is the one that actually
+  benefits from being left running unattended.
+  - Declining the disclaimer question cancels the whole wizard
+    immediately (same as the first-run disclaimer gate).
+  - `[esc]`/`[q]` cancels during the question phase; `[esc]`/`[a]` aborts
+    the currently in-progress install/pull during the run phase — kills
+    the process, leaves whatever hasn't started yet un-started.
+  - Reuses the existing `installOllama()` cmd for the install step, and
+    a **dedicated** copy of the "list models" screen's own
+    stream-parsing pull mechanism (`wizardPullModel`/
+    `wizardPullChanMsg`/etc., sharing the pure `stripANSI`/
+    `cleanPullLine` helpers but not the model fields) for downloads —
+    kept separate on purpose so a wizard run can never collide with an
+    unrelated download already in progress from the List Models screen.
+- **Disk-space gate before starting anything**: sums the real download
+  size of every selected model (`986 MB` qwen2.5:1.5b and `1.6 GB`
+  gemma2:2b confirmed from ollama.com's own library pages; `7.2 GB`
+  gemma4:e2b confirmed from the user's own already-installed copy via
+  `ollama list` — not guessed), adds a 20% margin (ollama's blob store
+  briefly holds compressed+decompressed data at once mid-pull), and
+  compares against real free space on the drive Ollama actually stores
+  models on (`$OLLAMA_MODELS` or `~/.ollama/models`) — not wherever
+  llama-shell happens to be running from. If it doesn't fit, the wizard
+  stops before downloading anything and says how much is missing.
+  Verified against real disk state (not mocked): a live `diskFreeBytes()`
+  call returned genuine free space (509.5 GB on the dev machine), the
+  real ~9.8 GB combined total correctly passed, and an artificially
+  inflated fake model size correctly triggered the "not enough space"
+  path — via a throwaway test, deleted after use.
+  - Free-space lookup shells out per OS rather than using
+    `syscall.Statfs` — that type doesn't exist when this same file is
+    cross-compiled for Windows, so it'd need a build-tag-split file;
+    shelling out (`Get-PSDrive` on Windows, `df -Pk` elsewhere) matches
+    the existing per-OS-branch pattern already used by `installOllama()`
+    and `openInBrowser()` instead of introducing a new file-splitting
+    convention just for this.
+- **Main-menu `[h]` label simplified to plain `help`** (was
+  `help / disclaimer / log / update`, which was about to grow a 5th
+  segment for the wizard) — the help screen itself still lists every
+  sub-item.
+
+## `read_document` tool (Word/PDF/text, Tier-1 "RAG") — seventh session (2026-08-23)
+
+- **New `read_document` agent tool**: extracts full plain text from a
+  file and dispatches by extension — `.pdf` (existing `pdftotext`,
+  reused as-is), `.docx` (new: parsed directly with `archive/zip` +
+  `encoding/xml`, no external dependency), anything else read as plain
+  text. `.doc` (legacy binary format) explicitly rejected with a message
+  telling the user to convert to `.docx`/`.pdf` first — parsing it
+  properly would need a real OLE/CFB parser, not worth it for how rare
+  actual `.doc` files are now.
+- **Why not full RAG (chunk + embed + vector search)**: for a handful of
+  files that fit in context, dumping the whole extracted text into the
+  chat (same as the existing `read_pdf` tool already does) is simpler and
+  sufficient — no vector store, no separate embedding model, no chunking
+  strategy to get wrong. Real RAG only earns its complexity once
+  documents are too large/numerous to fit in context at once; that's a
+  separate, larger feature if it's ever needed.
+- **`.docx` extraction approach**: Word's format is a zip of XML parts;
+  the visible text lives in `word/document.xml` as `<w:t>` runs grouped
+  into `<w:p>` paragraphs — walked with a plain `xml.Decoder` token loop
+  (no full-document unmarshal needed), emitting a newline per paragraph
+  end and per `<w:br>`/`<w:cr>`, and a tab per `<w:tab>`. Table cells are
+  just paragraphs nested one level deeper, so table text comes through
+  for free with no special-casing.
+- **Verified against a genuine `.docx`**, not a mocked one: built a real
+  minimal Word-format zip (proper `[Content_Types].xml` +
+  `word/document.xml` with split runs and a `<w:br/>`) and ran the actual
+  `readDocxText()` against it in a throwaway test (deleted after use).
+  Caught and fixed one real bug this way: `Compress-Archive` on Windows
+  writes zip entry names with backslash separators (`word\document.xml`)
+  instead of the zip-spec-standard forward slash real Word/LibreOffice
+  always uses — harmless for real `.docx` files, but the entry-name
+  match is now normalized (`strings.ReplaceAll(..., "\\", "/")`) anyway
+  since it costs nothing and removes the assumption.
+- Added to the `Vision & Media` tool category (alongside `read_pdf`) and
+  the tool-browser example-prompts map; tool count in README bumped
+  55 → 56.
+
 ## Self-update from GitHub releases — sixth session (2026-08-23)
 
 - **Fixed a version-comparison bug found during a real end-to-end test**:
