@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -289,62 +290,159 @@ func cleanupOldExe() {
 	_ = os.Remove(exePath + ".old")
 }
 
-// bannerGlyph is a 5-row-tall block letter. Every row must be the same
-// width so letters line up; a blank glyph (the space between words) is
-// just 5 empty rows of a given width.
-var bannerGlyphs = map[rune][]string{
-	'L': {
-		"#    ",
-		"#    ",
-		"#    ",
-		"#    ",
-		"#####",
-	},
-	'A': {
-		" ### ",
-		"#   #",
-		"#####",
-		"#   #",
-		"#   #",
-	},
-	'M': {
-		"#   #",
-		"## ##",
-		"# # #",
-		"#   #",
-		"#   #",
-	},
-	'S': {
-		" ####",
-		"#    ",
-		" ### ",
-		"    #",
-		"#### ",
-	},
-	'H': {
-		"#   #",
-		"#   #",
-		"#####",
-		"#   #",
-		"#   #",
-	},
-	'E': {
-		"#####",
-		"#    ",
-		"###  ",
-		"#    ",
-		"#####",
-	},
-	'-': {
-		"     ",
-		"     ",
-		"#####",
-		"     ",
-		"     ",
-	},
+// boxVertices are the 4 corners of a FLAT rectangle (zero depth, all
+// z=0), rotating in 3D — it'll periodically look edge-on/thin as it
+// spins past 90°, which is correct for a genuinely flat shape (like a
+// card flipping), not a rendering bug. boxEdges connects them as a
+// simple quad outline. triangleVertices/Edges are a flat triangle the
+// same way. The main-menu banner renders both side by side, each
+// spinning independently, instead of static block-letter text.
+var boxVertices = [4][3]float64{
+	{-1.6, -0.8, 0}, {1.6, -0.8, 0}, {1.6, 0.8, 0}, {-1.6, 0.8, 0},
 }
 
-const bannerWord = "LLAMA-SHELL"
+var boxEdges = [4][2]int{
+	{0, 1}, {1, 2}, {2, 3}, {3, 0},
+}
+
+var triangleVertices = [3][3]float64{
+	{0, -1, 0}, {0.87, 0.6, 0}, {-0.87, 0.6, 0},
+}
+
+var triangleEdges = [3][2]int{
+	{0, 1}, {1, 2}, {2, 0},
+}
+
+// circleVertices approximates a flat circle (zero depth, all z=0) as a
+// 16-point polygon; circleEdges connects them consecutively around the
+// loop. Same "flat shape spinning in 3D" treatment as the rectangle and
+// triangle.
+var circleVertices = func() [16][3]float64 {
+	var v [16][3]float64
+	for i := range v {
+		a := float64(i) / 16 * 2 * math.Pi
+		v[i] = [3]float64{math.Cos(a), math.Sin(a), 0}
+	}
+	return v
+}()
+
+var circleEdges = func() [16][2]int {
+	var e [16][2]int
+	for i := range e {
+		e[i] = [2]int{i, (i + 1) % 16}
+	}
+	return e
+}()
+
+// cubeColorStops is the banner's color loop, evenly spaced around the
+// cycle: yellow -> orange -> red -> green -> blue -> white -> (back to
+// yellow).
+var cubeColorStops = [6][3]int{
+	{255, 215, 0},
+	{255, 140, 0},
+	{255, 60, 60},
+	{80, 220, 100},
+	{80, 140, 255},
+	{255, 255, 255},
+}
+
+// cubeColorAt interpolates cubeColorStops at a phase in [0,1) (wrapping),
+// so the color blends smoothly through the loop rather than jumping
+// between flat colors.
+func cubeColorAt(phase float64) string {
+	n := len(cubeColorStops)
+	phase = math.Mod(phase, 1.0)
+	if phase < 0 {
+		phase += 1.0
+	}
+	seg := phase * float64(n)
+	idx := int(seg) % n
+	next := (idx + 1) % n
+	frac := seg - math.Floor(seg)
+	c0, c1 := cubeColorStops[idx], cubeColorStops[next]
+	lerp := func(a, b int) int { return int(float64(a) + (float64(b)-float64(a))*frac) }
+	return fmt.Sprintf("#%02X%02X%02X", lerp(c0[0], c1[0]), lerp(c0[1], c1[1]), lerp(c0[2], c1[2]))
+}
+
+// depthRamp is a density ramp from farthest to nearest — the wireframe
+// renders each pixel with a character picked from this by its depth
+// (rotated z), so the shape reads with real pseudo-3D shading instead of
+// a single flat character for every line.
+var depthRamp = []byte{'.', '*', '%', '#', '@'}
+
+func depthChar(z float64) byte {
+	const zMin, zMax = -1.8, 1.8 // typical range after rotating these shapes
+	t := (z - zMin) / (zMax - zMin)
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	return depthRamp[int(t*float64(len(depthRamp)-1))]
+}
+
+// renderWireframe projects verts (rotated by angle around all three
+// axes — X, Y, and Z — each at a different rate for a genuine tumble
+// rather than a flat single-axis spin) onto a w*h character grid via
+// simple perspective, then rasterizes each edge onto it with a basic
+// parametric line walk, shading each pixel by depth via depthChar. The
+// horizontal axis is stretched (2.2x) to compensate for terminal
+// characters being taller than they are wide — without it any shape
+// would render squashed. Shared by every shape so they all spin with
+// visually consistent depth/perspective.
+func renderWireframe(verts [][3]float64, edges [][2]int, w, h int, angle float64) string {
+	grid := make([][]byte, h)
+	for i := range grid {
+		grid[i] = make([]byte, w)
+		for j := range grid[i] {
+			grid[i][j] = ' '
+		}
+	}
+
+	ax, ay, az := angle*0.6, angle, angle*0.9
+	cosX, sinX := math.Cos(ax), math.Sin(ax)
+	cosY, sinY := math.Cos(ay), math.Sin(ay)
+	cosZ, sinZ := math.Cos(az), math.Sin(az)
+
+	// [3]float64{screenX, screenY, depthZ} — depth carried alongside the
+	// 2D projection so drawLine can interpolate it too, not just position.
+	proj := make([][3]float64, len(verts))
+	for i, v := range verts {
+		x, y, z := v[0], v[1], v[2]
+		x1 := x*cosY + z*sinY
+		z1 := -x*sinY + z*cosY
+		y2 := y*cosX - z1*sinX
+		z2 := y*sinX + z1*cosX
+		x2 := x1*cosZ - y2*sinZ
+		y3 := x1*sinZ + y2*cosZ
+		scale := 6.0 / (4.0 - z2)
+		proj[i] = [3]float64{x2 * scale * 2.2, y3 * scale, z2}
+	}
+
+	cx, cy := w/2, h/2
+	setPixel := func(px, py, z float64) {
+		gx, gy := cx+int(math.Round(px)), cy+int(math.Round(py))
+		if gx >= 0 && gx < w && gy >= 0 && gy < h {
+			grid[gy][gx] = depthChar(z)
+		}
+	}
+	drawLine := func(p0, p1 [3]float64) {
+		steps := int(math.Max(math.Abs(p1[0]-p0[0]), math.Abs(p1[1]-p0[1]))*2) + 1
+		for s := 0; s <= steps; s++ {
+			t := float64(s) / float64(steps)
+			setPixel(p0[0]+(p1[0]-p0[0])*t, p0[1]+(p1[1]-p0[1])*t, p0[2]+(p1[2]-p0[2])*t)
+		}
+	}
+	for _, e := range edges {
+		drawLine(proj[e[0]], proj[e[1]])
+	}
+
+	lines := make([]string, h)
+	for i, row := range grid {
+		lines[i] = string(row)
+	}
+	return strings.Join(lines, "\n")
+}
 
 type view int
 
@@ -785,6 +883,11 @@ func agentTools() []ollamaTool {
 				"properties": map[string]interface{}{"url": strProp("URL of the page to scrape.")},
 				"required":   []string{"url"},
 			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "get_web_ui_url",
+			Description: "Get the URL to open this same agentic chat in a web browser (llama-shell's own web UI), including its required access token. Call this whenever the user asks for the web UI's URL/link/address — never guess or say there isn't one without checking first.",
+			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		}},
 		{Type: "function", Function: ollamaToolFunction{
 			Name:        "get_public_ip",
@@ -1852,6 +1955,20 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		}
 		return truncateToolOutput(strings.TrimSpace(resp.Results[0].RawContent))
 
+	case "get_web_ui_url":
+		if !isWebServerRunning() {
+			return "The web UI is not currently running. Enable it in llama-shell via [h] help/settings -> [b] web server."
+		}
+		cfg := loadWebServerConfig()
+		var b strings.Builder
+		b.WriteString("Web UI links (each includes the required access token):\n\n")
+		b.WriteString(webServerURLFor("127.0.0.1", cfg.Token) + " (this machine only)\n\n")
+		for _, ip := range localLANIPv4s() {
+			b.WriteString(webServerURLFor(ip, cfg.Token) + " (same WiFi/LAN)\n\n")
+		}
+		b.WriteString("No tunnel (e.g. Cloudflare Tunnel) is set up, so none of these work from outside this network.")
+		return b.String()
+
 	case "get_public_ip":
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get("https://api.ipify.org")
@@ -2390,6 +2507,18 @@ func agentTickCmd() tea.Cmd {
 	})
 }
 
+// cubeTickMsg drives the main-menu banner's rotation — runs for the whole
+// program lifetime (cheap: one float increment per tick) rather than only
+// while viewMenu is showing, so it doesn't need to be restarted every time
+// the user navigates back to the main menu.
+type cubeTickMsg struct{}
+
+func cubeTickCmd() tea.Cmd {
+	return tea.Tick(90*time.Millisecond, func(time.Time) tea.Msg {
+		return cubeTickMsg{}
+	})
+}
+
 // runAgentTurn drives the tool-call loop for one user message: stream the
 // model's reply token-by-token, and while it keeps asking for tools, run
 // them locally and feed the results back, until it replies with plain
@@ -2455,7 +2584,20 @@ func agentSystemPrompt(wd string) string {
 			"(https://finance.yahoo.com/markets/stocks/articles/...)' — never print the raw URL "+
 			"as separate visible text like 'URL: https://...' or on its own line, and never "+
 			"write '(Source: MSN)'/'(Bloomberg)' alone with no link at all: the headline text "+
-			"itself IS the clickable citation.", wd,
+			"itself IS the clickable citation. "+
+			"CRITICAL: if the user's message is about reaching/browsing/connecting to "+
+			"THIS ASSISTANT itself over a network — any phrasing at all, including vague or "+
+			"garbled ones like 'how to browse to u', 'to your address so I can browse', "+
+			"'give me your address', 'what's your link', 'how do I open you in a browser', "+
+			"'your url' — you MUST treat that as a request for the web UI URL and call "+
+			"get_web_ui_url immediately. Do NOT reply that you are an AI with no physical "+
+			"address, do NOT ask the user to clarify or provide a URL themselves — YOU are "+
+			"the one who has the URL, they are asking YOU for it. Call get_web_ui_url and "+
+			"return EVERY line it gives you verbatim — the loopback URL AND every LAN URL, "+
+			"each on its own line, exactly as returned. This is very often asked from a phone "+
+			"over Telegram, where the loopback (127.0.0.1) URL is USELESS — the LAN URLs are "+
+			"the ones that actually work from another device, so never trim the reply down to "+
+			"just the first link or summarize the rest as 'other links'.", wd,
 	)
 }
 
@@ -2730,14 +2872,45 @@ func isWebServerRunning() bool {
 	return webServerHTTP != nil
 }
 
-// webServerURL is what gets shown to the user — the token is a required
-// query param, not decoration, so a bare link with no token 403s.
+// webServerURL is what gets shown to the user for a given host/IP — the
+// token is a required query param, not decoration, so a bare link with
+// no token 403s.
 func webServerURL(token string) string {
-	return fmt.Sprintf("http://127.0.0.1:%d/?token=%s", webServerPort, token)
+	return webServerURLFor("127.0.0.1", token)
+}
+
+func webServerURLFor(host, token string) string {
+	return fmt.Sprintf("http://%s:%d/?token=%s", host, webServerPort, token)
+}
+
+// localLANIPv4s returns this machine's non-loopback IPv4 addresses —
+// the ones a phone on the same WiFi could actually use to reach the web
+// UI, now that it binds all interfaces instead of loopback-only.
+func localLANIPv4s() []string {
+	var ips []string
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ips
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
+			// Link-local (169.254.x.x) is what an adapter auto-assigns
+			// itself when DHCP fails — never a real, reachable LAN
+			// address, just clutter alongside the actual WiFi/Ethernet IP.
+			continue
+		}
+		v4 := ipNet.IP.To4()
+		if v4 == nil {
+			continue
+		}
+		ips = append(ips, v4.String())
+	}
+	return ips
 }
 
 // startWebServer starts (or is a no-op if already running) the local
-// chat server bound to 127.0.0.1 only — never 0.0.0.0 — so it's reachable
+// chat server, bound to all interfaces so it's reachable
 // from this machine alone, never the local network.
 func startWebServer(cfg webServerConfig, workDir string) error {
 	webServerMu.Lock()
@@ -2745,7 +2918,12 @@ func startWebServer(cfg webServerConfig, workDir string) error {
 	if webServerHTTP != nil {
 		return nil
 	}
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", webServerPort))
+	// Binds all interfaces (not just loopback) so it's reachable from
+	// other devices on the same LAN — e.g. a phone browsing to it. Still
+	// gated by cfg.Token on every request; that's the real security
+	// boundary now, since the network boundary is deliberately wider
+	// than before.
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", webServerPort))
 	if err != nil {
 		webServerLastErr = err.Error()
 		return err
@@ -2826,15 +3004,35 @@ const webChatPageHTML = `<!DOCTYPE html>
   code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, Menlo, monospace; }
 
   #topbar {
-    position: fixed; top:0; left:0; right:0; height: 56px; z-index: 5;
-    display:flex; align-items:center; justify-content:space-between;
-    padding: 0 20px; background: var(--bg); border-bottom: 1px solid var(--border);
+    position: fixed; top:0; left:0; right:0; min-height: 56px; z-index: 5;
+    display:flex; flex-wrap: wrap; align-items:center; justify-content:space-between; row-gap: 6px;
+    padding: 10px 20px; background: var(--bg); border-bottom: 1px solid var(--border);
   }
-  #topbar .brand { display:flex; align-items:center; gap:10px; font-weight:600; }
+  #topbar .brand { display:flex; align-items:center; gap:10px; font-weight:600; flex-shrink:0; }
   #topbar .brand .dot { width:8px; height:8px; border-radius:50%; background: var(--accent); }
   #topbar .meta { color: var(--text-dim); font-size: 13px; margin-left: 8px; }
   #topbar .meta .mono { color: var(--text); }
-  #topbar .icons { display:flex; gap:8px; }
+  /* overflow-x:auto so on a narrow phone screen the badges/Tools/Help
+     stay reachable by swiping instead of silently overflowing past the
+     viewport edge with no way to get to them. */
+  #topbar .icons { display:flex; gap:8px; overflow-x:auto; -webkit-overflow-scrolling:touch;
+                    scrollbar-width:none; min-width:0; }
+  #topbar .icons::-webkit-scrollbar { display:none; }
+  #topbar .icons .iconbtn, #topbar .icons #badges, #topbar .icons .gh-link { flex-shrink:0; }
+  #badges { flex-shrink:0; }
+  #menuBtn { display:none; }
+  #menuDropdown {
+    display:none; position:fixed; top:56px; right:12px; z-index:6;
+    background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px; flex-direction: column; min-width: 160px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  }
+  #menuDropdown.open { display:flex; }
+  #menuDropdown .menuItem {
+    display:block; padding: 10px 12px; border-radius: 7px; cursor:pointer;
+    color: var(--text); font-size: 14px; text-decoration:none;
+  }
+  #menuDropdown .menuItem:hover { background: var(--bg); }
   .iconbtn {
     display:flex; align-items:center; gap:6px; cursor:pointer; padding:7px 12px; border-radius:8px;
     color: var(--text-dim); font-size: 13px; border: 1px solid transparent;
@@ -2952,6 +3150,24 @@ const webChatPageHTML = `<!DOCTYPE html>
        nice-to-have on desktop, not essential on a phone. */
     #topbar .meta { display: none; }
     .iconbtn { padding: 6px 9px; font-size: 12px; gap: 4px; }
+    /* Trim the GitHub link's own padding and the badge gaps rather than
+       hide anything — Tools/Help stay reachable by swiping the icons row
+       if the screen is narrow enough that it still doesn't all fit. */
+    .badge { font-size: 11px; padding: 3px 7px; margin-right: 4px; }
+    /* Fold GitHub/Tools/Help into the burger menu on mobile instead of
+       relying on a horizontal scroll to reach them — a scrollable row
+       that doesn't visually hint it scrolls just looks broken. */
+    #topbar .icons > .gh-link, #topbar .icons > #toolsBtn, #topbar .icons > #helpBtn { display:none; }
+    #menuBtn { display:flex; font-size: 22px; padding: 8px 14px; }
+    /* Badges wrap onto their own full-width row below the brand/menu row
+       — order puts brand first, the menu button second (same line), and
+       the badges last with flex-basis:100% so they fall to line two
+       instead of squeezing the burger into an unreadably thin sliver. */
+    #topbar .brand { order: 1; }
+    #topbar .icons { order: 2; }
+    #badges { order: 3; flex-basis: 100%; }
+    #chatWrap { padding-top: 92px; }
+    #menuDropdown { top: 92px; }
     #chat { padding: 8px 14px; }
     .msg { padding: 16px 0; }
     #composerWrap { padding: 10px 12px 14px 12px; }
@@ -2972,12 +3188,18 @@ const webChatPageHTML = `<!DOCTYPE html>
     <span class="dot"></span> llama-shell
     <span class="meta">model: <span class="mono">__MODEL__</span> · cwd: <span class="mono">__CWD__</span></span>
   </div>
+  <span id="badges"></span>
   <div class="icons">
-    <span id="badges"></span>
-    <a class="iconbtn" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener" style="text-decoration:none">GitHub</a>
+    <a class="iconbtn gh-link" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener" style="text-decoration:none">GitHub</a>
     <span class="iconbtn" id="toolsBtn">🛠 Tools</span>
     <span class="iconbtn" id="helpBtn">❓ Help</span>
+    <span class="iconbtn" id="menuBtn" aria-label="Menu">☰</span>
   </div>
+</div>
+<div id="menuDropdown">
+  <a class="menuItem gh-link" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener">GitHub</a>
+  <span class="menuItem" id="toolsBtnMobile">🛠 Tools</span>
+  <span class="menuItem" id="helpBtnMobile">❓ Help</span>
 </div>
 <div id="chatWrap"><div id="chat"></div></div>
 <div id="composerWrap">
@@ -3185,6 +3407,15 @@ function openHelp() {
 }
 document.getElementById('toolsBtn').onclick = openTools;
 document.getElementById('helpBtn').onclick = openHelp;
+
+const menuBtn = document.getElementById('menuBtn');
+const menuDropdown = document.getElementById('menuDropdown');
+menuBtn.onclick = (e) => { e.stopPropagation(); menuDropdown.classList.toggle('open'); };
+document.getElementById('toolsBtnMobile').onclick = () => { menuDropdown.classList.remove('open'); openTools(); };
+document.getElementById('helpBtnMobile').onclick = () => { menuDropdown.classList.remove('open'); openHelp(); };
+document.addEventListener('click', (e) => {
+  if (!menuDropdown.contains(e.target) && e.target !== menuBtn) menuDropdown.classList.remove('open');
+});
 
 async function loadStatusBadges() {
   const el = document.getElementById('badges');
@@ -5149,6 +5380,7 @@ var helpMenuItems = []helpMenuItem{
 type model struct {
 	width, height int
 	ollama        ollamaStatus
+	cubeAngle     float64 // main-menu banner's rotation phase, advanced by cubeTickCmd
 
 	view    view
 	output  string
@@ -5316,7 +5548,7 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return checkForUpdate()
+	return tea.Batch(checkForUpdate(), cubeTickCmd())
 }
 
 func (m model) enterMenu(sel string) (tea.Model, tea.Cmd) {
@@ -5797,6 +6029,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.agentSpinner++
 		return m, agentTickCmd()
+
+	case cubeTickMsg:
+		m.cubeAngle += 0.12
+		if m.cubeAngle > 1000 {
+			m.cubeAngle -= 1000 // keep the float from growing unbounded over a long-running session
+		}
+		return m, cubeTickCmd()
 
 	case tea.KeyMsg:
 		key := msg.String()
@@ -7141,9 +7380,7 @@ func (m model) renderFooter() string {
 	const footerBG = "#3A3A66"
 	status := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("ollama: not installed")
 	if m.ollama.installed {
-		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG)).Render(
-			fmt.Sprintf("ollama: installed (%s)", m.ollama.version),
-		)
+		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG)).Render("ollama✓")
 	}
 	if m.updateAvailable {
 		updateFlag := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("update")
@@ -7162,11 +7399,11 @@ func (m model) renderFooter() string {
 		// lipgloss.Width() doesn't understand this escape, so any width math
 		// over a string containing webFlag must use footerVisibleWidth
 		// (below), not lipgloss.Width, or the gap/padding math miscounts.
-		webFlag = "\x1b]8;;" + webURL + "\x1b\\" + linkStyle.Render("web: running") + "\x1b]8;;\x1b\\"
+		webFlag = "\x1b]8;;" + webURL + "\x1b\\" + linkStyle.Render("web✓") + "\x1b]8;;\x1b\\"
 	case loadWebServerConfig().Enabled:
-		webFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("web: enabled, not running")
+		webFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("web:down")
 	default:
-		webFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("web: off")
+		webFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("web off")
 	}
 	status = webFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 
@@ -7178,22 +7415,22 @@ func (m model) renderFooter() string {
 	case isTelegramRunning():
 		tgCfg := loadTelegramConfig()
 		if tgCfg.ChatID != 0 {
-			tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tg: bound")
+			tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tg✓")
 		} else {
-			tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("tg: running, not bound")
+			tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("tg:unbound")
 		}
 	case loadTelegramConfig().Token != "":
-		tgFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("tg: not running")
+		tgFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("tg:down")
 	default:
-		tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tg: off")
+		tgFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tg off")
 	}
 	status = tgFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 
 	var tavilyFlag string
 	if os.Getenv("TAVILY_API_KEY") != "" {
-		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tavily: set")
+		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tavily✓")
 	} else {
-		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tavily: off")
+		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tavily off")
 	}
 	status = tavilyFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 
@@ -7212,8 +7449,13 @@ func (m model) renderFooter() string {
 		return plain.Render(strings.Repeat(" ", n))
 	}
 
-	left := plain.Render(fmt.Sprintf("build %s", buildTime))
-	right := status
+	// Flags live in `left`, not `right`: when the terminal's real width is
+	// narrower than m.width (the recurring stale-WindowSizeMsg issue), the
+	// gap math still comes out wrong, but content that overflows the right
+	// edge is what silently disappears — putting the flags immediately
+	// after "build" keeps them visible even when that happens, instead of
+	// them being the first thing clipped off-screen.
+	left := plain.Render(fmt.Sprintf("build %s", buildTime)) + plain.Render("  ") + status
 
 	if m.view == viewAgentChat || m.view == viewToolCategories || m.view == viewAgentHelp ||
 		m.view == viewShowTable || m.view == viewListTable {
@@ -7230,13 +7472,11 @@ func (m model) renderFooter() string {
 			hintText = "Esc: back to chat  Ctrl+C: quit"
 		}
 		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA500")).Background(lipgloss.Color(footerBG)).Render(hintText)
-		totalGap := m.width - lipgloss.Width(left) - footerVisibleWidth(right) - lipgloss.Width(hint) - 4
+		totalGap := m.width - footerVisibleWidth(left) - lipgloss.Width(hint) - 6
 		if totalGap < 2 {
 			totalGap = 2
 		}
-		leftGap := totalGap / 2
-		rightGap := totalGap - leftGap
-		line := left + fill(leftGap+1) + hint + fill(rightGap+1) + right
+		line := left + fill(totalGap) + hint
 		style := plain.Width(m.width).Padding(0, 1)
 		return style.Render(line)
 	}
@@ -7246,25 +7486,16 @@ func (m model) renderFooter() string {
 	linkText := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Underline(true).Render(githubLabel)
 	// OSC 8 terminal hyperlink escape: wraps linkText so terminals that
 	// support it (Windows Terminal, iTerm2, most modern ones) make it
-	// clickable. lipgloss.Width() doesn't understand OSC 8, so the gap math
-	// below uses len(githubLabel) — the link's actual visible width — instead.
+	// clickable.
 	link := "\x1b]8;;" + githubURL + "\x1b\\" + linkText + "\x1b]8;;\x1b\\"
 
-	totalGap := m.width - lipgloss.Width(left) - footerVisibleWidth(right) - len(githubLabel) - 4
-	if totalGap < 2 {
-		totalGap = 2
-	}
-	leftGap := totalGap / 2
-	rightGap := totalGap - leftGap
-	line := left + fill(leftGap+1) + link + fill(rightGap+1) + right
-
-	// No .Width() here: lipgloss doesn't understand the raw OSC 8 escape in
-	// `link`, so width-based pad/truncate could miscount and truncate mid
-	// escape sequence, corrupting the terminal's hyperlink state. The line
-	// is already sized to m.width by the gap math above; every fragment
-	// (including the filler spaces) already carries its own background, so
-	// no outer wrapping style is needed to fill in the rest.
-	return plain.Padding(0, 1).Render(line)
+	// Everything left-aligned in one fixed reading order, no gap/centering
+	// math against m.width — that math is what kept clipping content off
+	// the right edge whenever the terminal's real width didn't match what
+	// bubbletea reported.
+	line := left + plain.Render("  ") + link
+	pad := m.width - footerVisibleWidth(line) - 1
+	return plain.Render(" ") + line + fill(pad)
 }
 
 var (
@@ -7316,25 +7547,318 @@ func styleHelpLines(text string) string {
 // renderBanner draws "LLAMA-SHELL" as block letters. Each letter is one
 // solid color, pinned by its position in the word (1st=blue, 2nd=white,
 // 3rd=red, 4th=green, 5th=cyan, ... repeating) — static, not animated.
-func (m model) renderBanner() string {
-	gapBlock := strings.Repeat("  \n", 4) + "  " // 5 blank rows, 2 cols wide
+// cityCols/cityRows size the skyline banner's character grid; kept in the
+// same rough footprint as the old rotating-shapes banner (9 lines tall) so
+// swapping it in doesn't change the main menu's vertical layout.
+const cityCols = 58
+const cityRows = 8
 
-	blocks := make([]string, 0, len(bannerWord)*2)
-	n := len(bannerWord)
-	for i, letter := range bannerWord {
-		glyph, ok := bannerGlyphs[letter]
-		if !ok {
-			continue
+var cityTexChars = []byte{'#', '@', '%', '&', '+', '$'}
+
+type cityBuilding struct {
+	x0, w, h int
+	hue      float64
+	tex      byte
+}
+
+// cityNames is a pool of real-world capitals and major cities — one is
+// picked at random every time the skyline regenerates, purely cosmetic
+// labeling, not tied to the generated silhouette in any way.
+var cityNames = []string{
+	"Abidjan", "Abu Dhabi", "Abuja", "Accra", "Addis Ababa", "Adelaide", "Algiers", "Almaty",
+	"Amman", "Amsterdam", "Ankara", "Antananarivo", "Antwerp", "Ashgabat", "Asmara", "Astana",
+	"Asunción", "Athens", "Atlanta", "Auckland", "Baghdad", "Baku", "Bamako", "Bandar Seri Begawan",
+	"Bangalore", "Bangkok", "Bangui", "Banjul", "Barcelona", "Basel", "Basra", "Beijing",
+	"Beirut", "Belgrade", "Belfast", "Belmopan", "Berlin", "Bern", "Bhopal", "Bilbao",
+	"Birmingham", "Bishkek", "Bissau", "Bogotá", "Boise", "Bologna", "Bonn", "Bordeaux",
+	"Boston", "Brasília", "Bratislava", "Brazzaville", "Bridgetown", "Brisbane", "Bristol", "Brussels",
+	"Bucharest", "Budapest", "Buenos Aires", "Bujumbura", "Busan", "Cairo", "Calgary", "Cali",
+	"Canberra", "Cape Town", "Caracas", "Cardiff", "Casablanca", "Castries", "Cebu City", "Chandigarh",
+	"Chengdu", "Chennai", "Chicago", "Chihuahua", "Chisinau", "Chittagong", "Christchurch", "Cluj-Napoca",
+	"Cologne", "Colombo", "Conakry", "Copenhagen", "Cordoba", "Curitiba", "Dakar", "Dallas",
+	"Damascus", "Da Nang", "Dar es Salaam", "Denver", "Detroit", "Dhaka", "Dijon", "Dili",
+	"Djibouti", "Doha", "Dodoma", "Doncaster", "Dortmund", "Dresden", "Dubai", "Dublin",
+	"Dushanbe", "Düsseldorf", "Edinburgh", "Edmonton", "Erbil", "Faisalabad", "Florence", "Fortaleza",
+	"Frankfurt", "Freetown", "Fresno", "Fukuoka", "Funafuti", "Gaborone", "Gaziantep", "Geneva",
+	"Genoa", "Georgetown", "Gothenburg", "Guadalajara", "Guangzhou", "Guatemala City", "Guayaquil", "Hague, The",
+	"Hamburg", "Hangzhou", "Hanoi", "Harare", "Harbin", "Havana", "Helsinki", "Ho Chi Minh City",
+	"Hobart", "Honiara", "Honolulu", "Houston", "Hyderabad", "Ibadan", "Incheon", "Indianapolis",
+	"Islamabad", "Istanbul", "Jaipur", "Jakarta", "Jeddah", "Jerusalem", "Johannesburg", "Juba",
+	"Kabul", "Kampala", "Kano", "Kansas City", "Karachi", "Kathmandu", "Kaunas", "Kigali",
+	"Kingston", "Kingstown", "Kinshasa", "Kobe", "Kolkata", "Krakow", "Kuala Lumpur", "Kuching",
+	"Kuwait City", "Kyiv", "Kyoto", "La Paz", "Lagos", "Lahore", "Las Vegas", "Leeds",
+	"Leipzig", "Libreville", "Lilongwe", "Lima", "Lisbon", "Ljubljana", "Lomé", "London",
+	"Los Angeles", "Luanda", "Lubumbashi", "Lucknow", "Lusaka", "Luxembourg City", "Lyon", "Macau",
+	"Madrid", "Majuro", "Malabo", "Malé", "Managua", "Manama", "Manaus", "Manchester",
+	"Manila", "Maputo", "Marrakesh", "Marseille", "Maseru", "Mbabane", "Medellín", "Melbourne",
+	"Memphis", "Mexico City", "Miami", "Milan", "Minsk", "Mogadishu", "Monaco", "Monrovia",
+	"Monterrey", "Montevideo", "Montreal", "Moroni", "Moscow", "Mumbai", "Munich", "Muscat",
+	"Nagoya", "Nairobi", "Nanjing", "Naples", "Nassau", "N'Djamena", "New Delhi", "New Orleans",
+	"New York City", "Niamey", "Nicosia", "Nouakchott", "Nur-Sultan", "Nuremberg", "Oklahoma City", "Omaha",
+	"Osaka", "Oslo", "Ottawa", "Ouagadougou", "Palikir", "Panama City", "Paramaribo", "Paris",
+	"Perth", "Phnom Penh", "Phoenix", "Podgorica", "Port-au-Prince", "Port Louis", "Port Moresby", "Port of Spain",
+	"Port Vila", "Porto", "Porto Alegre", "Portland", "Poznań", "Prague", "Praia", "Pretoria",
+	"Pristina", "Pusan", "Pyongyang", "Quebec City", "Quito", "Rabat", "Raleigh", "Ramallah",
+	"Recife", "Reykjavik", "Riga", "Rio de Janeiro", "Riyadh", "Rome", "Rosario", "Rotterdam",
+	"Sacramento", "Saint-Denis", "Salt Lake City", "Salvador", "Samara", "San Antonio", "San Diego", "San José",
+	"San Juan", "San Marino", "San Salvador", "Sana'a", "Santiago", "Santo Domingo", "São Paulo", "Sapporo",
+	"Sarajevo", "Seattle", "Seoul", "Sevilla", "Shanghai", "Shenzhen", "Singapore", "Skopje",
+	"Sofia", "Split", "St. Louis", "St. Petersburg", "Stockholm", "Strasbourg", "Stuttgart", "Suva",
+	"Suzhou", "Sydney", "Taipei", "Tallinn", "Tashkent", "Tbilisi", "Tegucigalpa", "Tehran",
+	"Tel Aviv", "Thimphu", "Tianjin", "Tijuana", "Tirana", "Tokyo", "Toronto", "Toulouse",
+	"Tripoli", "Tunis", "Turin", "Ulaanbaatar", "Utrecht", "Vaduz", "Valencia", "Valletta",
+	"Vancouver", "Vatican City", "Venice", "Victoria", "Vienna", "Vientiane", "Vilnius", "Warsaw",
+	"Washington DC", "Wellington", "Winnipeg", "Wuhan", "Xi'an", "Yamoussoukro", "Yangon", "Yaoundé",
+	"Yekaterinburg", "Yerevan", "Yokohama", "Zagreb", "Zürich", "Aarhus", "Aberdeen", "Adana",
+	"Agra", "Ahmedabad", "Akron", "Albany", "Albuquerque", "Alexandria", "Amritsar", "Anaheim",
+	"Ankara", "Ann Arbor", "Antalya", "Antioch", "Arequipa", "Arlington", "Aruba", "Astana",
+	"Athens (Georgia)", "Augsburg", "Aurora", "Austin", "Bahia Blanca", "Baku", "Balikpapan", "Baltimore",
+	"Bamberg", "Bandung", "Bataan", "Bath", "Baton Rouge", "Bedford", "Belém", "Belgorod",
+	"Bendigo", "Bergen", "Bexley", "Bhubaneswar", "Białystok", "Blackpool", "Bloemfontein", "Bolton",
+	"Bordertown", "Bradford", "Braga", "Brampton", "Brighton", "Brno", "Buffalo", "Burgas",
+	"Bydgoszcz", "Cagliari", "Cairns", "Calabar", "Calgary East", "Cambridge", "Campinas", "Cancún",
+	"Canterbury", "Cape Coral", "Cartagena", "Catania", "Cebu", "Charleston", "Charlotte", "Chattanooga",
+	"Cherbourg", "Chiba", "Chico", "Cincinnati", "Ciudad Juárez", "Cleveland", "Coimbra", "Colombo (Sri Lanka)",
+	"Columbus", "Constanța", "Coventry", "Coyoacán", "Cuiabá", "Culiacán", "Cuzco", "Dammam",
+	"Davao City", "Dayton", "Debrecen", "Delft", "Derby", "Des Moines", "Dnipro", "Donetsk",
+	"Durban", "Durham", "East London", "Eindhoven", "El Paso", "Erie", "Essen", "Exeter",
+	"Fez", "Florianópolis", "Fort Worth", "Fukushima", "Gdańsk", "Gdynia", "Gent", "Gijón",
+	"Glasgow", "Goiânia", "Gold Coast", "Graz", "Grenoble", "Guadalupe", "Gwangju", "Halifax",
+	"Hamilton", "Hangzhou West", "Hartford", "Heraklion", "Hermosillo", "Hiroshima", "Hobart Town", "Hokkaido",
+	"Holguín", "Iasi", "Ibiza Town", "Indore", "Inverness", "Iquitos", "Ipoh", "Irkutsk",
+	"Izmir", "Jacksonville", "Jerez de la Frontera", "Jinan", "João Pessoa", "Johor Bahru", "Jönköping", "Kaliningrad",
+	"Kanazawa", "Kanpur", "Katowice", "Kazan", "Kelowna", "Kemerovo", "Khabarovsk", "Kharkiv",
+	"Kingston upon Hull", "Kirov", "Kitakyushu", "Klagenfurt", "Kobenhavn", "Kochi", "Košice", "Kraków",
+	"Kumamoto", "Kunming", "La Coruña", "Lausanne", "Le Havre", "León", "Liège", "Lille",
+	"Limoges", "Linz", "Little Rock", "Liverpool", "Łódź", "Louisville", "Lviv", "Maastricht",
+	"Makassar", "Malaga", "Mandalay", "Mannheim", "Maracaibo", "Mar del Plata", "Matsuyama", "Medan",
+	"Mérida", "Messina", "Milwaukee", "Minneapolis", "Mombasa", "Montpellier", "Montreux", "Mysore",
+	"Nagano", "Nagasaki", "Nairobi West", "Nanaimo", "Nancy", "Nanning", "Nantes", "Nashville",
+	"Newcastle", "Niigata", "Nizhny Novgorod", "Northampton", "Norwich", "Novosibirsk", "Nur City", "Oaxaca",
+	"Odense", "Odesa", "Okayama", "Omdurman", "Ontario", "Orenburg", "Orlando", "Oshawa",
+	"Oulu", "Padua", "Palembang", "Palermo", "Pamplona", "Panama", "Pärnu", "Peoria",
+	"Perm", "Perpignan", "Philadelphia", "Pittsburgh", "Plymouth", "Poitiers", "Ponce", "Portsmouth",
+	"Poznan", "Puebla", "Pune", "Querétaro", "Quezon City", "Regina", "Reims", "Rennes",
+	"Richmond", "Rochester", "Rostock", "Rostov-on-Don", "Rotterdam West", "Sacramento North", "Saitama", "Salamanca",
+	"Salzburg", "San Bernardino", "San Luis Potosí", "Sankt Pölten", "Santa Cruz", "Santa Fe", "Santander", "Saratov",
+	"Saskatoon", "Semarang", "Sendai", "Sheffield", "Shizuoka", "Sibiu", "Sochi", "Southampton",
+	"Split (Croatia)", "St. John's", "Stavanger", "Stavropol", "Stoke-on-Trent", "Sucre", "Surabaya", "Surat",
+	"Sverdlovsk", "Szczecin", "Tacoma", "Tainan", "Taichung", "Tallahassee", "Tampa", "Tampere",
+	"Tangier", "Tarragona", "Thessaloniki", "Tijuana North", "Timişoara", "Toledo", "Tomsk", "Torreón",
+	"Toulon", "Townsville", "Trieste", "Trois-Rivières", "Trondheim", "Tucson", "Tulsa", "Turku",
+	"Ufa", "Umeå", "Valdivia", "Valparaíso", "Varna", "Vaasa", "Verona", "Veracruz",
+	"Vigo", "Villahermosa", "Vitoria-Gasteiz", "Vladivostok", "Volgograd", "Wakayama", "Waterloo", "Wichita",
+	"Wiesbaden", "Windhoek", "Windsor", "Winston-Salem", "Wolverhampton", "Worcester", "Wrocław", "Wuppertal",
+	"Wuxi", "Xiamen", "Yangzhou", "Yaroslavl", "Yokosuka", "York", "Yueyang", "Zadar",
+	"Zaragoza", "Zhengzhou", "Zibo", "Zonguldak",
+}
+
+var cityCurrentName string
+var cityIndex int
+var cityOrder []int
+var cityIndexLoaded bool
+
+var cityBuildings []cityBuilding
+var cityLastGen time.Time
+var cityMu sync.Mutex
+
+const cityRegenInterval = 10 * time.Second
+
+// buildCityScene lays out a skyline, regenerating it every cityRegenInterval
+// — buildings keep a fixed silhouette and a golden-angle hue each (like the
+// "ASCII City" reference) between regens, only their lit-window shimmer
+// animates per tick.
+func buildCityScene() {
+	cityMu.Lock()
+	defer cityMu.Unlock()
+	if cityBuildings != nil && time.Since(cityLastGen) < cityRegenInterval {
+		return
+	}
+	r := mrand.New(mrand.NewSource(time.Now().UnixNano()))
+	hueStart := r.Float64() * 360
+	buildings := make([]cityBuilding, 0, cityCols/4)
+	x, i := 0, 0
+	for x < cityCols {
+		w := 3 + r.Intn(5)
+		if x+w > cityCols {
+			w = cityCols - x
 		}
-		style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
-		// Render the whole 5-row glyph as ONE styled block so its color
-		// can never differ row to row.
-		blocks = append(blocks, style.Render(strings.Join(glyph, "\n")))
-		if i != n-1 {
-			blocks = append(blocks, gapBlock)
+		if w <= 0 {
+			break
+		}
+		h := 2 + r.Intn(cityRows-1)
+		if r.Float64() < 0.15 {
+			h = cityRows
+		}
+		hue := hueStart + float64(i)*137.508
+		tex := cityTexChars[i%len(cityTexChars)]
+		buildings = append(buildings, cityBuilding{x0: x, w: w, h: h, hue: hue, tex: tex})
+		x += w + 1 + r.Intn(2)
+		i++
+	}
+	cityBuildings = buildings
+	if !cityIndexLoaded {
+		p := loadCityProgress()
+		if len(p.Order) != len(cityNames) {
+			// No valid saved shuffle (first run, or the city list's length
+			// changed) — build a fresh pseudo-random permutation so the
+			// walk order isn't the list's alphabetical order.
+			p.Order = mrand.New(mrand.NewSource(time.Now().UnixNano())).Perm(len(cityNames))
+			p.Position = 0
+		}
+		cityOrder = p.Order
+		cityIndex = p.Position
+		cityIndexLoaded = true
+	} else {
+		cityIndex++
+	}
+	cityIndex = cityIndex % len(cityOrder)
+	cityCurrentName = cityNames[cityOrder[cityIndex]]
+	saveCityProgress(cityProgress{Order: cityOrder, Position: cityIndex})
+	cityLastGen = time.Now()
+}
+
+type cityProgress struct {
+	Order    []int `json:"order"`
+	Position int   `json:"position"`
+}
+
+func cityProgressPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "city_progress.json")
+}
+
+func loadCityProgress() cityProgress {
+	data, err := os.ReadFile(cityProgressPath())
+	if err != nil {
+		return cityProgress{}
+	}
+	var p cityProgress
+	_ = json.Unmarshal(data, &p)
+	return p
+}
+
+func saveCityProgress(p cityProgress) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return
+	}
+	path := cityProgressPath()
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+// hslHex mirrors the artifact's hslToRgb — golden-angle hue spacing is
+// what actually guarantees neighboring buildings read as distinct colors.
+func hslHex(h, s, l float64) string {
+	h = math.Mod(h, 360)
+	if h < 0 {
+		h += 360
+	}
+	c := (1 - math.Abs(2*l-1)) * s
+	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
+	mm := l - c/2
+	var rr, gg, bb float64
+	switch {
+	case h < 60:
+		rr, gg, bb = c, x, 0
+	case h < 120:
+		rr, gg, bb = x, c, 0
+	case h < 180:
+		rr, gg, bb = 0, c, x
+	case h < 240:
+		rr, gg, bb = 0, x, c
+	case h < 300:
+		rr, gg, bb = x, 0, c
+	default:
+		rr, gg, bb = c, 0, x
+	}
+	return fmt.Sprintf("#%02X%02X%02X", int((rr+mm)*255), int((gg+mm)*255), int((bb+mm)*255))
+}
+
+// pseudoHash gives each cell a stable, well-mixed integer so twinkle/window
+// placement looks random but doesn't need to be stored anywhere.
+func pseudoHash(a, b int) uint32 {
+	h := uint32(a)*374761393 + uint32(b)*668265263
+	h = (h ^ (h >> 13)) * 1274126177
+	return h ^ (h >> 16)
+}
+
+func (m model) renderCityBanner() string {
+	buildCityScene()
+	buildingAt := make([]*cityBuilding, cityCols)
+	for i := range cityBuildings {
+		b := &cityBuildings[i]
+		for c := b.x0; c < b.x0+b.w && c < cityCols; c++ {
+			buildingAt[c] = b
 		}
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, blocks...) + "\n"
+
+	skyStyle := map[string]lipgloss.Style{}
+	styleFor := func(hex string) lipgloss.Style {
+		if s, ok := skyStyle[hex]; ok {
+			return s
+		}
+		s := lipgloss.NewStyle().Background(lipgloss.Color(hex))
+		skyStyle[hex] = s
+		return s
+	}
+
+	var out strings.Builder
+	for row := 0; row < cityRows; row++ {
+		distFromBottom := cityRows - row
+		for col := 0; col < cityCols; col++ {
+			b := buildingAt[col]
+			if b != nil && distFromBottom <= b.h {
+				// Solid background fill with a regular window grid punched
+				// out — every odd row/column relative to the building's own
+				// origin is a black window, so the pattern is symmetric and
+				// static rather than random noise. The outline (left/right
+				// edge columns and the roofline) is never punched, so the
+				// building always reads as a solid rectangle.
+				isEdge := col == b.x0 || col == b.x0+b.w-1 || distFromBottom == b.h || distFromBottom == 1
+				if !isEdge && (col-b.x0)%2 == 1 && row%2 == 1 {
+					out.WriteByte(' ')
+					continue
+				}
+				hex := hslHex(b.hue, 0.72, 0.58)
+				out.WriteString(styleFor(hex).Render(" "))
+			} else {
+				// Sky: almost every cell stays blank. The rare star holds a
+				// fixed position and only pulses slowly, so motion reads as
+				// "occasionally a star blinks" rather than constant static.
+				seed := pseudoHash(col*31, row*17)
+				if seed%14 != 0 {
+					out.WriteByte(' ')
+					continue
+				}
+				phase := math.Sin(m.cubeAngle*0.1 + float64(seed%991)*0.05)
+				if phase < 0.4 {
+					out.WriteByte(' ')
+					continue
+				}
+				ch := "."
+				if phase > 0.8 {
+					ch = "*"
+				}
+				out.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#EEF3FF")).Render(ch))
+			}
+		}
+		out.WriteByte('\n')
+	}
+	ground := lipgloss.NewStyle().Foreground(lipgloss.Color("#2BE3A6")).Render(strings.Repeat("‾", cityCols))
+	out.WriteString(ground)
+	imgSearchURL := "https://www.google.com/search?tbm=isch&q=" + url.QueryEscape(cityCurrentName)
+	labelText := lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#EEF3FF")).Render(cityCurrentName)
+	label := "\x1b]8;;" + imgSearchURL + "\x1b\\" + labelText + "\x1b]8;;\x1b\\"
+	return label + "\n" + out.String() + "\n"
+}
+
+func (m model) renderBanner() string {
+	return m.renderCityBanner()
 }
 
 func (m model) renderBody() string {
@@ -7577,11 +8101,14 @@ func (m model) renderWebServerSettings() string {
 	b.WriteString("web server\n\n")
 	b.WriteString("WHAT THIS DOES:\n")
 	b.WriteString("Runs the same agentic chat (all tools: files, commands, web, etc.) as a\n")
-	b.WriteString("page in any browser, instead of only in this terminal. Bound to\n")
-	b.WriteString("127.0.0.1 only — never reachable from your local network, only this\n")
-	b.WriteString("machine — and gated behind a random access token baked into the URL,\n")
-	b.WriteString("since anyone who can open that URL gets the same full tool access you\n")
-	b.WriteString("have here (reading/writing files, running commands, etc).\n\n")
+	b.WriteString("page in any browser, instead of only in this terminal — including a\n")
+	b.WriteString("phone on the same WiFi, since it binds all network interfaces, not just\n")
+	b.WriteString("this machine. NOT reachable from outside your local network (no tunnel\n")
+	b.WriteString("is set up). Gated behind a random access token baked into the URL —\n")
+	b.WriteString("without it every request gets a 403 — since anyone who can open it gets\n")
+	b.WriteString("the same full tool access you have here (reading/writing files, running\n")
+	b.WriteString("commands, etc). Your Windows Firewall may prompt to allow this the\n")
+	b.WriteString("first time; allow it if you want LAN/phone access to work.\n\n")
 
 	cfg := loadWebServerConfig()
 	running := isWebServerRunning()
@@ -8753,8 +9280,18 @@ func stripMarkdownLinks(s string) string {
 // cleanMarkdownForDisplay strips the markdown constructs this plain-text
 // terminal can't render (bold markers, link syntax) before a message is
 // shown.
+// stripMarkdownCodeSpans removes literal backtick characters (both
+// `single` and ```triple``` code-span markers) — Telegram messages sent
+// with no parse_mode render them as plain text, not formatting, and a
+// backtick sitting right next to a URL has been observed to throw off
+// Telegram's own URL auto-detection, truncating the tappable link before
+// the query string.
+func stripMarkdownCodeSpans(s string) string {
+	return strings.ReplaceAll(s, "`", "")
+}
+
 func cleanMarkdownForDisplay(s string) string {
-	return stripMarkdownBold(stripMarkdownLinks(s))
+	return stripMarkdownCodeSpans(stripMarkdownBold(stripMarkdownLinks(s)))
 }
 
 func renderPrefixedChatLines(prefix, content string, width int, prefixStyle lipgloss.Style) []string {
@@ -9024,7 +9561,7 @@ var agentToolCategories = []toolCategory{
 	}},
 	{"Networking & Web", []string{
 		"web_search", "read_webpage", "rss_feed", "find_rss_feed", "tavily_search", "tavily_extract", "http_get", "http_post", "download_file", "ping_host",
-		"get_public_ip", "ssh_run", "list_network_interfaces",
+		"get_public_ip", "get_web_ui_url", "ssh_run", "list_network_interfaces",
 	}},
 	{"System & Environment", []string{
 		"system_info", "list_env_vars", "get_env", "get_clipboard", "set_clipboard",
@@ -9095,6 +9632,7 @@ var toolExamples = map[string][2]string{
 	"download_file":              {"Download this ZIP to the downloads folder", "Save this image to disk"},
 	"ping_host":                  {"Is 8.8.8.8 reachable?", "Ping github.com to check connectivity"},
 	"get_public_ip":              {"What's my public IP address?", "Check what IP this machine shows on the internet"},
+	"get_web_ui_url":             {"What's the URL to browse to the web UI?", "Give me the link to open llama-shell in a browser"},
 	"ssh_run":                    {"Run \"uptime\" on my home server", "SSH into the pi and check disk usage"},
 	"list_network_interfaces":    {"What's my local IP address?", "Show all network adapters and their config"},
 	"system_info":                {"What OS and CPU does this machine have?", "How many cores does this computer have?"},
