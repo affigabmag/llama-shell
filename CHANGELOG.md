@@ -3,6 +3,24 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## HOTFIX: revert forced num_ctx — it broke model loading (2026-08-27)
+
+- v0.8.4/v0.8.5 forced `num_ctx` to 8192 then 16384 to fix requests being
+  truncated at Ollama's 4096-token default. On a RAM-constrained deployment
+  this made things strictly worse: Ollama has its own auto-fit logic that
+  normally *shrinks* context automatically to fit available memory, but an
+  explicit `num_ctx` override disables that — it can't shrink, so the model
+  fails to load entirely instead of degrading gracefully. Confirmed on the
+  live CT 102 deployment via llama-server's own log: `context size set by
+  user to 16384 -> no change` / `failed to fit params to free device
+  memory, abort`. Every chat message then hung until the 180s client
+  timeout and errored.
+- Reverted — `num_ctx` is no longer set in the request, restoring Ollama's
+  own memory-aware auto-sizing. The original truncation bug (a large
+  request getting silently cut) is still open; fixing it now has to come
+  from shrinking the request itself (tool schema size), not from raising
+  context on a box that can't afford it.
+
 ## Manual update now auto-relaunches (2026-08-27)
 
 - `[u] download and install` on the update screen used to leave you on a

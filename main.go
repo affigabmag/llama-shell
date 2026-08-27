@@ -629,26 +629,24 @@ type ollamaTool struct {
 }
 
 type ollamaChatRequest struct {
-	Model    string                 `json:"model"`
-	Messages []ollamaChatMsg        `json:"messages"`
-	Tools    []ollamaTool           `json:"tools,omitempty"`
-	Stream   bool                   `json:"stream"`
-	Options  map[string]interface{} `json:"options,omitempty"`
+	Model    string          `json:"model"`
+	Messages []ollamaChatMsg `json:"messages"`
+	Tools    []ollamaTool    `json:"tools,omitempty"`
+	Stream   bool            `json:"stream"`
 }
 
-// agentContextTokens overrides Ollama's default context window (4096 for
-// most models unless OLLAMA_CONTEXT_LENGTH is set server-side), which was
-// silently truncating requests: system prompt + all tool schemas + chat
-// history routinely exceeds 4096 tokens once more than a couple of tools
-// exist, and llama.cpp's truncation strategy keeps only a handful of tokens
-// from the start of the prompt — gutting the system prompt's tool-use
-// instructions before the model ever sees them (confirmed via ollama's own
-// "truncating input prompt" log: a real request measured at 6985 tokens got
-// cut to 2051). Every model registered here reports a real context length
-// far larger than this (gemma4:e2b: 131072), so this is well within what
-// the model itself supports — the constraint is available RAM for the
-// larger KV cache, not the model's own limit.
-const agentContextTokens = 16384
+// A forced num_ctx override was tried here (8192, then 16384) to fix
+// requests being truncated at Ollama's 4096-token default. Reverted: on a
+// RAM-constrained deployment (CT 102, ~4GB total), forcing num_ctx disables
+// Ollama's own auto-fit logic, which normally SHRINKS context automatically
+// to fit available memory — with an explicit override it can't shrink, so
+// the model fails to load entirely instead of degrading gracefully
+// (confirmed via llama-server's own log: "context size set by user to
+// 16384 -> no change" / "failed to fit params to free device memory,
+// abort"). That's strictly worse than the original truncation bug, which at
+// least produced a reply. Left unset so Ollama's own memory-aware sizing
+// applies; fixing the truncation now has to come from shrinking the
+// request itself (tool schema size), not from raising context.
 
 type ollamaChatResponse struct {
 	Message ollamaChatMsg `json:"message"`
@@ -2583,8 +2581,7 @@ func checkAndRewarmModel(modelName string) tea.Cmd {
 // non-nil) as it arrives, and the fully assembled message is returned once
 // the stream ends.
 func ollamaChatStream(modelName string, messages []ollamaChatMsg, tools []ollamaTool, deltaCh chan<- string) (ollamaChatMsg, error) {
-	reqBody := ollamaChatRequest{Model: modelName, Messages: messages, Tools: tools, Stream: true,
-		Options: map[string]interface{}{"num_ctx": agentContextTokens}}
+	reqBody := ollamaChatRequest{Model: modelName, Messages: messages, Tools: tools, Stream: true}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
 		return ollamaChatMsg{}, err
