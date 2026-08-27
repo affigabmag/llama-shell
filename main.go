@@ -9144,7 +9144,11 @@ func (m model) renderFooter() string {
 	// edge is what silently disappears — putting the flags immediately
 	// after "build" keeps them visible even when that happens, instead of
 	// them being the first thing clipped off-screen.
-	left := plain.Render(fmt.Sprintf("build %s", buildTime)) + plain.Render("  ") + status
+	buildLabel := fmt.Sprintf("build %s", buildTime)
+	if appVersion != "" && appVersion != "dev" {
+		buildLabel += " " + appVersion
+	}
+	left := plain.Render(buildLabel) + plain.Render("  ") + status
 
 	if m.view == viewAgentChat || m.view == viewToolCategories || m.view == viewAgentHelp ||
 		m.view == viewShowTable || m.view == viewListTable {

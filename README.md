@@ -21,7 +21,7 @@ gets you from a blank machine to a working chat with zero manual setup.
 go build -ldflags "-X main.buildTime=$(date +%Y%m%d-%H%M%S) -X main.appVersion=v0.5.0" -o llama-shell.exe .
 ```
 
-The footer shows the build timestamp (there's no user-facing semantic version display — it's a live build tag, not manually bumped). `appVersion` is separate and only used internally to check for updates — set it to match the git tag you're cutting the release from. Omitting it leaves the update checker permanently unable to tell if a newer release exists (it falls back to `"dev"`, which the checker always treats as "nothing to compare").
+The footer shows the build timestamp, plus `appVersion` next to it if it was set at build time (e.g. `build 20260827-105727 v0.5.0`) — omit the `-X main.appVersion=...` ldflag (as a plain `go build .` does) and only the timestamp shows, falling back to `"dev"` internally. `appVersion` also drives the self-update checker — set it to match the git tag you're cutting the release from, or the checker can never tell if a newer release exists.
 
 ## Running
 

@@ -3,6 +3,15 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Footer shows appVersion — eleventh session (2026-08-27)
+
+- Footer now shows `appVersion` next to the build timestamp when the
+  binary was built with `-X main.appVersion=...` (e.g.
+  `build 20260827-105727 v0.5.0`) — previously only the build timestamp
+  ever showed, which caused real confusion distinguishing the running
+  llama-shell version from Ollama's own server version already shown in
+  the same footer (`ollama v0.32.15`).
+
 ## Autopilot, email, RTL fixes, encrypted backup, city banner — tenth session (2026-08-27)
 
 - **New: autopilot** (`[a]` in the main menu, `--autopilot` CLI flag) — checks
