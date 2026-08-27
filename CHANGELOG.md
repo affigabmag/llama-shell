@@ -3,6 +3,29 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Context-window truncation was gutting tool instructions (2026-08-27)
+
+- Found the real cause of the model refusing to use tools it had: Ollama
+  defaults to a 4096-token context window unless told otherwise, but a real
+  request (system prompt + all tool schemas + chat history) measured 6985
+  tokens — well over budget. llama.cpp's truncation strategy keeps only a
+  handful of tokens from the *start* of the prompt, which is exactly where
+  the system prompt's tool-use instructions live — so the model never
+  actually saw them, and fell back to its trained "I don't have internet
+  access" refusal. Confirmed via Ollama's own `truncating input prompt` log
+  line on the live deployment.
+- Every request now explicitly sets `num_ctx: 8192` instead of relying on
+  Ollama's silent default — verified against the model's real architecture
+  (gemma4:e2b uses grouped-query attention with a single KV head plus mostly
+  sliding-window layers) that this only costs roughly 50MB of extra RAM for
+  the larger KV cache, not gigabytes.
+- Trimmed `get_stock_quote`'s tool description (~970 characters off — it
+  hardcoded a long worldwide index/ticker table) to shrink the baseline
+  request size further.
+- Tool mode now defaults to "on" instead of "auto" when entering agentic
+  chat, so tools are always offered from the first message unless
+  explicitly turned off.
+
 ## Warmup timer resync, city banner row-0 overflow, update re-check on open (2026-08-27)
 
 - Fixed the "loading model into memory... (0s)" line freezing: `agentTickMsg`

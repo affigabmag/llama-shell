@@ -629,11 +629,26 @@ type ollamaTool struct {
 }
 
 type ollamaChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []ollamaChatMsg `json:"messages"`
-	Tools    []ollamaTool    `json:"tools,omitempty"`
-	Stream   bool            `json:"stream"`
+	Model    string                 `json:"model"`
+	Messages []ollamaChatMsg        `json:"messages"`
+	Tools    []ollamaTool           `json:"tools,omitempty"`
+	Stream   bool                   `json:"stream"`
+	Options  map[string]interface{} `json:"options,omitempty"`
 }
+
+// agentContextTokens overrides Ollama's default context window (4096 for
+// most models unless OLLAMA_CONTEXT_LENGTH is set server-side), which was
+// silently truncating requests: system prompt + all tool schemas + chat
+// history routinely exceeds 4096 tokens once more than a couple of tools
+// exist, and llama.cpp's truncation strategy keeps only a handful of tokens
+// from the start of the prompt — gutting the system prompt's tool-use
+// instructions before the model ever sees them (confirmed via ollama's own
+// "truncating input prompt" log: a real request measured at 6985 tokens got
+// cut to 2051). Every model registered here reports a real context length
+// far larger than this (gemma4:e2b: 131072), so this is well within what
+// the model itself supports — the constraint is available RAM for the
+// larger KV cache, not the model's own limit.
+const agentContextTokens = 8192
 
 type ollamaChatResponse struct {
 	Message ollamaChatMsg `json:"message"`
@@ -912,7 +927,7 @@ func agentTools() []ollamaTool {
 		}},
 		{Type: "function", Function: ollamaToolFunction{
 			Name:        "get_stock_quote",
-			Description: "Get the actual current/live price for a stock ticker or ANY country's market index, straight from a JSON API — no scraping, no cookie-consent walls, always has the real number. Use this INSTEAD OF web_search/read_webpage for any stock price or index-value question, worldwide, not just well-known indices. Symbols: NASDAQ-100 -> ^NDX, NASDAQ Composite -> ^IXIC, S&P 500 -> ^GSPC, Dow Jones -> ^DJI, Russell 2000 -> ^RUT, VIX -> ^VIX, TA-35 -> TA35.TA, TA-125 -> TA125.TA, FTSE 100 -> ^FTSE, DAX -> ^GDAXI, CAC 40 -> ^FCHI, IBEX 35 -> ^IBEX, FTSE MIB -> FTSEMIB.MI, Euro Stoxx 50 -> ^STOXX50E, AEX -> ^AEX, SMI -> ^SSMI, OMX Stockholm -> ^OMX, Nikkei 225 -> ^N225, Hang Seng -> ^HSI, Shanghai Composite -> 000001.SS, Shenzhen Component -> 399001.SZ, KOSPI -> ^KS11, KOSDAQ -> ^KQ11, TAIEX -> ^TWII, Nifty 50 -> ^NSEI, Sensex -> ^BSESN, Straits Times -> ^STI, ASX 200 -> ^AXJO, NZX 50 -> ^NZ50, TSX -> ^GSPTSE, Bovespa -> ^BVSP, IPC (Mexico) -> ^MXX, MERVAL -> ^MERV, MOEX -> IMOEX.ME, JSE Top 40 -> ^J200, EGX 30 -> ^CASE30, a company -> its ticker (e.g. AAPL, MSFT, TSLA). The user's wording may be garbled by autocorrect — resolve it to the real symbol yourself, never pass their literal typo through. If a country/index isn't listed here or this returns no data, fall back to web_search to find the right Yahoo Finance symbol.",
+			Description: "Get the actual current/live price for a stock ticker or a market index, straight from a JSON API — no scraping, no cookie-consent walls. Use this INSTEAD OF web_search/read_webpage for any stock/index price question. Common symbols: NASDAQ-100 -> ^NDX, S&P 500 -> ^GSPC, Dow Jones -> ^DJI, VIX -> ^VIX, TA-35 -> TA35.TA, FTSE 100 -> ^FTSE, DAX -> ^GDAXI, Nikkei 225 -> ^N225, Hang Seng -> ^HSI, a company -> its ticker (e.g. AAPL, MSFT, TSLA). Resolve autocorrect-garbled wording to the real symbol yourself. If unlisted here or no data comes back, fall back to web_search for the right Yahoo Finance symbol.",
 			Parameters: map[string]interface{}{
 				"type":       "object",
 				"properties": map[string]interface{}{"symbol": strProp("Ticker or index symbol, e.g. ^NDX, ^GSPC, ^DJI, AAPL, TSLA.")},
@@ -2568,7 +2583,8 @@ func checkAndRewarmModel(modelName string) tea.Cmd {
 // non-nil) as it arrives, and the fully assembled message is returned once
 // the stream ends.
 func ollamaChatStream(modelName string, messages []ollamaChatMsg, tools []ollamaTool, deltaCh chan<- string) (ollamaChatMsg, error) {
-	reqBody := ollamaChatRequest{Model: modelName, Messages: messages, Tools: tools, Stream: true}
+	reqBody := ollamaChatRequest{Model: modelName, Messages: messages, Tools: tools, Stream: true,
+		Options: map[string]interface{}{"num_ctx": agentContextTokens}}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
 		return ollamaChatMsg{}, err
@@ -6628,7 +6644,7 @@ type model struct {
 	agentWorkDir        string
 	agentCapabilities   string
 	agentToolsSupported bool
-	agentToolMode       string // "auto" (default), "on", "off"
+	agentToolMode       string // "on" (default), "off", "auto"
 	agentWarmup         string // "pending", "ready", or "error: ..."
 	agentMessages       []ollamaChatMsg
 	agentInput          string
@@ -6886,7 +6902,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.agentToolsSupported = m.agentCapabilities == "" || m.agentCapabilities == "-" ||
 				strings.Contains(m.agentCapabilities, "too")
-			m.agentToolMode = "auto"
+			m.agentToolMode = "on"
 			m.agentWarmup = "pending"
 			m.agentMessages = []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(wd)}}
 			m.agentInput = ""
@@ -7392,7 +7408,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						// runAgentTurn if the model rejects the tools list.
 						m.agentToolsSupported = m.agentCapabilities == "" || m.agentCapabilities == "-" ||
 							strings.Contains(m.agentCapabilities, "too")
-						m.agentToolMode = "auto"
+						m.agentToolMode = "on"
 						m.agentWarmup = "pending"
 						m.agentMessages = []ollamaChatMsg{
 							{Role: "system", Content: agentSystemPrompt(wd)},
@@ -9251,7 +9267,7 @@ func (m model) renderFooter() string {
 		if m.view == viewAgentChat {
 			mode := m.agentToolMode
 			if mode == "" {
-				mode = "auto"
+				mode = "on"
 			}
 			hintText = "tool mode: " + mode + "  Alt+H: help"
 		} else if m.view == viewToolCategories {
