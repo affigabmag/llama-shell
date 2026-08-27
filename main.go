@@ -7286,6 +7286,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.agentSpinner++
+		if m.agentWarmup == "pending" {
+			// The warmup status line (spinner + elapsed seconds) lives in
+			// the cached viewport content built by syncAgentViewport, unlike
+			// the "thinking" busy indicator below which renders fresh every
+			// frame directly in renderAgentChat — without this the elapsed
+			// time and spinner would visibly freeze at whatever they were
+			// when the chat was entered until some unrelated event (warmup
+			// finishing, a keypress) happened to force a resync.
+			m.syncAgentViewport()
+		}
 		return m, agentTickCmd()
 
 	case agentKeepWarmTickMsg:
@@ -7838,6 +7848,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if it.dest == viewEmailSettings {
 						m.emailEditing = loadEmailConfig().FromAddress == ""
 					}
+					if it.dest == viewUpdateText {
+						// The startup check (Init()) can run before a
+						// just-published GitHub release has propagated, or
+						// simply go stale the longer the app stays open —
+						// re-check every time this screen is opened instead
+						// of only showing whatever Init() saw once.
+						m.updateChecked = false
+						m.updateCheckErr = ""
+						appendLog("opened %s", it.label)
+						return m, checkForUpdate()
+					}
 				}
 				appendLog("opened %s", it.label)
 			default:
@@ -7850,6 +7871,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.helpScroll = 0
 							if it.dest == viewEmailSettings {
 								m.emailEditing = loadEmailConfig().FromAddress == ""
+							}
+							if it.dest == viewUpdateText {
+								m.updateChecked = false
+								m.updateCheckErr = ""
+								appendLog("opened %s", it.label)
+								return m, checkForUpdate()
 							}
 						}
 						appendLog("opened %s", it.label)
@@ -9748,14 +9775,13 @@ func (m model) renderCityBanner() string {
 		// alone is still worth showing rather than nothing at all.
 		return label + "\n"
 	}
-	// The label shares row 0 with the scene's own first row (prefixed,
-	// not overlaid — splicing text into the middle of a row that's
-	// already full of per-cell ANSI color codes would misalign the
-	// visible columns) instead of taking a whole extra line for itself,
-	// saving a full row of height on a short terminal.
-	lines := strings.SplitN(scene, "\n", 2)
-	lines[0] = label + "  " + lines[0]
-	return strings.Join(lines, "\n") + "\n"
+	// The label gets its own line above the scene. It was previously
+	// spliced into row 0 to save a line on short terminals, but that made
+	// row 0 wider than every other row (label text plus all cityCols
+	// cells, vs. exactly cityCols cells for the rest) — the box has a
+	// fixed column width matching the other rows, so the widened row 0
+	// overflowed/misaligned against the border instead.
+	return label + "\n" + scene + "\n"
 }
 
 // bannerMaxSceneRows caps the city/countryside scene's row count to what
@@ -9767,10 +9793,8 @@ func (m model) renderCityBanner() string {
 // hiding the city/country name label rather than the scene's grass/river
 // rows, which is backwards from what actually matters here.
 func (m model) bannerMaxSceneRows() int {
-	// No separate reserve for the label line — it now shares row 0 with
-	// the scene's own first row instead of taking a whole line of its
-	// own (see renderCityBanner).
 	reserved := 2 /* header */ + 1 /* footer */ + 2 /* box padding */ +
+		1 /* label line */ +
 		2 /* "Welcome to llama-shell" + blank line before it */ +
 		len(menuItems) + 2 /* blank + hint line */
 	avail := m.height - reserved

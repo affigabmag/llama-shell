@@ -3,6 +3,23 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Warmup timer resync, city banner row-0 overflow, update re-check on open (2026-08-27)
+
+- Fixed the "loading model into memory... (0s)" line freezing: `agentTickMsg`
+  bumped the spinner counter but never rebuilt the cached viewport content
+  that the elapsed-seconds text actually lives in, unlike the busy/"thinking"
+  indicator which renders fresh every frame — it now resyncs the viewport on
+  every tick while warmup is pending.
+- Fixed the main-menu city banner's top row rendering distorted/misaligned:
+  the city/country label was spliced into row 0 of the skyline grid, making
+  that one row wider than the fixed box width every other row uses. The
+  label now gets its own line above the scene again.
+- The update screen (`[h] help/settings -> [u] update`) now re-checks GitHub
+  every time it's opened instead of only showing whatever the one-time
+  startup check saw — a release published after launch, or a stale "up to
+  date" left over from a previous manual install, now reflects correctly
+  without needing to restart the app.
+
 ## Date/time refusal nudge — fourteenth session (2026-08-27)
 
 - Extended the live-data nudge to cover "what day is it today"-style
