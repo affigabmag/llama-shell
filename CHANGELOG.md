@@ -3,6 +3,61 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Autopilot, email, RTL fixes, encrypted backup, city banner — tenth session (2026-08-27)
+
+- **New: autopilot** (`[a]` in the main menu, `--autopilot` CLI flag) — checks
+  Ollama is installed (opens the installer page and asks for a relaunch if
+  not — no silent installer exists for Windows/macOS), pulls `gemma4:e2b` if
+  missing, enables + starts the web server, then drops straight into the
+  TUI's own agentic chat with that model. `Esc` returns to the main menu
+  instead of the normal model-selection screen.
+- **New: email** (`[e]` from the help menu) — `send_email` agent tool
+  (only `to`/`subject` required) via Gmail SMTP + an App Password. Saving
+  sends a real test email to confirm it works; masked `● configured`
+  summary with `[r]` to reconfigure once set up (same pattern later applied
+  to the Tavily and Telegram settings screens too).
+- **New: backup / restore** (`[x]` from the help menu, `--export-backup`
+  / `--import-backup` CLI flags) — exports every setting (email, telegram,
+  tavily, web server, auto-update, disclaimer acceptance) into one
+  AES-256-GCM-encrypted `.lsb` file, or restores from one. No password
+  prompt (fixed embedded passphrase — protects against casual viewing/
+  editing, not a determined attacker with the source). Navigated via an
+  in-terminal directory browser, not an OS GUI dialog — first tried a
+  PowerShell/osascript/zenity-binary shim per platform, then the
+  `ncruces/zenity` Go library, before landing on a pure in-terminal
+  browser per explicit request ("purly cli").
+- **New: web server port setting** (`[p]` on the web server screen) —
+  defaults to `8787` (unchanged), configurable 1-65535, applies immediately
+  if the server's already running.
+- Animated banner replaced: the old rotating-wireframe-shapes banner is now
+  a generative city skyline (1400+ real city/town names, unique per-building
+  colors, day/night by the city's actual local time) or a countryside scene
+  (sky/sun-or-moon/tree line/river/grass) for smaller towns, regenerating
+  every 15s; the city name links to a Google Images search.
+- RTL (Hebrew/Arabic) fixes in the agentic chat: live input line reorders
+  while typing, digits embedded in RTL text no longer get character-reversed
+  (`150` → `051` bug), and RTL-majority reply paragraphs right-align.
+- Cross-platform "prevent sleep while running" (Windows
+  `SetThreadExecutionState`, macOS `caffeinate -w`, Linux `systemd-inhibit`)
+  so the web server/Telegram bot don't silently go offline mid-session.
+- CLI flags added: `--help`/`-h`, `--tools`/`--tools-extended`, `--log [N]`,
+  `--minimized`, on top of the backup/autopilot ones above — all documented
+  in the new "Command-line flags" README section.
+- `get_stock_quote` agent tool (Yahoo Finance JSON chart API) with a large
+  index/symbol table (KOSPI, Nikkei, Hang Seng, FTSE, DAX, etc.) plus a
+  per-turn "live-data nudge" system message to override small models'
+  trained-in "I don't have real-time access" refusal.
+- Telegram bot restructured into a concurrent fetcher + processing loop: a
+  message sent mid-turn now gets an immediate "still working on your
+  previous message, please wait" reply instead of silently queuing.
+- Searchable activity log (`/` to search, 5000-line cap) in both the TUI and
+  web UI; `--log [N]` CLI equivalent.
+- Auto-update daemon (daily, configurable check time) merged into the
+  existing `[u]` update screen rather than a separate menu item.
+- Disclaimer-decline bug fixed: declining now actually clears a
+  pre-existing acceptance marker too, not just skips creating a new one, so
+  the gate reliably reappears on the next launch.
+
 ## Web UI, Telegram bot, Tavily, RSS tools — ninth session (2026-08-25)
 
 - **New: web UI** (`[b]` from the help menu) — the same agentic chat served

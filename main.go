@@ -5,9 +5,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +22,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/smtp"
 	"net/url"
 	"os"
 	"os/exec"
@@ -28,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -91,33 +97,44 @@ type updateCheckResultMsg struct {
 // ldflag-injected baseline to compare against).
 func checkForUpdate() tea.Cmd {
 	return func() tea.Msg {
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Get(updateRepoAPI)
+		latest, assetURL, err := checkForUpdateSync()
 		if err != nil {
 			return updateCheckResultMsg{err: err.Error()}
 		}
-		defer resp.Body.Close()
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return updateCheckResultMsg{err: err.Error()}
-		}
-		if resp.StatusCode != 200 {
-			return updateCheckResultMsg{err: fmt.Sprintf("status %d", resp.StatusCode)}
-		}
-		var rel githubRelease
-		if err := json.Unmarshal(data, &rel); err != nil {
-			return updateCheckResultMsg{err: err.Error()}
-		}
-		want := updateAssetName(runtime.GOOS, runtime.GOARCH)
-		assetURL := ""
-		for _, a := range rel.Assets {
-			if a.Name == want {
-				assetURL = a.BrowserDownloadURL
-				break
-			}
-		}
-		return updateCheckResultMsg{latestVersion: rel.TagName, assetURL: assetURL}
+		return updateCheckResultMsg{latestVersion: latest, assetURL: assetURL}
 	}
+}
+
+// checkForUpdateSync is the plain (non-tea.Cmd) version of the GitHub
+// releases check, reused by both the manual "check for update" UI action
+// and the background daily auto-update timer, which has no tea.Program
+// message loop to post a result back into.
+func checkForUpdateSync() (latestVersion, assetURL string, err error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(updateRepoAPI)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var rel githubRelease
+	if err := json.Unmarshal(data, &rel); err != nil {
+		return "", "", err
+	}
+	want := updateAssetName(runtime.GOOS, runtime.GOARCH)
+	for _, a := range rel.Assets {
+		if a.Name == want {
+			assetURL = a.BrowserDownloadURL
+			break
+		}
+	}
+	return rel.TagName, assetURL, nil
 }
 
 // parseVersionParts pulls the leading dotted numeric run out of a version
@@ -469,6 +486,10 @@ const (
 	viewWebServerSettings
 	viewWebServerModelSelect
 	viewTelegramSettings
+	viewAutopilot
+	viewEmailSettings
+	viewBackupSettings
+	viewBackupBrowser
 )
 
 type cmdResultMsg struct {
@@ -725,7 +746,7 @@ func agentTools() []ollamaTool {
 		}},
 		{Type: "function", Function: ollamaToolFunction{
 			Name:        "run_command",
-			Description: "Run a shell command on this machine (via cmd.exe) and return its combined stdout/stderr output.",
+			Description: "Run a shell command on this machine (via cmd.exe) and return its combined stdout/stderr output. Use this for Ollama model lifecycle actions there's no dedicated tool for — e.g. `ollama stop <model>` to unload/restart a running model (it reloads automatically the next time it's used), `ollama ps` to see what's running.",
 			Parameters: map[string]interface{}{
 				"type":       "object",
 				"properties": map[string]interface{}{"command": strProp("The full command line to run, e.g. \"dir\" or \"tasklist\".")},
@@ -757,7 +778,7 @@ func agentTools() []ollamaTool {
 		}},
 		{Type: "function", Function: ollamaToolFunction{
 			Name:        "kill_process",
-			Description: "Forcibly terminate a running process by name or PID.",
+			Description: "Forcibly terminate a running process by name or PID. Name can be given with or without \".exe\" — it's added automatically if missing.",
 			Parameters: map[string]interface{}{
 				"type":       "object",
 				"properties": map[string]interface{}{"target": strProp("Process name (e.g. \"notepad.exe\") or numeric PID.")},
@@ -888,6 +909,28 @@ func agentTools() []ollamaTool {
 			Name:        "get_web_ui_url",
 			Description: "Get the URL to open this same agentic chat in a web browser (llama-shell's own web UI), including its required access token. Call this whenever the user asks for the web UI's URL/link/address — never guess or say there isn't one without checking first.",
 			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "get_stock_quote",
+			Description: "Get the actual current/live price for a stock ticker or ANY country's market index, straight from a JSON API — no scraping, no cookie-consent walls, always has the real number. Use this INSTEAD OF web_search/read_webpage for any stock price or index-value question, worldwide, not just well-known indices. Symbols: NASDAQ-100 -> ^NDX, NASDAQ Composite -> ^IXIC, S&P 500 -> ^GSPC, Dow Jones -> ^DJI, Russell 2000 -> ^RUT, VIX -> ^VIX, TA-35 -> TA35.TA, TA-125 -> TA125.TA, FTSE 100 -> ^FTSE, DAX -> ^GDAXI, CAC 40 -> ^FCHI, IBEX 35 -> ^IBEX, FTSE MIB -> FTSEMIB.MI, Euro Stoxx 50 -> ^STOXX50E, AEX -> ^AEX, SMI -> ^SSMI, OMX Stockholm -> ^OMX, Nikkei 225 -> ^N225, Hang Seng -> ^HSI, Shanghai Composite -> 000001.SS, Shenzhen Component -> 399001.SZ, KOSPI -> ^KS11, KOSDAQ -> ^KQ11, TAIEX -> ^TWII, Nifty 50 -> ^NSEI, Sensex -> ^BSESN, Straits Times -> ^STI, ASX 200 -> ^AXJO, NZX 50 -> ^NZ50, TSX -> ^GSPTSE, Bovespa -> ^BVSP, IPC (Mexico) -> ^MXX, MERVAL -> ^MERV, MOEX -> IMOEX.ME, JSE Top 40 -> ^J200, EGX 30 -> ^CASE30, a company -> its ticker (e.g. AAPL, MSFT, TSLA). The user's wording may be garbled by autocorrect — resolve it to the real symbol yourself, never pass their literal typo through. If a country/index isn't listed here or this returns no data, fall back to web_search to find the right Yahoo Finance symbol.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"symbol": strProp("Ticker or index symbol, e.g. ^NDX, ^GSPC, ^DJI, AAPL, TSLA.")},
+				"required":   []string{"symbol"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "send_email",
+			Description: "Send an email through the Gmail account configured in llama-shell's help/settings ([e] email). Only 'to' and 'subject' are required — never ask the user for a body if they didn't give one, just send it without one (or write a short reasonable body yourself from context if that makes sense). Fails with a clear error if no account has been set up yet — tell the user to configure it there rather than trying anything else.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"to":      strProp("Recipient email address."),
+					"subject": strProp("Email subject line."),
+					"body":    strProp("Plain-text email body. Optional — omit or leave empty if the user didn't ask for specific content."),
+				},
+				"required": []string{"to", "subject"},
+			},
 		}},
 		{Type: "function", Function: ollamaToolFunction{
 			Name:        "get_public_ip",
@@ -1431,8 +1474,8 @@ func parseRSSFeed(data []byte) ([]rssItem, error) {
 
 	var atom struct {
 		Entries []struct {
-			Title   string `xml:"title"`
-			Link    struct {
+			Title string `xml:"title"`
+			Link  struct {
 				Href string `xml:"href,attr"`
 			} `xml:"link"`
 			Updated string `xml:"updated"`
@@ -1557,7 +1600,27 @@ func webSearch(query string) (string, error) {
 // need to hand image bytes back to the model (take_screenshot, view_image),
 // which executeAgentTool's plain string return can't carry. Everything else
 // delegates straight through with no images.
+// logAgentToolCall records every tool call the agent makes (name + args,
+// then success/error + a truncated preview of the result) across all three
+// surfaces (TUI, web UI, Telegram) that funnel through this one function —
+// giving the log a real audit trail of what the model actually did, not
+// just what the user/UI did.
+func logAgentToolCall(name string, args map[string]interface{}, result string) {
+	argsJSON, _ := json.Marshal(args)
+	outcome := "ok"
+	if strings.HasPrefix(strings.TrimSpace(result), "error") {
+		outcome = "ERROR"
+	}
+	appendLog("tool call: %s(%s) -> %s: %s", name, truncateName(string(argsJSON), 200), outcome, truncateName(result, 200))
+}
+
 func executeAgentToolWithImages(workDir, name string, args map[string]interface{}) (string, []string) {
+	result, images := executeAgentToolWithImagesInner(workDir, name, args)
+	logAgentToolCall(name, args, result)
+	return result, images
+}
+
+func executeAgentToolWithImagesInner(workDir, name string, args map[string]interface{}) (string, []string) {
 	switch name {
 	case "take_screenshot":
 		const script = `
@@ -1766,6 +1829,14 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		if _, convErr := strconv.Atoi(target); convErr == nil {
 			out, err = exec.Command("taskkill", "/F", "/PID", target).CombinedOutput()
 		} else {
+			// Windows' taskkill /IM matches the image name exactly, which
+			// always includes ".exe" — a model asked to "kill/restart X"
+			// reliably passes the bare name (e.g. "ollama"), which then
+			// fails as "process not found" even though the process is
+			// running, since the real image name is "ollama.exe".
+			if filepath.Ext(target) == "" {
+				target += ".exe"
+			}
 			out, err = exec.Command("taskkill", "/F", "/IM", target).CombinedOutput()
 		}
 		result := string(out)
@@ -1960,11 +2031,12 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 			return "The web UI is not currently running. Enable it in llama-shell via [h] help/settings -> [b] web server."
 		}
 		cfg := loadWebServerConfig()
+		port := webServerEffectivePort(cfg)
 		var b strings.Builder
 		b.WriteString("Web UI links (each includes the required access token):\n\n")
-		b.WriteString(webServerURLFor("127.0.0.1", cfg.Token) + " (this machine only)\n\n")
+		b.WriteString(webServerURLFor("127.0.0.1", cfg.Token, port) + " (this machine only)\n\n")
 		for _, ip := range localLANIPv4s() {
-			b.WriteString(webServerURLFor(ip, cfg.Token) + " (same WiFi/LAN)\n\n")
+			b.WriteString(webServerURLFor(ip, cfg.Token, port) + " (same WiFi/LAN)\n\n")
 		}
 		b.WriteString("No tunnel (e.g. Cloudflare Tunnel) is set up, so none of these work from outside this network.")
 		return b.String()
@@ -1981,6 +2053,79 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 			return "error: " + err.Error()
 		}
 		return strings.TrimSpace(string(data))
+
+	case "get_stock_quote":
+		symbol, _ := args["symbol"].(string)
+		symbol = strings.TrimSpace(symbol)
+		if symbol == "" {
+			return "error: symbol is required"
+		}
+		client := &http.Client{Timeout: 10 * time.Second}
+		req, _ := http.NewRequest("GET", "https://query1.finance.yahoo.com/v8/finance/chart/"+url.QueryEscape(symbol), nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		resp, err := client.Do(req)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		var parsed struct {
+			Chart struct {
+				Result []struct {
+					Meta struct {
+						Symbol             string  `json:"symbol"`
+						RegularMarketPrice float64 `json:"regularMarketPrice"`
+						PreviousClose      float64 `json:"previousClose"`
+						Currency           string  `json:"currency"`
+						RegularMarketTime  int64   `json:"regularMarketTime"`
+						LongName           string  `json:"longName"`
+						ShortName          string  `json:"shortName"`
+						InstrumentType     string  `json:"instrumentType"`
+					} `json:"meta"`
+				} `json:"result"`
+				Error json.RawMessage `json:"error"`
+			} `json:"chart"`
+		}
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			return "error: could not parse quote response: " + err.Error()
+		}
+		if len(parsed.Chart.Result) == 0 {
+			return fmt.Sprintf("error: no quote data found for symbol %q (raw response: %s)", symbol, truncateToolOutput(string(data)))
+		}
+		meta := parsed.Chart.Result[0].Meta
+		name := meta.LongName
+		if name == "" {
+			name = meta.ShortName
+		}
+		change := meta.RegularMarketPrice - meta.PreviousClose
+		// An index (^GSPC, ^NDX, ^FTSE, etc.) is a unitless point value, not
+		// an amount of money — Yahoo's API still labels it with a currency
+		// code (the currency the constituent stocks trade in), which reads
+		// as wrong/confusing tacked onto an index level, so drop it there.
+		isIndex := meta.InstrumentType == "INDEX" || strings.HasPrefix(meta.Symbol, "^")
+		unit := " " + meta.Currency
+		if isIndex {
+			unit = " points"
+		}
+		return fmt.Sprintf("%s (%s): %.2f%s (previous close %.2f, change %+.2f), as of %s",
+			name, meta.Symbol, meta.RegularMarketPrice, unit, meta.PreviousClose, change,
+			time.Unix(meta.RegularMarketTime, 0).Format(time.RFC1123))
+
+	case "send_email":
+		to := toolArgString(args, "to")
+		subject := toolArgString(args, "subject")
+		body := toolArgString(args, "body") // optional — fine to send empty
+		if to == "" || subject == "" {
+			return "error: to and subject are required"
+		}
+		cfg := loadEmailConfig()
+		if err := sendEmailViaGmail(cfg, to, subject, body); err != nil {
+			return "error: " + err.Error()
+		}
+		return "email sent to " + to
 
 	case "list_env_vars":
 		vars := os.Environ()
@@ -2380,6 +2525,42 @@ func warmupPollTick(modelName string) tea.Cmd {
 	})
 }
 
+// agentKeepWarmInterval: how often, while sitting in the agentic chat, to
+// verify via `ollama ps` that the model is still actually loaded in
+// memory — Ollama unloads an idle model on its own after a while, and a
+// long-lived chat session (especially one driving the web server/Telegram
+// bot) should catch that and reload it rather than let the next real
+// message eat a cold-load delay with no warning.
+const agentKeepWarmInterval = 10 * time.Minute
+
+type agentKeepWarmTickMsg struct{}
+
+func agentKeepWarmTickCmd() tea.Cmd {
+	return tea.Tick(agentKeepWarmInterval, func(time.Time) tea.Msg {
+		return agentKeepWarmTickMsg{}
+	})
+}
+
+type agentRewarmCheckedMsg struct {
+	modelName string
+	wasLoaded bool
+}
+
+// checkAndRewarmModel runs `ollama ps` and, if the model isn't in the
+// list (Ollama unloaded it), fires off `ollama run <model> hi` in the
+// background to reload it — fire-and-forget, not awaited, so this never
+// blocks the UI waiting for a cold load to finish.
+func checkAndRewarmModel(modelName string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := exec.Command("ollama", "ps").CombinedOutput()
+		loaded := err == nil && strings.Contains(string(out), modelName)
+		if !loaded {
+			_ = exec.Command("ollama", "run", modelName, "hi").Start()
+		}
+		return agentRewarmCheckedMsg{modelName: modelName, wasLoaded: loaded}
+	}
+}
+
 // ollamaChatStream sends one /api/chat request with stream:true. Ollama's
 // streaming protocol is newline-delimited JSON: each line is a partial
 // {"message":{"content":"<token(s)>"},"done":false} chunk, ending with a
@@ -2549,6 +2730,15 @@ func agentSystemPrompt(wd string) string {
 			"Web tools: web_search gives snippets only, never full article text — for a "+
 			"specific story or 'top N' request, follow up with read_webpage or rss_feed on "+
 			"the best result and answer from that; don't stop at a link list. "+
+			"HARD RULE for any live/current-value question — a stock price, an index level "+
+			"(NASDAQ, S&P 500, Dow, etc.), an exchange rate, a score, the weather, anything that "+
+			"changes in real time: you MUST call web_search (or tavily_search) and then "+
+			"read_webpage/tavily_extract on a real result to actually fetch the current number, "+
+			"then answer with that number. NEVER respond with 'I don't have real-time access' "+
+			"or hand back a list of links for the user to go check themselves — you have the "+
+			"tools to check it yourself, so use them and report the actual value you found "+
+			"(plus its source URL). Only say you couldn't find it after actually trying the "+
+			"tools and getting nothing usable back. "+
 			"HARD RULE for ALL web results, not just 'top N': every item in ANY answer built "+
 			"from web_search/tavily_search/read_webpage/rss_feed must include BOTH the actual "+
 			"URL AND a one-to-two-sentence summary of what it's actually about, taken from the "+
@@ -2560,6 +2750,19 @@ func agentSystemPrompt(wd string) string {
 			"items (same URL+summary rule applies to each). If web_search's first batch has fewer than N usable "+
 			"results, call it again with a broader/different query instead of quietly stopping "+
 			"short or padding with vague unsourced claims. "+
+			"HARD RULE: a section/category homepage (e.g. 'BBC News - World', 'Reuters World "+
+			"News', a site's /world or /news landing page) is NOT a story — its web_search "+
+			"snippet is just that page's generic meta description ('the latest news from X'), "+
+			"which is not a real news item. When asked for 'top N stories about the world/news' "+
+			"with no single site named, skip web_search entirely and go straight to "+
+			"rss_feed on https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en — this is a known-"+
+			"working general headline feed covering exactly this case, do not try find_rss_feed on "+
+			"individual outlets (reuters.com/cnn.com/bbc.com/etc.) for this general request, that "+
+			"is slow and unreliable; save find_rss_feed for when the user names one specific site. "+
+			"Report N real individual articles from that feed's actual items — never list "+
+			"homepages as if they were the stories, and never say you 'can't pull a live list "+
+			"without a functional RSS feed' without having actually called rss_feed on that URL "+
+			"first. "+
 			"HARD RULE, no exceptions: NEVER call read_webpage on finance.yahoo.com or "+
 			"ynet.co.il, no matter how the user phrases the request (news, topics, headlines, "+
 			"stories, top N, or just mentioning the site) and even if you already have an older "+
@@ -2618,6 +2821,68 @@ func shouldRetryWithoutTools(err error) bool {
 		strings.Contains(msg, "llama-server process has terminated")
 }
 
+// liveDataRe matches requests for a value that changes in real time — a
+// small model's trained-in "I don't have real-time access" refusal is
+// strong enough to override the system prompt's tool-usage rules, so a
+// per-turn reminder right next to the actual question (not just once at
+// the top of the conversation) is what actually gets it to call the tool.
+var liveDataRe = regexp.MustCompile(`(?i)\b(stock price|share price|stock index|stock indexes|` +
+	`stock indices|market index|market indices|index value|index values|indices|nasdaq|s&p ?500|` +
+	`dow jones|kospi|kosdaq|nikkei|hang seng|sensex|nifty|exchange rate|currency rate|` +
+	`current price|current value|closing value|closing price|live score|` +
+	`weather (in|for|today)|forecast)\b`)
+
+// liveDataNudge returns a one-off system reminder to inject right before
+// the model call when the latest user message asks for a live value — it
+// is never stored back into the conversation history, only sent for this
+// one request, so it doesn't show up as a stray system bubble in the chat.
+// formatElapsedDuration renders "56s", or "1m 04s" past a minute — mirrors
+// the web UI's formatElapsed so Telegram replies carry the same at-a-glance
+// timing info.
+func formatElapsedDuration(d time.Duration) string {
+	total := int(d.Round(time.Second).Seconds())
+	if total < 60 {
+		return fmt.Sprintf("%ds", total)
+	}
+	return fmt.Sprintf("%dm %02ds", total/60, total%60)
+}
+
+func liveDataNudge(msgs []ollamaChatMsg) *ollamaChatMsg {
+	if len(msgs) == 0 {
+		return nil
+	}
+	last := msgs[len(msgs)-1]
+	if last.Role != "user" || !liveDataRe.MatchString(last.Content) {
+		return nil
+	}
+	return &ollamaChatMsg{Role: "system", Content: "The message right above asks for a live/" +
+		"current value. If it's a stock price or a market index, call get_stock_quote with the " +
+		"right Yahoo Finance symbol — a LARGE reference table, use it for ANY country's index, " +
+		"not just the well-known ones: NASDAQ-100 -> ^NDX, NASDAQ Composite -> ^IXIC, S&P 500 -> " +
+		"^GSPC, Dow Jones -> ^DJI, Russell 2000 -> ^RUT, VIX -> ^VIX, TA-35 -> TA35.TA, TA-125 -> " +
+		"TA125.TA, FTSE 100 -> ^FTSE, DAX (Germany) -> ^GDAXI, CAC 40 (France) -> ^FCHI, IBEX 35 " +
+		"(Spain) -> ^IBEX, FTSE MIB (Italy) -> FTSEMIB.MI, Euro Stoxx 50 -> ^STOXX50E, AEX " +
+		"(Netherlands) -> ^AEX, SMI (Switzerland) -> ^SSMI, OMX Stockholm -> ^OMX, Nikkei 225 -> " +
+		"^N225, Hang Seng -> ^HSI, Shanghai Composite -> 000001.SS, Shenzhen Component -> " +
+		"399001.SZ, KOSPI (South Korea) -> ^KS11, KOSDAQ -> ^KQ11, TAIEX (Taiwan) -> ^TWII, " +
+		"Nifty 50 (India) -> ^NSEI, Sensex (India) -> ^BSESN, Straits Times (Singapore) -> ^STI, " +
+		"ASX 200 (Australia) -> ^AXJO, NZX 50 (New Zealand) -> ^NZ50, TSX (Canada) -> ^GSPTSE, " +
+		"Bovespa (Brazil) -> ^BVSP, IPC (Mexico) -> ^MXX, MERVAL (Argentina) -> ^MERV, MOEX " +
+		"(Russia) -> IMOEX.ME, JSE Top 40 (South Africa) -> ^J200, EGX 30 (Egypt) -> ^CASE30, a " +
+		"company -> its ticker. The user's own wording may be garbled/typo'd (phone autocorrect, " +
+		"etc.) — figure out what they actually meant and use the REAL symbol from this list, " +
+		"never pass their garbled text straight through as the symbol. If the country/index " +
+		"isn't in this table, or get_stock_quote comes back with no data, call web_search first " +
+		"to find the right Yahoo Finance symbol/number instead of giving up or claiming you have " +
+		"no way to check it — you do, you just need the right symbol first. get_stock_quote hits " +
+		"a real JSON API and always returns the actual number, no scraping or consent walls " +
+		"involved, so prefer it over web_search/read_webpage once you have the right symbol. For " +
+		"anything else live (weather, a score, etc.), call web_search or tavily_search " +
+		"first — snippets often contain the number directly. Then answer with the actual number " +
+		"you got back. Do NOT say you lack real-time access and do NOT just hand back a list of " +
+		"links; fetch it yourself and report the real value."}
+}
+
 func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool, suppressTools bool) tea.Cmd {
 	ch := make(chan tea.Msg)
 	go func() {
@@ -2648,6 +2913,13 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 			if toolsSupported && !suppressTools {
 				tools = agentTools()
 			}
+			nudged := false
+			if i == 0 {
+				if n := liveDataNudge(msgs); n != nil {
+					msgs = append(msgs, *n)
+					nudged = true
+				}
+			}
 			reply, err := attempt(tools)
 			// Some models report no "tools" capability at all — Ollama
 			// rejects the request outright rather than just ignoring the
@@ -2657,6 +2929,9 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 			if err != nil && toolsSupported && shouldRetryWithoutTools(err) {
 				toolsSupported = false
 				reply, err = attempt(nil)
+			}
+			if nudged {
+				msgs = msgs[:len(msgs)-1]
 			}
 			if err != nil {
 				ch <- agentTurnDoneMsg{messages: msgs, err: err.Error(), toolsSupported: toolsSupported}
@@ -2688,10 +2963,20 @@ func runAgentTurnSync(modelName string, history []ollamaChatMsg, workDir string,
 		if toolsSupported {
 			tools = agentTools()
 		}
+		nudged := false
+		if i == 0 {
+			if n := liveDataNudge(msgs); n != nil {
+				msgs = append(msgs, *n)
+				nudged = true
+			}
+		}
 		reply, err := ollamaChatStream(modelName, msgs, tools, nil)
 		if err != nil && toolsSupported && shouldRetryWithoutTools(err) {
 			toolsSupported = false
 			reply, err = ollamaChatStream(modelName, msgs, nil, nil)
+		}
+		if nudged {
+			msgs = msgs[:len(msgs)-1]
 		}
 		if err != nil {
 			return msgs, err
@@ -2759,6 +3044,15 @@ func markDisclaimerAccepted() {
 	_ = os.WriteFile(path, []byte(time.Now().Format(time.RFC3339)), 0o644)
 }
 
+// clearDisclaimerAccepted removes any existing acceptance marker on
+// decline — not just "don't create one". Without this, declining after a
+// PRIOR run had already accepted (marker file already on disk from
+// before) would silently do nothing: the old marker stays, and the next
+// launch skips straight past the gate as if nothing had changed.
+func clearDisclaimerAccepted() {
+	_ = os.Remove(disclaimerAcceptedFilePath())
+}
+
 // tavilyKeyFilePath is where the Tavily API key is persisted locally, so
 // the user only has to enter it once via the settings screen instead of
 // setting an environment variable by hand every session.
@@ -2804,6 +3098,19 @@ type webServerConfig struct {
 	Enabled bool   `json:"enabled"`
 	Model   string `json:"model"`
 	Token   string `json:"token"`
+	// Port is 0 in an existing config saved before this field existed,
+	// or if the user never changed it — webServerEffectivePort treats
+	// 0 as "use the default", so old configs keep working unchanged.
+	Port int `json:"port,omitempty"`
+}
+
+// webServerEffectivePort is the port actually used — cfg.Port if the
+// user set one, otherwise the original hardcoded default.
+func webServerEffectivePort(cfg webServerConfig) int {
+	if cfg.Port <= 0 || cfg.Port > 65535 {
+		return webServerDefaultPort
+	}
+	return cfg.Port
 }
 
 // genWebServerToken makes a random per-install access token, embedded as
@@ -2818,6 +3125,52 @@ func genWebServerToken() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// autoUpdateConfig persists the auto-update checkbox and its daily check
+// time. Enabled defaults to true and Hour/Minute default to 3:00 AM when no
+// config file exists yet (first run) — the feature is opt-out, not opt-in,
+// per how it was asked for.
+type autoUpdateConfig struct {
+	Enabled bool `json:"enabled"`
+	Hour    int  `json:"hour"`
+	Minute  int  `json:"minute"`
+}
+
+func defaultAutoUpdateConfig() autoUpdateConfig {
+	return autoUpdateConfig{Enabled: true, Hour: 3, Minute: 0}
+}
+
+func autoUpdateConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "autoupdate_config.json")
+}
+
+func loadAutoUpdateConfig() autoUpdateConfig {
+	data, err := os.ReadFile(autoUpdateConfigPath())
+	if err != nil {
+		return defaultAutoUpdateConfig()
+	}
+	var cfg autoUpdateConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return defaultAutoUpdateConfig()
+	}
+	return cfg
+}
+
+func saveAutoUpdateConfig(cfg autoUpdateConfig) error {
+	path := autoUpdateConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 func webServerConfigPath() string {
@@ -2850,7 +3203,7 @@ func saveWebServerConfig(cfg webServerConfig) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-const webServerPort = 8787
+const webServerDefaultPort = 8787
 
 var (
 	webServerMu      sync.Mutex
@@ -2875,12 +3228,12 @@ func isWebServerRunning() bool {
 // webServerURL is what gets shown to the user for a given host/IP — the
 // token is a required query param, not decoration, so a bare link with
 // no token 403s.
-func webServerURL(token string) string {
-	return webServerURLFor("127.0.0.1", token)
+func webServerURL(token string, port int) string {
+	return webServerURLFor("127.0.0.1", token, port)
 }
 
-func webServerURLFor(host, token string) string {
-	return fmt.Sprintf("http://%s:%d/?token=%s", host, webServerPort, token)
+func webServerURLFor(host, token string, port int) string {
+	return fmt.Sprintf("http://%s:%d/?token=%s", host, port, token)
 }
 
 // localLANIPv4s returns this machine's non-loopback IPv4 addresses —
@@ -2923,7 +3276,8 @@ func startWebServer(cfg webServerConfig, workDir string) error {
 	// gated by cfg.Token on every request; that's the real security
 	// boundary now, since the network boundary is deliberately wider
 	// than before.
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", webServerPort))
+	port := webServerEffectivePort(cfg)
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		webServerLastErr = err.Error()
 		return err
@@ -2937,12 +3291,13 @@ func startWebServer(cfg webServerConfig, workDir string) error {
 	mux.HandleFunc("/api/tools", webRequireToken(cfg.Token, webHandleTools))
 	mux.HandleFunc("/api/warmup", webRequireToken(cfg.Token, webHandleWarmup))
 	mux.HandleFunc("/api/status", webRequireToken(cfg.Token, webHandleStatus))
+	mux.HandleFunc("/api/logs", webRequireToken(cfg.Token, webHandleLogs))
 	srv := &http.Server{Handler: mux}
 	webServerHTTP = srv
 	go func() {
 		_ = srv.Serve(ln)
 	}()
-	appendLog("web server started on %s (model %s)", webServerURL(cfg.Token), cfg.Model)
+	appendLog("web server started on %s (model %s)", webServerURL(cfg.Token, port), cfg.Model)
 	return nil
 }
 
@@ -3054,6 +3409,7 @@ const webChatPageHTML = `<!DOCTYPE html>
   .msg .content { white-space: normal; word-wrap: break-word; }
   .msg .content p { margin: 0 0 12px 0; }
   .msg .content p:last-child { margin-bottom: 0; }
+  .replyTime { font-size: 11px; color: var(--text-dim); margin-top: 8px; font-variant-numeric: tabular-nums; }
   .msg .content a { color: var(--accent); text-decoration: none; }
   .msg .content a:hover { text-decoration: underline; }
   .msg .content code { background: var(--bg-inset); padding: 2px 5px; border-radius: 4px; font-size: 13px; }
@@ -3114,10 +3470,20 @@ const webChatPageHTML = `<!DOCTYPE html>
   #panelHeader { flex-shrink:0; padding: 20px 24px 14px 24px; border-bottom: 1px solid var(--border); }
   #panelHeader h2 { margin: 0; }
   #panelHeader p { color: var(--text-dim); margin: 8px 0 0 0; font-size: 13px; }
+  .toolsHintRow { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-top:8px; }
+  .toolsHintRow p { margin:0; flex:1; }
+  .toolsCollapseBtns { display:flex; gap:10px; flex-shrink:0; white-space:nowrap; padding-top:1px; }
+  .miniBtn { color: var(--accent); font-size: 12px; cursor:pointer; text-decoration: underline; }
+  .miniBtn:hover { color: var(--text); }
   #toolSearch { width: 100%; margin-top: 10px; background: var(--bg-inset); color: var(--text);
                 border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit;
                 font-size: 13px; outline: none; }
   #toolSearch:focus { border-color: var(--accent); }
+  #logSearch { width: 100%; margin-top: 10px; background: var(--bg-inset); color: var(--text);
+               border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit;
+               font-size: 13px; outline: none; }
+  #logSearch:focus { border-color: var(--accent); }
+  .logLines { font-size: 12px; white-space: pre-wrap; word-break: break-word; color: var(--text-dim); }
   #panelClose { float:right; cursor:pointer; color: var(--text-dim); }
   #panelClose:hover { color: var(--text); }
   #panelBody { overflow-y:auto; padding: 8px 24px 24px 24px; flex:1; }
@@ -3197,9 +3563,10 @@ const webChatPageHTML = `<!DOCTYPE html>
   </div>
 </div>
 <div id="menuDropdown">
-  <a class="menuItem gh-link" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener">GitHub</a>
+  <a class="menuItem gh-link" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener">🐙 GitHub</a>
   <span class="menuItem" id="toolsBtnMobile">🛠 Tools</span>
   <span class="menuItem" id="helpBtnMobile">❓ Help</span>
+  <span class="menuItem" id="logsBtnMobile">📜 Logs</span>
 </div>
 <div id="chatWrap"><div id="chat"></div></div>
 <div id="composerWrap">
@@ -3291,6 +3658,7 @@ function renderStep(step) {
 
 function render() {
   const items = buildDisplayItems(messages);
+  let replyIdx = 0;
   chat.innerHTML = items.map(it => {
     if (it.type === 'user') {
       return '<div class="msg user"><div class="role">You</div><div class="content">' + renderMarkdown(it.content) + '</div></div>';
@@ -3300,8 +3668,10 @@ function render() {
         it.steps.map(renderStep).join('') + '</div></div>';
     }
     const isErr = it.content.startsWith('(error)');
+    const secs = turnElapsed[replyIdx++];
+    const timing = (secs != null) ? '<div class="replyTime">' + formatElapsed(secs) + '</div>' : '';
     return '<div class="msg assistant' + (isErr ? ' error' : '') + '"><div class="role">Assistant</div><div class="content">' +
-      renderMarkdown(it.content) + '</div></div>';
+      renderMarkdown(it.content) + '</div>' + timing + '</div>';
   }).join('');
   window.scrollTo(0, document.body.scrollHeight);
 }
@@ -3329,8 +3699,14 @@ async function openTools() {
     const tools = await resp.json();
     setPanelHeader('<h2>Tools (' + tools.length + ')</h2>' +
       '<input id="toolSearch" placeholder="Search tools by name or description..." />' +
-      '<p>Click a row to fill the input with an example prompt, or the copy icon to copy it '+
-      'without filling the box.</p>');
+      '<div class="toolsHintRow"><p>Click a row to fill the input with an example prompt, or the copy icon to copy it '+
+      'without filling the box.</p>' +
+      '<div class="toolsCollapseBtns"><span class="miniBtn" id="collapseAllBtn">Collapse all</span>' +
+      '<span class="miniBtn" id="expandAllBtn">Expand all</span></div></div>');
+    document.getElementById('collapseAllBtn').onclick = () =>
+      panelBody.querySelectorAll('.catGroup').forEach(d => { d.open = false; });
+    document.getElementById('expandAllBtn').onclick = () =>
+      panelBody.querySelectorAll('.catGroup').forEach(d => { d.open = true; });
     let html = '';
     let lastCat = null;
     let num = 0;
@@ -3408,11 +3784,41 @@ function openHelp() {
 document.getElementById('toolsBtn').onclick = openTools;
 document.getElementById('helpBtn').onclick = openHelp;
 
+// Fetches from the server fresh every open (and on each search keystroke)
+// rather than once — the log keeps growing while the panel might sit open,
+// and re-fetching is cheap since the server already caps it at 1000 lines.
+async function openLogs() {
+  setPanelHeader('<h2>Logs</h2><input id="logSearch" placeholder="Search logs..." />');
+  panelBody.innerHTML = '<p>Loading…</p>';
+  overlay.classList.add('open');
+  const searchInput = document.getElementById('logSearch');
+  let debounceTimer = null;
+  async function loadLogs(q) {
+    try {
+      const resp = await fetch('/api/logs?token=' + encodeURIComponent(token) +
+        (q ? '&q=' + encodeURIComponent(q) : ''));
+      const data = await resp.json();
+      panelBody.innerHTML = data.lines.length
+        ? '<pre class="mono logLines">' + data.lines.map(esc).join('\n') + '</pre>'
+        : '<p>No matching log entries.</p>';
+    } catch (e) {
+      panelBody.innerHTML = '<p style="color:#f87171">Failed to load logs: ' + esc(String(e)) + '</p>';
+    }
+  }
+  searchInput.oninput = () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => loadLogs(searchInput.value), 250);
+  };
+  loadLogs('');
+  searchInput.focus();
+}
+
 const menuBtn = document.getElementById('menuBtn');
 const menuDropdown = document.getElementById('menuDropdown');
 menuBtn.onclick = (e) => { e.stopPropagation(); menuDropdown.classList.toggle('open'); };
 document.getElementById('toolsBtnMobile').onclick = () => { menuDropdown.classList.remove('open'); openTools(); };
 document.getElementById('helpBtnMobile').onclick = () => { menuDropdown.classList.remove('open'); openHelp(); };
+document.getElementById('logsBtnMobile').onclick = () => { menuDropdown.classList.remove('open'); openLogs(); };
 document.addEventListener('click', (e) => {
   if (!menuDropdown.contains(e.target) && e.target !== menuBtn) menuDropdown.classList.remove('open');
 });
@@ -3424,6 +3830,7 @@ async function loadStatusBadges() {
     const s = await resp.json();
     const badge = (cls, text) => '<span class="badge ' + cls + '">' + esc(text) + '</span>';
     let html = '';
+    if (s.buildVersion) html += badge('off', 'build: ' + s.buildVersion);
     html += s.ollamaInstalled ? badge('on', 'ollama: ' + (s.ollamaVersion || 'installed')) : badge('warn', 'ollama: not installed');
     html += s.tavilyConfigured ? badge('on', 'tavily: set') : badge('off', 'tavily: off');
     if (s.telegramBound) html += badge('on', 'tg: bound');
@@ -3449,12 +3856,13 @@ async function pollWarmup() {
 function thinkingPhrase(elapsedMs) {
   if (!warmupLoaded) return 'Loading model into memory';
   const s = elapsedMs / 1000;
-  if (s < 4) return 'Thinking';
-  if (s < 8) return 'Reasoning';
-  if (s < 14) return 'Working through it';
-  if (s < 20) return 'Almost done';
+  const secs = Math.floor(s) + 's';
+  if (s < 4) return 'Thinking (' + secs + ')';
+  if (s < 8) return 'Reasoning (' + secs + ')';
+  if (s < 14) return 'Working through it (' + secs + ')';
+  if (s < 20) return 'Almost done (' + secs + ')';
   const phrases = ['Still going', 'Taking a while', 'Almost done'];
-  return phrases[Math.floor((s - 20) / 6) % phrases.length];
+  return phrases[Math.floor((s - 20) / 6) % phrases.length] + ' (' + secs + ')';
 }
 
 function autoGrow() {
@@ -3465,6 +3873,11 @@ input.addEventListener('input', autoGrow);
 
 let busy = false;
 let currentController = null;
+// One entry per completed turn's elapsed seconds, in order — matched up to
+// the Nth content-bearing assistant reply at render time. Kept separate
+// from the messages array itself so this display-only text never gets
+// sent back to the model as part of the conversation history.
+let turnElapsed = [];
 function setBusy(b) {
   busy = b;
   sendBtn.textContent = b ? '■' : '➤';
@@ -3514,12 +3927,21 @@ async function send() {
       messages.push({ role: 'assistant', content: '(error) ' + e });
     }
   }
+  turnElapsed.push(Math.round((Date.now() - startedAt) / 1000));
   clearInterval(warmupTimer);
   clearInterval(warmupPollTimer);
   setBusy(false);
   currentController = null;
   render();
   input.focus();
+}
+
+// Formats seconds as "56s", or "1m 04s" past a minute.
+function formatElapsed(totalSec) {
+  if (totalSec < 60) return totalSec + 's';
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m + 'm ' + String(s).padStart(2, '0') + 's';
 }
 sendBtn.onclick = () => {
   if (busy) {
@@ -3641,8 +4063,12 @@ func webHandleChatAPI(w http.ResponseWriter, r *http.Request) {
 	if len(history) == 0 || history[0].Role != "system" {
 		history = append([]ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(workDir)}}, history...)
 	}
+	if len(history) > 0 && history[len(history)-1].Role == "user" {
+		appendLog("web chat message: %s", truncateName(history[len(history)-1].Content, 80))
+	}
 	updated, err := runAgentTurnSync(modelName, history, workDir, true)
 	if err != nil {
+		appendLog("web chat: turn error: %s", err.Error())
 		json.NewEncoder(w).Encode(webChatResponse{Error: err.Error(), Messages: updated})
 		return
 	}
@@ -3701,6 +4127,7 @@ type webStatusResponse struct {
 	TelegramBound    bool   `json:"telegramBound"`
 	OllamaInstalled  bool   `json:"ollamaInstalled"`
 	OllamaVersion    string `json:"ollamaVersion"`
+	BuildVersion     string `json:"buildVersion"`
 }
 
 // webHandleStatus surfaces the same integration state the TUI's footer
@@ -3717,7 +4144,20 @@ func webHandleStatus(w http.ResponseWriter, r *http.Request) {
 		TelegramBound:    isTelegramRunning() && tgCfg.ChatID != 0,
 		OllamaInstalled:  ollama.installed,
 		OllamaVersion:    ollama.version,
+		BuildVersion:     buildTime,
 	})
+}
+
+// webHandleLogs serves the same activity log the TUI's own log viewer
+// shows (last maxDisplayedLogLines events, newest first), optionally
+// filtered via ?q= — the same substring-match search the TUI uses.
+func webHandleLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	lines := readLogLines(r.URL.Query().Get("q"))
+	if lines == nil {
+		lines = []string{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"lines": lines})
 }
 
 // telegramConfig persists across restarts: the bot token, which model
@@ -3757,6 +4197,425 @@ func saveTelegramConfig(cfg telegramConfig) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+// emailConfig persists Gmail SMTP credentials — App Password auth (not
+// the account's real password; Gmail rejects plain-password SMTP login
+// entirely once 2FA is on, and recommends App Passwords even without it).
+// Host/port are fixed to Gmail's real submission endpoint, not user
+// input — there's only one correct value, so asking for it would just be
+// one more thing to get wrong.
+type emailConfig struct {
+	FromAddress string `json:"from_address"`
+	AppPassword string `json:"app_password"`
+	DisplayName string `json:"display_name,omitempty"`
+}
+
+const (
+	emailSMTPHost = "smtp.gmail.com"
+	emailSMTPPort = "587"
+)
+
+func emailConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "email_config.json")
+}
+
+func loadEmailConfig() emailConfig {
+	data, err := os.ReadFile(emailConfigPath())
+	if err != nil {
+		return emailConfig{}
+	}
+	var cfg emailConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveEmailConfig(cfg emailConfig) error {
+	path := emailConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// sendEmailViaGmail sends one plain-text email through Gmail's SMTP
+// submission endpoint using the saved App Password. net/smtp's SendMail
+// upgrades to STARTTLS automatically when the server offers it (Gmail
+// always does on port 587), so no manual TLS handshake is needed here.
+func sendEmailViaGmail(cfg emailConfig, to, subject, body string) error {
+	if cfg.FromAddress == "" || cfg.AppPassword == "" {
+		return fmt.Errorf("email isn't configured yet — set it up in help/settings first")
+	}
+	auth := smtp.PlainAuth("", cfg.FromAddress, cfg.AppPassword, emailSMTPHost)
+	from := cfg.FromAddress
+	if cfg.DisplayName != "" {
+		from = fmt.Sprintf("%s <%s>", cfg.DisplayName, cfg.FromAddress)
+	}
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\n", from, to, subject, body)
+	return smtp.SendMail(emailSMTPHost+":"+emailSMTPPort, auth, cfg.FromAddress, []string{to}, []byte(msg))
+}
+
+type emailTestResultMsg struct {
+	err string
+}
+
+func sendTestEmail(cfg emailConfig) tea.Cmd {
+	return func() tea.Msg {
+		err := sendEmailViaGmail(cfg, cfg.FromAddress,
+			"llama-shell test email",
+			"This confirms llama-shell can send email through your Gmail account. If you're reading this, it worked.")
+		if err != nil {
+			return emailTestResultMsg{err: err.Error()}
+		}
+		return emailTestResultMsg{}
+	}
+}
+
+// backupMagic tags a llama-shell backup file so import can reject
+// anything else (a random file, or one from a future incompatible
+// format) with a clear error instead of a confusing decrypt failure.
+const backupMagic = "LSB1"
+
+const (
+	backupSaltLen       = 16
+	backupNonceLen      = 12
+	backupKDFIterations = 200000
+	backupKeyLen        = 32 // AES-256
+	// backupFixedPassphrase is the sole key material behind every backup
+	// file — there's no password prompt and no key file, by design (the
+	// user just wants "not plain text if someone opens the file", not
+	// real secrecy from someone who has the app's own source). Anyone
+	// with this source can decrypt any backup; this is obfuscation
+	// against casual viewing/editing, not a security boundary.
+	backupFixedPassphrase = "llama-shell-backup-v1-not-a-secret"
+)
+
+// pbkdf2SHA256 derives a key of length keyLen from password+salt using
+// PBKDF2 (RFC 8018) with HMAC-SHA256, iterated `iterations` times. Go's
+// standard library has no PBKDF2 (only golang.org/x/crypto does), and
+// this feature is meant to work with zero extra dependencies — the
+// algorithm itself is a few lines of HMAC chaining, so it's inlined here
+// rather than vendoring a library for it.
+func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
+	prf := hmac.New(sha256.New, password)
+	hashLen := prf.Size()
+	numBlocks := (keyLen + hashLen - 1) / hashLen
+	var dk []byte
+	for block := 1; block <= numBlocks; block++ {
+		prf.Reset()
+		prf.Write(salt)
+		var blockIndex [4]byte
+		binary.BigEndian.PutUint32(blockIndex[:], uint32(block))
+		prf.Write(blockIndex[:])
+		u := prf.Sum(nil)
+		t := make([]byte, len(u))
+		copy(t, u)
+		for i := 1; i < iterations; i++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		dk = append(dk, t...)
+	}
+	return dk[:keyLen]
+}
+
+// llamaShellConfigDir is the one directory every persisted setting in
+// this app lives under (email/telegram/tavily/webserver/autoupdate
+// configs, city banner progress, the disclaimer marker, etc.) — backup
+// export/import operates on this whole directory rather than listing
+// each file by name, so a future new setting is included automatically.
+func llamaShellConfigDir() (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell"), nil
+}
+
+// zipConfigDir walks llamaShellConfigDir() and returns it as an
+// in-memory zip (archive/zip, already used elsewhere for the
+// compress_zip tool) — the plaintext that gets encrypted for export.
+func zipConfigDir() ([]byte, error) {
+	dir, err := llamaShellConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		w, err := zw.Create(e.Name())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := w.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// unzipIntoConfigDir extracts a zip previously produced by
+// zipConfigDir back into llamaShellConfigDir(), overwriting whatever is
+// there — that's the point of a restore.
+func unzipIntoConfigDir(zipData []byte) error {
+	dir, err := llamaShellConfigDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		return err
+	}
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, filepath.Base(f.Name)), data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// encryptBackup derives a one-time key from the fixed passphrase plus a
+// fresh random salt (PBKDF2) and seals plaintext with AES-256-GCM. The
+// salt still varies per file (so two backups never share a key/nonce
+// pair even though the passphrase is constant); the passphrase itself
+// never varies, so there's nothing for the user to type or lose.
+// Output layout: magic(4) | salt(16) | nonce(12) | ciphertext+tag.
+func encryptBackup(plaintext []byte) ([]byte, error) {
+	salt := make([]byte, backupSaltLen)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+	key := pbkdf2SHA256([]byte(backupFixedPassphrase), salt, backupKDFIterations, backupKeyLen)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, backupNonceLen)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+	out := make([]byte, 0, len(backupMagic)+len(salt)+len(nonce)+len(ciphertext))
+	out = append(out, []byte(backupMagic)...)
+	out = append(out, salt...)
+	out = append(out, nonce...)
+	out = append(out, ciphertext...)
+	return out, nil
+}
+
+// decryptBackup reverses encryptBackup. gcm.Open's authentication check
+// (GCM is AEAD) catches a corrupted/truncated/tampered-with file rather
+// than silently returning garbage.
+func decryptBackup(data []byte) ([]byte, error) {
+	if len(data) < len(backupMagic)+backupSaltLen+backupNonceLen {
+		return nil, fmt.Errorf("not a llama-shell backup file (too short)")
+	}
+	if string(data[:len(backupMagic)]) != backupMagic {
+		return nil, fmt.Errorf("not a llama-shell backup file (bad header)")
+	}
+	rest := data[len(backupMagic):]
+	salt := rest[:backupSaltLen]
+	nonce := rest[backupSaltLen : backupSaltLen+backupNonceLen]
+	ciphertext := rest[backupSaltLen+backupNonceLen:]
+	key := pbkdf2SHA256([]byte(backupFixedPassphrase), salt, backupKDFIterations, backupKeyLen)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("corrupted backup file")
+	}
+	return plaintext, nil
+}
+
+// defaultBackupPath is the pre-filled suggestion shown in the backup
+// form — the user's home directory keeps it somewhere they'll actually
+// find again, rather than the app's own cache dir (which is also what's
+// being backed up, so writing there would be a little odd).
+func defaultBackupPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, "llama-shell-backup.lsb")
+}
+
+// exportBackup zips the whole config directory, encrypts it, and
+// writes it to path.
+func exportBackup(path string) error {
+	plain, err := zipConfigDir()
+	if err != nil {
+		return err
+	}
+	encrypted, err := encryptBackup(plain)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, encrypted, 0o600)
+}
+
+// importBackup reads path, decrypts it, and restores it over the
+// current config directory.
+func importBackup(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	plain, err := decryptBackup(data)
+	if err != nil {
+		return err
+	}
+	return unzipIntoConfigDir(plain)
+}
+
+// fileBrowseEntry is one row in the in-terminal directory browser used
+// by the backup export/import screen — a plain text-mode "..[dir]/file"
+// list navigated with the keyboard, not an OS GUI dialog.
+type fileBrowseEntry struct {
+	name  string
+	isDir bool
+}
+
+// listDirEntries lists dir for the backup file browser: ".." first
+// (unless dir is already a filesystem root), then subdirectories, then
+// files — each group alphabetical. Files are filtered to *.lsb (the
+// only thing this browser is ever used to pick) so a folder full of
+// unrelated files doesn't bury the one that matters; directories are
+// never filtered, since you need to see all of them to navigate.
+func listDirEntries(dir string) ([]fileBrowseEntry, error) {
+	raw, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var dirs, files []fileBrowseEntry
+	for _, e := range raw {
+		if e.IsDir() {
+			dirs = append(dirs, fileBrowseEntry{name: e.Name(), isDir: true})
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(e.Name()), ".lsb") {
+			files = append(files, fileBrowseEntry{name: e.Name(), isDir: false})
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].name) < strings.ToLower(dirs[j].name) })
+	sort.Slice(files, func(i, j int) bool { return strings.ToLower(files[i].name) < strings.ToLower(files[j].name) })
+
+	entries := make([]fileBrowseEntry, 0, len(dirs)+len(files)+1)
+	if parent := filepath.Dir(dir); parent != dir {
+		entries = append(entries, fileBrowseEntry{name: "..", isDir: true})
+	}
+	entries = append(entries, dirs...)
+	entries = append(entries, files...)
+	return entries, nil
+}
+
+// enterBackupBrowser switches into the in-terminal directory browser,
+// starting in the same folder defaultBackupPath() suggests (the user's
+// home directory). mode is "export" or "import".
+func (m model) enterBackupBrowser(mode string) model {
+	m.backupMode = mode
+	m.backupMsg = ""
+	m.backupBrowseDir = filepath.Dir(defaultBackupPath())
+	m.backupBrowseCursor = 0
+	m.backupBrowseFilename = filepath.Base(defaultBackupPath())
+	m.backupBrowseEditingName = mode == "export"
+	entries, err := listDirEntries(m.backupBrowseDir)
+	if err != nil {
+		m.backupMsg = redStyle.Render("can't open " + m.backupBrowseDir + ": " + err.Error())
+		m.view = viewBackupSettings
+		return m
+	}
+	m.backupBrowseEntries = entries
+	m.view = viewBackupBrowser
+	return m
+}
+
+// confirmBackupExport runs when Enter is pressed in the filename field
+// during export — joins the current browsed directory with the typed
+// filename and writes the encrypted backup there.
+func (m model) confirmBackupExport() (model, tea.Cmd) {
+	name := strings.TrimSpace(m.backupBrowseFilename)
+	if name == "" {
+		m.backupMsg = "enter a file name"
+		return m, nil
+	}
+	if !strings.EqualFold(filepath.Ext(name), ".lsb") {
+		name += ".lsb"
+	}
+	path := filepath.Join(m.backupBrowseDir, name)
+	if err := exportBackup(path); err != nil {
+		m.backupMsg = redStyle.Render("export failed: " + err.Error())
+		appendLog("backup: export failed: %s", err.Error())
+	} else {
+		m.backupMsg = helpKeyStyle.Render("exported to " + path)
+		appendLog("backup: exported settings to %s", path)
+	}
+	m.view = viewBackupSettings
+	return m, nil
+}
+
+// confirmBackupImport runs when a .lsb file is selected in import
+// mode — decrypts and restores it over the current config directory.
+func (m model) confirmBackupImport(path string) (model, tea.Cmd) {
+	if err := importBackup(path); err != nil {
+		m.backupMsg = redStyle.Render("import failed: " + err.Error())
+		appendLog("backup: import failed: %s", err.Error())
+	} else {
+		m.backupMsg = helpKeyStyle.Render("imported from " + path + " — restart llama-shell for all of it to take effect")
+		appendLog("backup: imported settings from %s", path)
+	}
+	m.view = viewBackupSettings
+	return m, nil
 }
 
 var (
@@ -3883,94 +4742,161 @@ func telegramSendChatAction(token string, chatID int64) error {
 	return nil
 }
 
+// telegramIncomingMsg is one user text message handed from the fetcher
+// goroutine to the processing loop in runTelegramPollLoop.
+type telegramIncomingMsg struct {
+	chatID int64
+	text   string
+}
+
 // runTelegramPollLoop is the bot's whole lifetime: poll, answer, repeat.
 // It auto-binds to the first chat that ever messages it (cfg.ChatID == 0)
 // and persists that binding, then rejects any other chat ID from then on
 // — otherwise anyone who discovers the bot's @username would get the same
 // full local tool access (files, commands, network) you have here.
 func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string) {
-	var offset int64
 	history := []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(workDir)}}
-	boundChatID := cfg.ChatID
-	consecutiveErrs := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		updates, err := telegramGetUpdates(cfg.Token, offset)
-		if err != nil {
-			consecutiveErrs++
-			telegramMu.Lock()
-			telegramLastErr = err.Error()
-			telegramMu.Unlock()
-			appendLog("telegram: getUpdates error: %s", err.Error())
+	var boundChatID atomic.Int64
+	boundChatID.Store(cfg.ChatID)
+	var busy atomic.Bool
+	var busyChatID atomic.Int64
+	incoming := make(chan telegramIncomingMsg, 32)
+	// Captured once as its own immutable value — the fetcher goroutine
+	// must never touch the shared `cfg` variable itself, since the main
+	// loop below mutates cfg.ChatID concurrently; even touching a
+	// different field of the same struct from two goroutines is a real
+	// data race, not just a logical one.
+	token := cfg.Token
+
+	// Fetcher runs independently of how long a turn takes to process —
+	// without this, a message sent while the bot is mid-turn would just
+	// sit unnoticed until the NEXT getUpdates call (after the current
+	// turn finishes), with no acknowledgment that it was even received.
+	// This lets it reply immediately with "please wait" for a message
+	// that arrives while busy, then still queue it for real processing.
+	go func() {
+		var offset int64
+		consecutiveErrs := 0
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Duration(min(consecutiveErrs, 6)) * 5 * time.Second):
+			default:
 			}
+			updates, err := telegramGetUpdates(token, offset)
+			if err != nil {
+				consecutiveErrs++
+				telegramMu.Lock()
+				telegramLastErr = err.Error()
+				telegramMu.Unlock()
+				appendLog("telegram: getUpdates error: %s", err.Error())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Duration(min(consecutiveErrs, 6)) * 5 * time.Second):
+				}
+				continue
+			}
+			consecutiveErrs = 0
+			for _, u := range updates {
+				offset = u.UpdateID + 1
+				if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
+					continue
+				}
+				chatID := u.Message.Chat.ID
+				if bound := boundChatID.Load(); bound != 0 && chatID != bound {
+					appendLog("telegram: rejected message from unbound chat %d", chatID)
+					_ = telegramSendMessage(token, chatID, "This bot is bound to a different chat.")
+					continue
+				}
+				if busy.Load() && chatID == busyChatID.Load() {
+					_ = telegramSendMessage(token, chatID,
+						"⏳ Still working on your previous message — please wait, I'll get to this one right after.")
+				}
+				select {
+				case incoming <- telegramIncomingMsg{chatID: chatID, text: u.Message.Text}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		var msg telegramIncomingMsg
+		select {
+		case <-ctx.Done():
+			return
+		case msg = <-incoming:
+		}
+		chatID := msg.chatID
+		if boundChatID.Load() == 0 {
+			boundChatID.Store(chatID)
+			cfg.ChatID = chatID
+			_ = saveTelegramConfig(cfg)
+			appendLog("telegram: bound to chat %d", chatID)
+		}
+		busy.Store(true)
+		busyChatID.Store(chatID)
+		history = append(history, ollamaChatMsg{Role: "user", Content: msg.text})
+		appendLog("telegram message: %s", truncateName(msg.text, 80))
+
+		// Instant ack so the chat doesn't look like a dead end while a
+		// small model + tool calls can take anywhere from seconds to a
+		// couple minutes — plus Telegram's native "typing..." indicator,
+		// refreshed on a ticker since it only lasts ~5s per call.
+		_ = telegramSendMessage(cfg.Token, chatID, "⏳ Got it — working on it...")
+		turnStarted := time.Now()
+		typingDone := make(chan struct{})
+		go func() {
+			_ = telegramSendChatAction(cfg.Token, chatID)
+			typingTicker := time.NewTicker(4 * time.Second)
+			defer typingTicker.Stop()
+			// A separate, slower ticker for an actual text message —
+			// the typing indicator alone disappears/gets missed easily
+			// on the other end, so a visible "still working" note every
+			// minute makes it obvious the bot hasn't gone silent on a
+			// long tool-calling turn.
+			statusTicker := time.NewTicker(1 * time.Minute)
+			defer statusTicker.Stop()
+			elapsedMin := 0
+			for {
+				select {
+				case <-typingDone:
+					return
+				case <-typingTicker.C:
+					_ = telegramSendChatAction(cfg.Token, chatID)
+				case <-statusTicker.C:
+					elapsedMin++
+					_ = telegramSendMessage(cfg.Token, chatID,
+						fmt.Sprintf("⏳ Still working on it... (%dm)", elapsedMin))
+				}
+			}
+		}()
+
+		updated, err := runAgentTurnSync(cfg.Model, history, workDir, true)
+		close(typingDone)
+		elapsed := formatElapsedDuration(time.Since(turnStarted))
+		if err != nil {
+			_ = telegramSendMessage(cfg.Token, chatID, "error: "+err.Error()+" ("+elapsed+")")
+			busy.Store(false)
 			continue
 		}
-		consecutiveErrs = 0
-		for _, u := range updates {
-			offset = u.UpdateID + 1
-			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
-				continue
-			}
-			chatID := u.Message.Chat.ID
-			if boundChatID == 0 {
-				boundChatID = chatID
-				cfg.ChatID = chatID
-				_ = saveTelegramConfig(cfg)
-				appendLog("telegram: bound to chat %d", chatID)
-			} else if chatID != boundChatID {
-				_ = telegramSendMessage(cfg.Token, chatID, "This bot is bound to a different chat.")
-				continue
-			}
-			history = append(history, ollamaChatMsg{Role: "user", Content: u.Message.Text})
-
-			// Instant ack so the chat doesn't look like a dead end while a
-			// small model + tool calls can take anywhere from seconds to a
-			// couple minutes — plus Telegram's native "typing..." indicator,
-			// refreshed on a ticker since it only lasts ~5s per call.
-			_ = telegramSendMessage(cfg.Token, chatID, "⏳ Got it — working on it...")
-			typingDone := make(chan struct{})
-			go func() {
-				_ = telegramSendChatAction(cfg.Token, chatID)
-				ticker := time.NewTicker(4 * time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-typingDone:
-						return
-					case <-ticker.C:
-						_ = telegramSendChatAction(cfg.Token, chatID)
-					}
-				}
-			}()
-
-			updated, err := runAgentTurnSync(cfg.Model, history, workDir, true)
-			close(typingDone)
-			if err != nil {
-				_ = telegramSendMessage(cfg.Token, chatID, "error: "+err.Error())
-				continue
-			}
-			history = updated
-			var reply string
-			for _, m := range updated {
-				if m.Role == "assistant" && strings.TrimSpace(m.Content) != "" {
-					reply = m.Content
-				}
-			}
-			if reply == "" {
-				reply = "(no reply)"
-			}
-			if err := telegramSendMessage(cfg.Token, chatID, cleanMarkdownForDisplay(reply)); err != nil {
-				appendLog("telegram: sendMessage error: %s", err.Error())
+		history = updated
+		var reply string
+		for _, m := range updated {
+			if m.Role == "assistant" && strings.TrimSpace(m.Content) != "" {
+				reply = m.Content
 			}
 		}
+		if reply == "" {
+			reply = "(no reply)"
+		}
+		reply = cleanMarkdownForDisplay(reply) + "\n\n⏱ " + elapsed
+		if err := telegramSendMessage(cfg.Token, chatID, reply); err != nil {
+			appendLog("telegram: sendMessage error: %s", err.Error())
+		}
+		busy.Store(false)
 	}
 }
 
@@ -4015,19 +4941,50 @@ func appendLog(format string, args ...interface{}) {
 	fmt.Fprintf(f, "%s  %s\n", time.Now().Format("2006-01-02 15:04:05"), line)
 }
 
-// readLogTail returns the last n lines of the activity log, or a
-// placeholder if there's nothing yet.
-func readLogTail(n int) string {
+// maxDisplayedLogLines caps how much of the (unbounded, ever-growing) log
+// file the log viewers show — the file on disk keeps everything, this only
+// limits what gets loaded/rendered for a screen or the /api/logs response.
+const maxDisplayedLogLines = 5000
+
+// readLogLines returns up to maxDisplayedLogLines most recent log lines,
+// newest first, optionally filtered to those containing query
+// (case-insensitive substring match, applied after capping to the display
+// window — matching "last 1000 events" first, then narrowing).
+func readLogLines(query string) []string {
 	data, err := os.ReadFile(logFilePath())
 	if err != nil || len(data) == 0 {
-		return "no log entries yet."
+		return nil
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+	if len(lines) > maxDisplayedLogLines {
+		lines = lines[len(lines)-maxDisplayedLogLines:]
 	}
 	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
 		lines[i], lines[j] = lines[j], lines[i]
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return lines
+	}
+	q := strings.ToLower(query)
+	filtered := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if strings.Contains(strings.ToLower(l), q) {
+			filtered = append(filtered, l)
+		}
+	}
+	return filtered
+}
+
+// readLogTail returns the last n lines of the activity log, or a
+// placeholder if there's nothing yet.
+func readLogTail(n int) string {
+	lines := readLogLines("")
+	if lines == nil {
+		return "no log entries yet."
+	}
+	if len(lines) > n {
+		lines = lines[:n]
 	}
 	return strings.Join(lines, "\n")
 }
@@ -4856,6 +5813,48 @@ func checkWizardDiskSpace(actions []wizardAction) (ok bool, freeBytes, neededByt
 		dir, toGB(needed), toGB(free))
 }
 
+// advanceWizardChain moves to the next queued wizard setup screen, or —
+// if the queue is empty — back to viewMenu when this navigation came from
+// the wizard (wizardInChain), else viewHelpMenu for a screen opened
+// directly (not part of any chain). Called from each chainable settings
+// screen's own exit points (Esc, or a successful save) instead of each
+// hardcoding its "next" destination.
+func (m model) advanceWizardChain() model {
+	if len(m.wizardPendingSetups) > 0 {
+		next := m.wizardPendingSetups[0]
+		m.wizardPendingSetups = m.wizardPendingSetups[1:]
+		m.view = next
+		if next == viewEmailSettings {
+			m.emailEditing = loadEmailConfig().FromAddress == ""
+		}
+		appendLog("wizard: opening %s setup", helpMenuLabelForView(next))
+		return m
+	}
+	if m.wizardInChain {
+		m.wizardInChain = false
+		m.wizardPhase = ""
+		m.view = viewMenu
+		return m
+	}
+	m.view = viewHelpMenu
+	return m
+}
+
+// helpMenuLabelForView gives a short human name for a wizard-chained
+// settings screen, for log messages only.
+func helpMenuLabelForView(v view) string {
+	switch v {
+	case viewTavilySettings:
+		return "tavily key"
+	case viewTelegramSettings:
+		return "telegram bot"
+	case viewEmailSettings:
+		return "email"
+	default:
+		return "settings"
+	}
+}
+
 // enterWizard builds the setup-wizard question list and switches to it.
 // skipDisclaimer omits the disclaimer question — used when the wizard is
 // entered right after the first-run disclaimer gate already accepted it
@@ -4877,6 +5876,7 @@ func (m model) enterWizard(skipDisclaimer bool) model {
 		wizardQuestion{id: "gemma4", prompt: "Download gemma4:e2b (~7 GB)?"},
 		wizardQuestion{id: "tavily", prompt: "Set up a Tavily API key now, for web-search/scraping tools in agentic chat?"},
 		wizardQuestion{id: "telegram", prompt: "Set up a Telegram bot now, to chat with the agent from your phone?"},
+		wizardQuestion{id: "email", prompt: "Set up a Gmail account now, so the agent can send email?"},
 	)
 	m.wizardQIndex = 0
 	m.wizardAnswers = map[string]bool{}
@@ -5352,6 +6352,7 @@ type menuItem struct {
 }
 
 var menuItems = []menuItem{
+	{"a", "autopilot        (auto: install ollama + gemma4:e2b + enable web server)"},
 	{"l", "list models      (ollama + library + huggingface)"},
 	{"p", "running models    (ollama ps)"},
 	{"s", "Select Model      (scan all + cache)"},
@@ -5370,11 +6371,13 @@ var helpMenuItems = []helpMenuItem{
 	{"h", "read help", viewHelpText},
 	{"d", "disclaimer (no warranty)", viewDisclaimerText},
 	{"g", "view log", viewLogText},
-	{"u", "update", viewUpdateText},
+	{"u", "update (includes auto-update settings)", viewUpdateText},
 	{"w", "setup wizard (install ollama + download starter models)", viewWizard},
 	{"t", "tavily API key (enables tavily_search/tavily_extract tools)", viewTavilySettings},
 	{"b", "web server (browser access to agentic chat)", viewWebServerSettings},
 	{"m", "telegram bot (chat with the agent from your phone)", viewTelegramSettings},
+	{"e", "email (Gmail app password, sends a test email)", viewEmailSettings},
+	{"x", "backup / restore (encrypted export & import of all settings)", viewBackupSettings},
 }
 
 type model struct {
@@ -5465,17 +6468,81 @@ type model struct {
 
 	tavilyKeyInput string
 	tavilyKeyMsg   string
+	tavilyEditing  bool
+
+	telegramEditing bool
+
+	// emailFieldFocus: 0 = address, 1 = display name (optional), 2 = app password.
+	emailAddrInput        string
+	emailDisplayNameInput string
+	emailPassInput        string
+	emailFieldFocus       int
+	emailMsg              string
+	emailSending          bool
+	// emailEditing: false shows the greyed-out configured summary (with a
+	// [r] reconfigure option) whenever an account is already saved; true
+	// shows the live input fields. Always true when nothing is saved yet.
+	emailEditing bool
+
+	// backupMode: "" = the export/import chooser menu, "export" or
+	// "import" once one is picked — that switches to viewBackupBrowser,
+	// an in-terminal directory browser (no OS GUI dialog, no password
+	// prompt — see backupFixedPassphrase).
+	backupMode          string
+	backupMsg           string
+	backupBrowseDir     string
+	backupBrowseEntries []fileBrowseEntry
+	backupBrowseCursor  int
+	// backupBrowseFilename/backupBrowseEditingName: export mode only —
+	// the typed destination filename and whether the filename field (vs.
+	// the directory list) currently has keyboard focus.
+	backupBrowseFilename    string
+	backupBrowseEditingName bool
+
+	autoUpdateEditingTime bool
+	autoUpdateTimeInput   string
+	autoUpdateMsg         string
+
+	// agentReturnView is where Esc from the agentic chat goes back to —
+	// viewShowTable normally (entered via "show model info"), but viewMenu
+	// when autopilot started the chat directly with nothing scanned.
+	agentReturnView view
+
+	// autopilotPhase drives the one-click "install ollama + pull gemma4:e2b
+	// + enable web server" flow: "installing_ollama", "pulling_model",
+	// "enabling_server", "done", or "" before it starts.
+	autopilotPhase string
+	autopilotMsg   string
+	// startupCmd carries the tea.Cmd from an --autopilot-triggered
+	// enterMenu("a") call in initialModel() through to Init(), which is
+	// the only place a Model can actually hand bubbletea an initial Cmd.
+	startupCmd tea.Cmd
+	// logQuery/logSearchMode drive the searchable log viewer: typing '/'
+	// enters search mode, subsequent characters filter, Enter locks the
+	// filter in while returning to normal scroll navigation.
+	logQuery      string
+	logSearchMode bool
 
 	webServerBusy        bool
 	webServerMsg         string
 	webServerAwaitingDL  bool
 	webServerModelList   []string
 	webServerModelCursor int
+	webServerEditingPort bool
+	webServerPortInput   string
 
 	telegramTokenInput string
 	telegramMsg        string
 
-	wizardPendingTelegram bool // chain from wizard: tavily screen's exit routes to telegram next
+	// wizardPendingSetups queues the optional setup screens (tavily,
+	// telegram, email) the wizard's "done" phase chains through in order —
+	// each screen's exit pops the next one instead of going to help menu.
+	// wizardInChain marks that this navigation came from the wizard, so
+	// the LAST screen in the chain goes back to viewMenu (matching a
+	// completed wizard run) instead of viewHelpMenu (a direct, non-wizard
+	// visit to that same settings screen).
+	wizardPendingSetups []view
+	wizardInChain       bool
 
 	downloadConfirm  *catalogRow
 	downloading      bool
@@ -5514,10 +6581,14 @@ type model struct {
 	agentSpinner        int
 	agentStarted        time.Time
 	agentWarmupStarted  time.Time
-	agentScroll         int // lines scrolled back from the bottom; 0 = live/latest
-	agentStreamBuf      string
-	agentViewport       viewport.Model
-	agentVPReady        bool
+	// agentTurnTimes has one entry per completed turn, in order — matched
+	// up to the Nth content-bearing assistant reply when rendering, same
+	// approach as the web UI's turnElapsed.
+	agentTurnTimes []time.Duration
+	agentScroll    int // lines scrolled back from the bottom; 0 = live/latest
+	agentStreamBuf string
+	agentViewport  viewport.Model
+	agentVPReady   bool
 }
 
 func initialModel() model {
@@ -5544,15 +6615,40 @@ func initialModel() model {
 		}
 		startTelegramBot(tgCfg, wd)
 	}
+	// --autopilot reuses the exact same flow as pressing [a] in the main
+	// menu — but only once the disclaimer's actually been accepted; a
+	// first run still needs that gate regardless of the flag.
+	if startupAutopilot && m.view != viewFirstRunDisclaimer {
+		newM, cmd := m.enterMenu("a")
+		m = newM.(model)
+		m.startupCmd = cmd
+	}
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(checkForUpdate(), cubeTickCmd())
+	cmds := []tea.Cmd{checkForUpdate(), cubeTickCmd()}
+	if m.startupCmd != nil {
+		cmds = append(cmds, m.startupCmd)
+	}
+	return tea.Batch(cmds...)
 }
+
+const autopilotModel = "gemma4:e2b"
 
 func (m model) enterMenu(sel string) (tea.Model, tea.Cmd) {
 	switch sel {
+	case "a":
+		m.view = viewAutopilot
+		m.autopilotMsg = ""
+		if !checkOllama().installed {
+			m.autopilotPhase = "installing_ollama"
+			appendLog("autopilot: ollama not installed, opening installer")
+			return m, installOllama()
+		}
+		m.autopilotPhase = "pulling_model"
+		appendLog("autopilot: pulling %s", autopilotModel)
+		return m, pullModelForWebServer(autopilotModel)
 	case "l":
 		appendLog("opened list models")
 		m.catalogCursor = 0
@@ -5684,6 +6780,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case webServerPullDoneMsg:
 		m.webServerBusy = false
+		if m.view == viewAutopilot {
+			if msg.err != "" {
+				m.autopilotPhase = "error"
+				m.autopilotMsg = "model download failed: " + msg.err
+				appendLog("autopilot: model download failed: %s", msg.err)
+				return m, nil
+			}
+			appendLog("autopilot: %s ready", autopilotModel)
+			cfg := loadWebServerConfig()
+			if cfg.Token == "" {
+				cfg.Token = genWebServerToken()
+			}
+			cfg.Enabled = true
+			cfg.Model = autopilotModel
+			if err := saveWebServerConfig(cfg); err != nil {
+				m.autopilotPhase = "error"
+				m.autopilotMsg = "error saving web server config: " + err.Error()
+				return m, nil
+			}
+			wd, err := os.Getwd()
+			if err != nil {
+				wd = "."
+			}
+			if err := startWebServer(cfg, wd); err != nil {
+				m.autopilotPhase = "error"
+				m.autopilotMsg = "failed to start web server: " + err.Error()
+				appendLog("autopilot: web server start failed: %s", err.Error())
+				return m, nil
+			}
+			m.autopilotPhase = "done"
+			m.autopilotMsg = webServerURL(cfg.Token, webServerEffectivePort(cfg))
+			appendLog("autopilot: web server enabled with model %s", autopilotModel)
+			// Drop straight into the TUI's own agentic chat too, instead of
+			// leaving the user on a static "done" screen — autopilot's
+			// whole point is getting to a working chat with zero manual
+			// steps, and the web server alone doesn't give them that here.
+			m.agentModelName = autopilotModel
+			m.agentWorkDir = wd
+			m.agentReturnView = viewMenu
+			m.agentCapabilities = "" // unknown for a freshly pulled model; runAgentTurn falls back if tools aren't supported
+			m.agentToolsSupported = true
+			m.agentToolMode = "auto"
+			m.agentWarmup = "pending"
+			m.agentMessages = []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(wd)}}
+			m.agentInput = ""
+			m.agentErr = ""
+			m.agentBusy = false
+			m.agentStarted = time.Now()
+			m.agentWarmupStarted = time.Now()
+			m.agentTurnTimes = nil
+			m.agentViewport = viewport.New(agentViewportWidth(m.width), agentViewportHeight(m.height))
+			m.agentVPReady = true
+			m.syncAgentViewport()
+			m.view = viewAgentChat
+			appendLog("autopilot: started agentic chat with %s", autopilotModel)
+			return m, tea.Batch(warmupPollTick(m.agentModelName), agentKeepWarmTickCmd())
+		}
 		if msg.err != "" {
 			m.webServerMsg = "download failed: " + msg.err
 			appendLog("web server: gemma4:e2b download failed: %s", msg.err)
@@ -5886,8 +7039,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case emailTestResultMsg:
+		m.emailSending = false
+		if msg.err != "" {
+			m.emailMsg = redStyle.Render("saved, but the test email failed: " + msg.err)
+			appendLog("email: test send failed: %s", msg.err)
+		} else {
+			m.emailMsg = helpKeyStyle.Render("saved — test email sent, check your inbox")
+			appendLog("email: test send succeeded")
+		}
+		m.emailAddrInput = ""
+		m.emailPassInput = ""
+		if msg.err == "" {
+			// A successful save+test drops back to the greyed-out
+			// configured summary — no reason to keep showing raw editable
+			// fields once it's confirmed working.
+			m.emailEditing = false
+		}
+		return m, nil
+
 	case ollamaInstallResultMsg:
 		m.ollamaInstallRunning = false
+		if m.view == viewAutopilot {
+			// Windows/macOS have no scriptable silent installer (see
+			// installOllama) — this only opened the download page. Can't
+			// proceed to the model pull automatically until the user
+			// finishes that install and relaunches.
+			m.autopilotPhase = "waiting_for_manual_install"
+			m.autopilotMsg = strings.TrimSpace(msg.output)
+			if msg.err != "" {
+				m.autopilotMsg = strings.TrimSpace(msg.output + " " + msg.err)
+			}
+			appendLog("autopilot: ollama install step: %s", m.autopilotMsg)
+			return m, nil
+		}
 		if m.view == viewWizard {
 			m.ollama = checkOllama()
 			if msg.err != "" {
@@ -6005,6 +7190,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentTurnDoneMsg:
 		m.agentBusy = false
+		// Only record a time if this turn actually produced a rendered
+		// reply — buildAgentChatLines only advances its own counter for a
+		// content-bearing assistant message, so a timed-but-unrendered
+		// turn (e.g. an error with no reply) would misalign every
+		// subsequent turn's time against the wrong displayed bubble.
+		if lastMsg := lastAssistantContent(msg.messages); lastMsg != "" {
+			m.agentTurnTimes = append(m.agentTurnTimes, time.Since(m.agentStarted))
+		}
 		if msg.err == "" {
 			m.agentWarmup = "ready"
 		}
@@ -6029,6 +7222,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.agentSpinner++
 		return m, agentTickCmd()
+
+	case agentKeepWarmTickMsg:
+		if m.view != viewAgentChat {
+			// Left the chat — don't reschedule, let this loop end
+			// naturally instead of ticking forever in the background.
+			return m, nil
+		}
+		next := agentKeepWarmTickCmd()
+		if m.agentBusy {
+			// Don't run a competing `ollama ps`/`ollama run` against a
+			// turn that's already in flight; just check again next cycle.
+			return m, next
+		}
+		return m, tea.Batch(next, checkAndRewarmModel(m.agentModelName))
+
+	case agentRewarmCheckedMsg:
+		if !msg.wasLoaded {
+			appendLog("keep-warm: %s was unloaded, reloading in the background", msg.modelName)
+		}
+		return m, nil
 
 	case cubeTickMsg:
 		m.cubeAngle += 0.12
@@ -6096,6 +7309,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						m.agentModelName = name
 						m.agentWorkDir = wd
+						m.agentReturnView = viewShowTable
 						m.agentCapabilities = m.scanRows[m.scanCursor].Capabilities
 						// Known-unsupported skips the doomed first request
 						// entirely; unknown ("-", stale/no cache) stays
@@ -6113,12 +7327,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.agentBusy = false
 						m.agentStarted = time.Now()
 						m.agentWarmupStarted = time.Now()
+						m.agentTurnTimes = nil
 						m.agentViewport = viewport.New(agentViewportWidth(m.width), agentViewportHeight(m.height))
 						m.agentVPReady = true
 						m.syncAgentViewport()
 						m.view = viewAgentChat
 						appendLog("started agentic chat with %s", name)
-						return m, tea.Batch(warmupPollOllama(name), agentTickCmd())
+						return m, tea.Batch(warmupPollOllama(name), agentTickCmd(), agentKeepWarmTickCmd())
 					case 1:
 						m.scanBusy = true
 						m.scanBusyLabel = fmt.Sprintf("running %s...", name)
@@ -6250,7 +7465,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "esc":
 				appendLog("exited agentic chat with %s", m.agentModelName)
-				m.view = viewShowTable
+				m.view = m.agentReturnView
 				return m, nil
 			case "enter":
 				text := strings.TrimSpace(m.agentInput)
@@ -6305,10 +7520,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentPasteNotice = ""
 				return m, pasteFromClipboard()
 			default:
-				if len(key) == 1 || key == "space" {
-					if key == "space" {
-						key = " "
-					}
+				if key == "space" {
+					m.agentInput += " "
+				} else if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+					// size == len(key) rules out multi-key names like
+					// "ctrl+c"/"alt+v" (which aren't a single valid rune)
+					// while still accepting any printable Unicode
+					// character, not just single-byte ASCII — otherwise
+					// Hebrew/Arabic/CJK/etc. input gets silently dropped.
 					m.agentInput += key
 				}
 				return m, nil
@@ -6494,6 +7713,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.enterWizard(true)
 				appendLog("first run: disclaimer accepted, opening setup wizard")
 			case "q", "esc", "ctrl+c":
+				clearDisclaimerAccepted()
 				appendLog("quit")
 				return m, tea.Quit
 			}
@@ -6550,6 +7770,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.view = it.dest
 					m.helpScroll = 0
+					if it.dest == viewEmailSettings {
+						m.emailEditing = loadEmailConfig().FromAddress == ""
+					}
 				}
 				appendLog("opened %s", it.label)
 			default:
@@ -6560,6 +7783,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						} else {
 							m.view = it.dest
 							m.helpScroll = 0
+							if it.dest == viewEmailSettings {
+								m.emailEditing = loadEmailConfig().FromAddress == ""
+							}
 						}
 						appendLog("opened %s", it.label)
 					}
@@ -6568,19 +7794,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case viewTavilySettings:
+			if os.Getenv("TAVILY_API_KEY") != "" && !m.tavilyEditing {
+				// Configured summary — only reconfigure/back apply, same
+				// pattern as the email settings screen.
+				switch key {
+				case "ctrl+c":
+					appendLog("quit")
+					return m, tea.Quit
+				case "esc":
+					m = m.advanceWizardChain()
+					m.tavilyKeyMsg = ""
+					return m, nil
+				case "r":
+					m.tavilyEditing = true
+					m.tavilyKeyInput = ""
+					m.tavilyKeyMsg = ""
+					appendLog("tavily: reconfiguring")
+				}
+				return m, nil
+			}
 			switch key {
 			case "ctrl+c":
 				appendLog("quit")
 				return m, tea.Quit
 			case "esc":
-				if m.wizardPendingTelegram {
-					m.wizardPendingTelegram = false
-					m.view = viewTelegramSettings
-				} else {
-					m.view = viewHelpMenu
-				}
+				m = m.advanceWizardChain()
 				m.tavilyKeyInput = ""
 				m.tavilyKeyMsg = ""
+				m.tavilyEditing = false
 				return m, nil
 			case "enter":
 				trimmed := strings.TrimSpace(m.tavilyKeyInput)
@@ -6596,9 +7837,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tavilyKeyMsg = "saved — tavily_search/tavily_extract are ready to use"
 				appendLog("tavily API key saved")
 				m.tavilyKeyInput = ""
-				if m.wizardPendingTelegram {
-					m.wizardPendingTelegram = false
-					m.view = viewTelegramSettings
+				m.tavilyEditing = false
+				if len(m.wizardPendingSetups) > 0 {
+					m = m.advanceWizardChain()
 				}
 				return m, nil
 			case "backspace":
@@ -6642,14 +7883,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case viewTelegramSettings:
+			if loadTelegramConfig().Token != "" && !m.telegramEditing {
+				switch key {
+				case "ctrl+c":
+					appendLog("quit")
+					return m, tea.Quit
+				case "esc":
+					m = m.advanceWizardChain()
+					m.telegramMsg = ""
+					return m, nil
+				case "r":
+					m.telegramEditing = true
+					m.telegramTokenInput = ""
+					m.telegramMsg = ""
+					appendLog("telegram: reconfiguring")
+				}
+				return m, nil
+			}
 			switch key {
 			case "ctrl+c":
 				appendLog("quit")
 				return m, tea.Quit
 			case "esc":
-				m.view = viewHelpMenu
+				m = m.advanceWizardChain()
 				m.telegramTokenInput = ""
 				m.telegramMsg = ""
+				m.telegramEditing = false
 				return m, nil
 			case "enter":
 				trimmed := strings.TrimSpace(m.telegramTokenInput)
@@ -6660,6 +7919,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					_ = saveTelegramConfig(cfg)
 					m.telegramMsg = "disabled"
 					m.telegramTokenInput = ""
+					m.telegramEditing = false
 					return m, nil
 				}
 				names, err := listInstalledModelNames()
@@ -6685,7 +7945,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				startTelegramBot(cfg, wd)
 				m.telegramMsg = "saved — bot is running, model " + model + ". Message it on Telegram to bind this chat."
 				m.telegramTokenInput = ""
+				m.telegramEditing = false
 				appendLog("telegram bot token saved")
+				if len(m.wizardPendingSetups) > 0 {
+					m = m.advanceWizardChain()
+				}
 				return m, nil
 			case "backspace":
 				if len(m.telegramTokenInput) > 0 {
@@ -6722,6 +7986,217 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case viewEmailSettings:
+			if m.emailSending {
+				return m, nil
+			}
+			if loadEmailConfig().FromAddress != "" && !m.emailEditing {
+				// Configured summary screen — only reconfigure/back apply,
+				// there are no live fields to Tab between here.
+				switch key {
+				case "ctrl+c":
+					appendLog("quit")
+					return m, tea.Quit
+				case "esc":
+					m = m.advanceWizardChain()
+					m.emailMsg = ""
+					return m, nil
+				case "r":
+					cfg := loadEmailConfig()
+					m.emailEditing = true
+					// Address and display name usually don't change on a
+					// reconfigure (only the app password typically does,
+					// e.g. after revoking/regenerating it) — pre-fill those
+					// two so the user isn't forced to retype them.
+					m.emailAddrInput = cfg.FromAddress
+					m.emailDisplayNameInput = cfg.DisplayName
+					m.emailPassInput = ""
+					m.emailFieldFocus = 2
+					m.emailMsg = ""
+					appendLog("email: reconfiguring")
+				}
+				return m, nil
+			}
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				m = m.advanceWizardChain()
+				m.emailAddrInput = ""
+				m.emailDisplayNameInput = ""
+				m.emailPassInput = ""
+				m.emailMsg = ""
+				m.emailFieldFocus = 0
+				m.emailEditing = false
+				return m, nil
+			case "tab", "down":
+				m.emailFieldFocus = (m.emailFieldFocus + 1) % 3
+				return m, nil
+			case "up":
+				m.emailFieldFocus = (m.emailFieldFocus + 2) % 3
+				return m, nil
+			case "enter":
+				// Enter just advances through address -> display name ->
+				// password like Tab, rather than trying to submit from an
+				// earlier field — only the last field (password) submits.
+				if m.emailFieldFocus < 2 {
+					m.emailFieldFocus++
+					return m, nil
+				}
+				addr := strings.TrimSpace(m.emailAddrInput)
+				displayName := strings.TrimSpace(m.emailDisplayNameInput)
+				pass := strings.ReplaceAll(strings.TrimSpace(m.emailPassInput), " ", "")
+				if addr == "" || pass == "" {
+					m.emailMsg = "both the Gmail address and the app password are required"
+					return m, nil
+				}
+				cfg := emailConfig{FromAddress: addr, AppPassword: pass, DisplayName: displayName}
+				if err := saveEmailConfig(cfg); err != nil {
+					m.emailMsg = "error saving config: " + err.Error()
+					return m, nil
+				}
+				appendLog("email: config saved for %s, sending test email", addr)
+				m.emailSending = true
+				m.emailMsg = ""
+				return m, sendTestEmail(cfg)
+			case "backspace":
+				switch m.emailFieldFocus {
+				case 0:
+					if len(m.emailAddrInput) > 0 {
+						m.emailAddrInput = m.emailAddrInput[:len(m.emailAddrInput)-1]
+					}
+				case 1:
+					if len(m.emailDisplayNameInput) > 0 {
+						m.emailDisplayNameInput = m.emailDisplayNameInput[:len(m.emailDisplayNameInput)-1]
+					}
+				default:
+					if len(m.emailPassInput) > 0 {
+						m.emailPassInput = m.emailPassInput[:len(m.emailPassInput)-1]
+					}
+				}
+				return m, nil
+			default:
+				if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+					switch m.emailFieldFocus {
+					case 0:
+						m.emailAddrInput += key
+					case 1:
+						m.emailDisplayNameInput += key
+					default:
+						m.emailPassInput += key
+					}
+				}
+				return m, nil
+			}
+
+		case viewBackupSettings:
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				m.view = viewHelpMenu
+				m.backupMode = ""
+				m.backupMsg = ""
+				return m, nil
+			case "e":
+				m = m.enterBackupBrowser("export")
+			case "i":
+				m = m.enterBackupBrowser("import")
+			}
+			return m, nil
+
+		case viewBackupBrowser:
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				m.view = viewBackupSettings
+				return m, nil
+			case "up":
+				if m.backupBrowseEditingName {
+					m.backupBrowseEditingName = false
+					return m, nil
+				}
+				if m.backupBrowseCursor > 0 {
+					m.backupBrowseCursor--
+				}
+				return m, nil
+			case "down":
+				if m.backupBrowseEditingName {
+					return m, nil
+				}
+				if m.backupBrowseCursor < len(m.backupBrowseEntries)-1 {
+					m.backupBrowseCursor++
+				}
+				return m, nil
+			case "tab":
+				// Export mode only — toggle focus between the directory
+				// list and the destination filename field.
+				if m.backupMode == "export" {
+					m.backupBrowseEditingName = !m.backupBrowseEditingName
+				}
+				return m, nil
+			case "enter":
+				if m.backupBrowseEditingName {
+					return m.confirmBackupExport()
+				}
+				if len(m.backupBrowseEntries) == 0 {
+					return m, nil
+				}
+				sel := m.backupBrowseEntries[m.backupBrowseCursor]
+				if sel.isDir {
+					var next string
+					if sel.name == ".." {
+						next = filepath.Dir(m.backupBrowseDir)
+					} else {
+						next = filepath.Join(m.backupBrowseDir, sel.name)
+					}
+					m.backupBrowseDir = next
+					m.backupBrowseCursor = 0
+					entries, err := listDirEntries(next)
+					if err != nil {
+						m.backupMsg = redStyle.Render("can't open " + next + ": " + err.Error())
+						m.view = viewBackupSettings
+						return m, nil
+					}
+					m.backupBrowseEntries = entries
+					return m, nil
+				}
+				// Selected an existing .lsb file.
+				if m.backupMode == "export" {
+					m.backupBrowseFilename = sel.name
+					m.backupBrowseEditingName = true
+					return m, nil
+				}
+				return m.confirmBackupImport(filepath.Join(m.backupBrowseDir, sel.name))
+			case "backspace":
+				if m.backupBrowseEditingName && len(m.backupBrowseFilename) > 0 {
+					m.backupBrowseFilename = m.backupBrowseFilename[:len(m.backupBrowseFilename)-1]
+				}
+				return m, nil
+			default:
+				if m.backupBrowseEditingName {
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+						m.backupBrowseFilename += key
+					}
+				}
+				return m, nil
+			}
+
+		case viewAutopilot:
+			if key == "ctrl+c" {
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			if key == "esc" {
+				m.view = viewMenu
+				return m, nil
+			}
+			return m, nil
+
 		case viewWebServerSettings:
 			if key == "ctrl+c" {
 				appendLog("quit")
@@ -6743,6 +8218,53 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.webServerBusy {
 				return m, nil // busy downloading — ignore keys except ctrl+c above
+			}
+			if m.webServerEditingPort {
+				switch key {
+				case "esc":
+					m.webServerEditingPort = false
+					m.webServerPortInput = ""
+				case "enter":
+					port, err := strconv.Atoi(strings.TrimSpace(m.webServerPortInput))
+					if err != nil || port < 1 || port > 65535 {
+						m.webServerMsg = "invalid port — enter a number 1-65535"
+					} else {
+						cfg := loadWebServerConfig()
+						cfg.Port = port
+						if err := saveWebServerConfig(cfg); err != nil {
+							m.webServerMsg = "error saving config: " + err.Error()
+						} else {
+							appendLog("web server: port set to %d", port)
+							m.webServerMsg = fmt.Sprintf("saved — port %d takes effect next time the server (re)starts", port)
+							// Apply immediately if it's already running,
+							// rather than leaving the change silently
+							// pending until the next manual restart.
+							if isWebServerRunning() {
+								stopWebServer()
+								wd, werr := os.Getwd()
+								if werr != nil {
+									wd = "."
+								}
+								if serr := startWebServer(cfg, wd); serr != nil {
+									m.webServerMsg = "saved, but restart on the new port failed: " + serr.Error()
+								} else {
+									m.webServerMsg = fmt.Sprintf("saved — now running on port %d", port)
+								}
+							}
+						}
+					}
+					m.webServerEditingPort = false
+					m.webServerPortInput = ""
+				case "backspace":
+					if len(m.webServerPortInput) > 0 {
+						m.webServerPortInput = m.webServerPortInput[:len(m.webServerPortInput)-1]
+					}
+				default:
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsDigit(r) {
+						m.webServerPortInput += key
+					}
+				}
+				return m, nil
 			}
 			switch key {
 			case "esc":
@@ -6775,6 +8297,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.webServerMsg = "disabled"
 				}
 				appendLog("web server disabled")
+				return m, nil
+			case "p":
+				m.webServerEditingPort = true
+				m.webServerPortInput = strconv.Itoa(webServerEffectivePort(loadWebServerConfig()))
+				m.webServerMsg = ""
 				return m, nil
 			}
 			return m, nil
@@ -6845,6 +8372,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.wizardAnswers[q.id] = true
 				case "n":
 					m.wizardAnswers[q.id] = false
+					if q.id == "disclaimer" {
+						// Declining the disclaimer means the user doesn't
+						// accept using this app at all — continuing to any
+						// other screen would look like the decline didn't
+						// matter, so quit immediately instead. Also clear
+						// any existing acceptance marker from an earlier
+						// session — otherwise a decline here after a past
+						// accept would silently do nothing.
+						clearDisclaimerAccepted()
+						appendLog("disclaimer declined — quitting")
+						return m, tea.Quit
+					}
 				default:
 					return m, nil
 				}
@@ -6878,19 +8417,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "done":
+				var queue []view
 				if m.wizardAnswers["tavily"] {
-					m.wizardAnswers["tavily"] = false // consume so the next keypress here goes to the menu, not a loop
-					if m.wizardAnswers["telegram"] {
-						m.wizardPendingTelegram = true // chain: tavily screen's exit routes to telegram next
-					}
-					m.view = viewTavilySettings
-					appendLog("wizard: opening tavily key setup")
-					return m, nil
+					queue = append(queue, viewTavilySettings)
 				}
 				if m.wizardAnswers["telegram"] {
-					m.wizardAnswers["telegram"] = false
-					m.view = viewTelegramSettings
-					appendLog("wizard: opening telegram bot setup")
+					queue = append(queue, viewTelegramSettings)
+				}
+				if m.wizardAnswers["email"] {
+					queue = append(queue, viewEmailSettings)
+				}
+				// Consume all three now — otherwise revisiting this "done"
+				// screen later (e.g. after the chain finishes and the user
+				// somehow lands back here) would rebuild the same queue.
+				m.wizardAnswers["tavily"] = false
+				m.wizardAnswers["telegram"] = false
+				m.wizardAnswers["email"] = false
+				if len(queue) > 0 {
+					m.view = queue[0]
+					m.wizardPendingSetups = queue[1:]
+					m.wizardInChain = true
+					if queue[0] == viewEmailSettings {
+						m.emailEditing = loadEmailConfig().FromAddress == ""
+					}
+					appendLog("wizard: opening %s setup", helpMenuLabelForView(queue[0]))
 					return m, nil
 				}
 				m.view = viewMenu
@@ -6899,7 +8449,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case viewHelpText, viewDisclaimerText, viewLogText:
+		case viewHelpText, viewDisclaimerText:
 			switch key {
 			case "ctrl+c":
 				appendLog("quit")
@@ -6924,6 +8474,61 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampHelpScroll()
 			return m, nil
 
+		case viewLogText:
+			if m.logSearchMode {
+				switch key {
+				case "ctrl+c":
+					appendLog("quit")
+					return m, tea.Quit
+				case "esc":
+					m.logSearchMode = false
+					m.logQuery = ""
+				case "enter":
+					m.logSearchMode = false
+				case "backspace":
+					if len(m.logQuery) > 0 {
+						m.logQuery = m.logQuery[:len(m.logQuery)-1]
+					}
+				default:
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+						m.logQuery += key
+					}
+				}
+				m.helpScroll = 0
+				m.clampHelpScroll()
+				return m, nil
+			}
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				if m.logQuery != "" {
+					m.logQuery = ""
+					m.helpScroll = 0
+				} else {
+					m.view = viewHelpMenu
+					m.helpScroll = 0
+				}
+				return m, nil
+			case "/":
+				m.logSearchMode = true
+			case "up", "k":
+				m.helpScroll--
+			case "down", "j":
+				m.helpScroll++
+			case "pgup":
+				m.helpScroll -= helpPageLines(m.height)
+			case "pgdown":
+				m.helpScroll += helpPageLines(m.height)
+			case "home":
+				m.helpScroll = 0
+			case "end":
+				m.helpScroll = 1 << 30 // clamped below
+			}
+			m.clampHelpScroll()
+			return m, nil
+
 		case viewUpdateText:
 			if m.updateDownloading {
 				return m, nil
@@ -6931,6 +8536,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key == "ctrl+c" {
 				appendLog("quit")
 				return m, tea.Quit
+			}
+			if m.autoUpdateEditingTime {
+				switch key {
+				case "esc":
+					m.autoUpdateEditingTime = false
+					m.autoUpdateTimeInput = ""
+				case "enter":
+					hour, minute, ok := parseHHMM(m.autoUpdateTimeInput)
+					if !ok {
+						m.autoUpdateMsg = "invalid time — use 24h HH:MM, e.g. 03:00 or 22:30"
+					} else {
+						cfg := loadAutoUpdateConfig()
+						cfg.Hour, cfg.Minute = hour, minute
+						_ = saveAutoUpdateConfig(cfg)
+						appendLog("auto-update: check time set to %02d:%02d", hour, minute)
+						m.autoUpdateMsg = fmt.Sprintf("saved — will check daily at %02d:%02d", hour, minute)
+					}
+					m.autoUpdateEditingTime = false
+					m.autoUpdateTimeInput = ""
+				case "backspace":
+					if len(m.autoUpdateTimeInput) > 0 {
+						m.autoUpdateTimeInput = m.autoUpdateTimeInput[:len(m.autoUpdateTimeInput)-1]
+					}
+				default:
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+						m.autoUpdateTimeInput += key
+					}
+				}
+				return m, nil
 			}
 			if m.updateResult != "" || m.updateResultErr != "" {
 				m.updateResult = ""
@@ -6941,6 +8575,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "esc":
 				m.view = viewHelpMenu
+				m.autoUpdateMsg = ""
 				return m, nil
 			case "u", "enter":
 				if m.updateAvailable && m.updateAssetURL != "" {
@@ -6956,6 +8591,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateCheckErr = ""
 				appendLog("re-checking for update")
 				return m, checkForUpdate()
+			case "e":
+				cfg := loadAutoUpdateConfig()
+				cfg.Enabled = true
+				_ = saveAutoUpdateConfig(cfg)
+				appendLog("auto-update: enabled")
+				m.autoUpdateMsg = "auto-update enabled"
+			case "d":
+				cfg := loadAutoUpdateConfig()
+				cfg.Enabled = false
+				_ = saveAutoUpdateConfig(cfg)
+				appendLog("auto-update: disabled")
+				m.autoUpdateMsg = "auto-update disabled"
+			case "t":
+				m.autoUpdateEditingTime = true
+				m.autoUpdateTimeInput = ""
+				m.autoUpdateMsg = ""
 			}
 			return m, nil
 
@@ -7260,13 +8911,19 @@ func (m *model) clampHelpScroll() {
 	case viewDisclaimerText:
 		content = renderDisclaimerText()
 	case viewLogText:
-		content = renderLogText()
+		content = m.renderLogText()
 	case viewToolCategories:
 		content, _ = m.renderToolCategories()
 	case viewTavilySettings:
 		content = m.renderTavilySettings()
 	case viewTelegramSettings:
 		content = m.renderTelegramSettings()
+	case viewEmailSettings:
+		content = m.renderEmailSettings()
+	case viewBackupSettings:
+		content = m.renderBackupSettings()
+	case viewBackupBrowser:
+		content = m.renderBackupBrowser()
 	default:
 		return
 	}
@@ -7378,9 +9035,36 @@ func footerVisibleWidth(s string) int {
 
 func (m model) renderFooter() string {
 	const footerBG = "#3A3A66"
+	if m.view == viewLogText {
+		// The footer is the one row that's reliably visible no matter what
+		// (it's the last thing drawn each frame) — put the search
+		// indicator here too, not just at the top of the scrollable body,
+		// so it can't get scrolled out of view on a terminal whose real
+		// row count doesn't match what bubbletea thinks it is.
+		greenBold := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG))
+		plainFooter := lipgloss.NewStyle().Foreground(lipgloss.Color("#AAAAAA")).Background(lipgloss.Color(footerBG))
+		var queryRendered string
+		if m.logSearchMode {
+			queryRendered = plainFooter.Render(m.logQuery + "█")
+		} else if m.logQuery == "" {
+			// Blink the placeholder — a static hint blends into the rest
+			// of the dim footer text and is easy to miss entirely.
+			queryRendered = plainFooter.Bold(true).Blink(true).Render("(press / to type)")
+		} else {
+			queryRendered = plainFooter.Render(m.logQuery)
+		}
+		line := plainFooter.Render(" ") + greenBold.Render("Search") + plainFooter.Render(": ") + queryRendered
+		pad := m.width - footerVisibleWidth(line)
+		if pad < 0 {
+			pad = 0
+		}
+		return line + plainFooter.Render(strings.Repeat(" ", pad))
+	}
 	status := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("ollama: not installed")
 	if m.ollama.installed {
-		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG)).Render("ollama✓")
+		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG)).Render(
+			fmt.Sprintf("ollama✓ %s", m.ollama.version),
+		)
 	}
 	if m.updateAvailable {
 		updateFlag := lipgloss.NewStyle().Bold(true).Blink(true).Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("update")
@@ -7393,7 +9077,7 @@ func (m model) renderFooter() string {
 	switch {
 	case isWebServerRunning():
 		cfg := loadWebServerConfig()
-		webURL := webServerURL(cfg.Token)
+		webURL := webServerURL(cfg.Token, webServerEffectivePort(cfg))
 		linkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Underline(true)
 		// OSC 8 hyperlink so clicking "web: running" opens the server URL —
 		// lipgloss.Width() doesn't understand this escape, so any width math
@@ -7433,6 +9117,11 @@ func (m model) renderFooter() string {
 		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Background(lipgloss.Color(footerBG)).Render("tavily off")
 	}
 	status = tavilyFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
+
+	if loadEmailConfig().FromAddress != "" {
+		mailFlag := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("mail✓")
+		status = mailFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
+	}
 
 	// Every fragment placed on the footer line — including plain filler
 	// spaces — must carry its own Background explicitly. Each styled
@@ -7550,7 +9239,10 @@ func styleHelpLines(text string) string {
 // cityCols/cityRows size the skyline banner's character grid; kept in the
 // same rough footprint as the old rotating-shapes banner (9 lines tall) so
 // swapping it in doesn't change the main menu's vertical layout.
-const cityCols = 58
+// cityCols is mutable (not const) — it tracks the terminal's actual width
+// so the skyline spans the full banner instead of a fixed narrow strip.
+var cityCols = 58
+
 const cityRows = 8
 
 var cityTexChars = []byte{'#', '@', '%', '&', '+', '$'}
@@ -7565,92 +9257,182 @@ type cityBuilding struct {
 // picked at random every time the skyline regenerates, purely cosmetic
 // labeling, not tied to the generated silhouette in any way.
 var cityNames = []string{
-	"Abidjan", "Abu Dhabi", "Abuja", "Accra", "Addis Ababa", "Adelaide", "Algiers", "Almaty",
-	"Amman", "Amsterdam", "Ankara", "Antananarivo", "Antwerp", "Ashgabat", "Asmara", "Astana",
-	"Asunción", "Athens", "Atlanta", "Auckland", "Baghdad", "Baku", "Bamako", "Bandar Seri Begawan",
-	"Bangalore", "Bangkok", "Bangui", "Banjul", "Barcelona", "Basel", "Basra", "Beijing",
-	"Beirut", "Belgrade", "Belfast", "Belmopan", "Berlin", "Bern", "Bhopal", "Bilbao",
-	"Birmingham", "Bishkek", "Bissau", "Bogotá", "Boise", "Bologna", "Bonn", "Bordeaux",
-	"Boston", "Brasília", "Bratislava", "Brazzaville", "Bridgetown", "Brisbane", "Bristol", "Brussels",
-	"Bucharest", "Budapest", "Buenos Aires", "Bujumbura", "Busan", "Cairo", "Calgary", "Cali",
-	"Canberra", "Cape Town", "Caracas", "Cardiff", "Casablanca", "Castries", "Cebu City", "Chandigarh",
-	"Chengdu", "Chennai", "Chicago", "Chihuahua", "Chisinau", "Chittagong", "Christchurch", "Cluj-Napoca",
-	"Cologne", "Colombo", "Conakry", "Copenhagen", "Cordoba", "Curitiba", "Dakar", "Dallas",
-	"Damascus", "Da Nang", "Dar es Salaam", "Denver", "Detroit", "Dhaka", "Dijon", "Dili",
-	"Djibouti", "Doha", "Dodoma", "Doncaster", "Dortmund", "Dresden", "Dubai", "Dublin",
-	"Dushanbe", "Düsseldorf", "Edinburgh", "Edmonton", "Erbil", "Faisalabad", "Florence", "Fortaleza",
-	"Frankfurt", "Freetown", "Fresno", "Fukuoka", "Funafuti", "Gaborone", "Gaziantep", "Geneva",
-	"Genoa", "Georgetown", "Gothenburg", "Guadalajara", "Guangzhou", "Guatemala City", "Guayaquil", "Hague, The",
-	"Hamburg", "Hangzhou", "Hanoi", "Harare", "Harbin", "Havana", "Helsinki", "Ho Chi Minh City",
-	"Hobart", "Honiara", "Honolulu", "Houston", "Hyderabad", "Ibadan", "Incheon", "Indianapolis",
-	"Islamabad", "Istanbul", "Jaipur", "Jakarta", "Jeddah", "Jerusalem", "Johannesburg", "Juba",
-	"Kabul", "Kampala", "Kano", "Kansas City", "Karachi", "Kathmandu", "Kaunas", "Kigali",
-	"Kingston", "Kingstown", "Kinshasa", "Kobe", "Kolkata", "Krakow", "Kuala Lumpur", "Kuching",
-	"Kuwait City", "Kyiv", "Kyoto", "La Paz", "Lagos", "Lahore", "Las Vegas", "Leeds",
-	"Leipzig", "Libreville", "Lilongwe", "Lima", "Lisbon", "Ljubljana", "Lomé", "London",
-	"Los Angeles", "Luanda", "Lubumbashi", "Lucknow", "Lusaka", "Luxembourg City", "Lyon", "Macau",
-	"Madrid", "Majuro", "Malabo", "Malé", "Managua", "Manama", "Manaus", "Manchester",
-	"Manila", "Maputo", "Marrakesh", "Marseille", "Maseru", "Mbabane", "Medellín", "Melbourne",
-	"Memphis", "Mexico City", "Miami", "Milan", "Minsk", "Mogadishu", "Monaco", "Monrovia",
-	"Monterrey", "Montevideo", "Montreal", "Moroni", "Moscow", "Mumbai", "Munich", "Muscat",
-	"Nagoya", "Nairobi", "Nanjing", "Naples", "Nassau", "N'Djamena", "New Delhi", "New Orleans",
-	"New York City", "Niamey", "Nicosia", "Nouakchott", "Nur-Sultan", "Nuremberg", "Oklahoma City", "Omaha",
-	"Osaka", "Oslo", "Ottawa", "Ouagadougou", "Palikir", "Panama City", "Paramaribo", "Paris",
-	"Perth", "Phnom Penh", "Phoenix", "Podgorica", "Port-au-Prince", "Port Louis", "Port Moresby", "Port of Spain",
-	"Port Vila", "Porto", "Porto Alegre", "Portland", "Poznań", "Prague", "Praia", "Pretoria",
-	"Pristina", "Pusan", "Pyongyang", "Quebec City", "Quito", "Rabat", "Raleigh", "Ramallah",
-	"Recife", "Reykjavik", "Riga", "Rio de Janeiro", "Riyadh", "Rome", "Rosario", "Rotterdam",
-	"Sacramento", "Saint-Denis", "Salt Lake City", "Salvador", "Samara", "San Antonio", "San Diego", "San José",
-	"San Juan", "San Marino", "San Salvador", "Sana'a", "Santiago", "Santo Domingo", "São Paulo", "Sapporo",
-	"Sarajevo", "Seattle", "Seoul", "Sevilla", "Shanghai", "Shenzhen", "Singapore", "Skopje",
-	"Sofia", "Split", "St. Louis", "St. Petersburg", "Stockholm", "Strasbourg", "Stuttgart", "Suva",
-	"Suzhou", "Sydney", "Taipei", "Tallinn", "Tashkent", "Tbilisi", "Tegucigalpa", "Tehran",
-	"Tel Aviv", "Thimphu", "Tianjin", "Tijuana", "Tirana", "Tokyo", "Toronto", "Toulouse",
-	"Tripoli", "Tunis", "Turin", "Ulaanbaatar", "Utrecht", "Vaduz", "Valencia", "Valletta",
-	"Vancouver", "Vatican City", "Venice", "Victoria", "Vienna", "Vientiane", "Vilnius", "Warsaw",
-	"Washington DC", "Wellington", "Winnipeg", "Wuhan", "Xi'an", "Yamoussoukro", "Yangon", "Yaoundé",
-	"Yekaterinburg", "Yerevan", "Yokohama", "Zagreb", "Zürich", "Aarhus", "Aberdeen", "Adana",
-	"Agra", "Ahmedabad", "Akron", "Albany", "Albuquerque", "Alexandria", "Amritsar", "Anaheim",
-	"Ankara", "Ann Arbor", "Antalya", "Antioch", "Arequipa", "Arlington", "Aruba", "Astana",
-	"Athens (Georgia)", "Augsburg", "Aurora", "Austin", "Bahia Blanca", "Baku", "Balikpapan", "Baltimore",
-	"Bamberg", "Bandung", "Bataan", "Bath", "Baton Rouge", "Bedford", "Belém", "Belgorod",
-	"Bendigo", "Bergen", "Bexley", "Bhubaneswar", "Białystok", "Blackpool", "Bloemfontein", "Bolton",
-	"Bordertown", "Bradford", "Braga", "Brampton", "Brighton", "Brno", "Buffalo", "Burgas",
-	"Bydgoszcz", "Cagliari", "Cairns", "Calabar", "Calgary East", "Cambridge", "Campinas", "Cancún",
-	"Canterbury", "Cape Coral", "Cartagena", "Catania", "Cebu", "Charleston", "Charlotte", "Chattanooga",
-	"Cherbourg", "Chiba", "Chico", "Cincinnati", "Ciudad Juárez", "Cleveland", "Coimbra", "Colombo (Sri Lanka)",
-	"Columbus", "Constanța", "Coventry", "Coyoacán", "Cuiabá", "Culiacán", "Cuzco", "Dammam",
-	"Davao City", "Dayton", "Debrecen", "Delft", "Derby", "Des Moines", "Dnipro", "Donetsk",
-	"Durban", "Durham", "East London", "Eindhoven", "El Paso", "Erie", "Essen", "Exeter",
-	"Fez", "Florianópolis", "Fort Worth", "Fukushima", "Gdańsk", "Gdynia", "Gent", "Gijón",
-	"Glasgow", "Goiânia", "Gold Coast", "Graz", "Grenoble", "Guadalupe", "Gwangju", "Halifax",
-	"Hamilton", "Hangzhou West", "Hartford", "Heraklion", "Hermosillo", "Hiroshima", "Hobart Town", "Hokkaido",
-	"Holguín", "Iasi", "Ibiza Town", "Indore", "Inverness", "Iquitos", "Ipoh", "Irkutsk",
-	"Izmir", "Jacksonville", "Jerez de la Frontera", "Jinan", "João Pessoa", "Johor Bahru", "Jönköping", "Kaliningrad",
-	"Kanazawa", "Kanpur", "Katowice", "Kazan", "Kelowna", "Kemerovo", "Khabarovsk", "Kharkiv",
-	"Kingston upon Hull", "Kirov", "Kitakyushu", "Klagenfurt", "Kobenhavn", "Kochi", "Košice", "Kraków",
-	"Kumamoto", "Kunming", "La Coruña", "Lausanne", "Le Havre", "León", "Liège", "Lille",
-	"Limoges", "Linz", "Little Rock", "Liverpool", "Łódź", "Louisville", "Lviv", "Maastricht",
-	"Makassar", "Malaga", "Mandalay", "Mannheim", "Maracaibo", "Mar del Plata", "Matsuyama", "Medan",
-	"Mérida", "Messina", "Milwaukee", "Minneapolis", "Mombasa", "Montpellier", "Montreux", "Mysore",
-	"Nagano", "Nagasaki", "Nairobi West", "Nanaimo", "Nancy", "Nanning", "Nantes", "Nashville",
-	"Newcastle", "Niigata", "Nizhny Novgorod", "Northampton", "Norwich", "Novosibirsk", "Nur City", "Oaxaca",
-	"Odense", "Odesa", "Okayama", "Omdurman", "Ontario", "Orenburg", "Orlando", "Oshawa",
-	"Oulu", "Padua", "Palembang", "Palermo", "Pamplona", "Panama", "Pärnu", "Peoria",
-	"Perm", "Perpignan", "Philadelphia", "Pittsburgh", "Plymouth", "Poitiers", "Ponce", "Portsmouth",
-	"Poznan", "Puebla", "Pune", "Querétaro", "Quezon City", "Regina", "Reims", "Rennes",
-	"Richmond", "Rochester", "Rostock", "Rostov-on-Don", "Rotterdam West", "Sacramento North", "Saitama", "Salamanca",
-	"Salzburg", "San Bernardino", "San Luis Potosí", "Sankt Pölten", "Santa Cruz", "Santa Fe", "Santander", "Saratov",
-	"Saskatoon", "Semarang", "Sendai", "Sheffield", "Shizuoka", "Sibiu", "Sochi", "Southampton",
-	"Split (Croatia)", "St. John's", "Stavanger", "Stavropol", "Stoke-on-Trent", "Sucre", "Surabaya", "Surat",
-	"Sverdlovsk", "Szczecin", "Tacoma", "Tainan", "Taichung", "Tallahassee", "Tampa", "Tampere",
-	"Tangier", "Tarragona", "Thessaloniki", "Tijuana North", "Timişoara", "Toledo", "Tomsk", "Torreón",
-	"Toulon", "Townsville", "Trieste", "Trois-Rivières", "Trondheim", "Tucson", "Tulsa", "Turku",
-	"Ufa", "Umeå", "Valdivia", "Valparaíso", "Varna", "Vaasa", "Verona", "Veracruz",
-	"Vigo", "Villahermosa", "Vitoria-Gasteiz", "Vladivostok", "Volgograd", "Wakayama", "Waterloo", "Wichita",
-	"Wiesbaden", "Windhoek", "Windsor", "Winston-Salem", "Wolverhampton", "Worcester", "Wrocław", "Wuppertal",
-	"Wuxi", "Xiamen", "Yangzhou", "Yaroslavl", "Yokosuka", "York", "Yueyang", "Zadar",
-	"Zaragoza", "Zhengzhou", "Zibo", "Zonguldak",
+	"Abidjan (Ivory Coast)", "Abu Dhabi (UAE)", "Abuja (Nigeria)", "Accra (Ghana)", "Addis Ababa (Ethiopia)", "Adelaide (Australia)", "Algiers (Algeria)", "Almaty (Kazakhstan)",
+	"Amman (Jordan)", "Amsterdam (Netherlands)", "Ankara (Turkey)", "Antananarivo (Madagascar)", "Antwerp (Belgium)", "Ashgabat (Turkmenistan)", "Asmara (Eritrea)", "Astana (Kazakhstan)",
+	"Asunción (Paraguay)", "Athens (Greece)", "Atlanta (USA)", "Auckland (New Zealand)", "Baghdad (Iraq)", "Baku (Azerbaijan)", "Bamako (Mali)", "Bandar Seri Begawan (Brunei)",
+	"Bangalore (India)", "Bangkok (Thailand)", "Bangui (Central African Republic)", "Banjul (Gambia)", "Barcelona (Spain)", "Basel (Switzerland)", "Basra (Iraq)", "Beijing (China)",
+	"Beirut (Lebanon)", "Belgrade (Serbia)", "Belfast (Northern Ireland)", "Belmopan (Belize)", "Berlin (Germany)", "Bern (Switzerland)", "Bhopal (India)", "Bilbao (Spain)",
+	"Birmingham (England)", "Bishkek (Kyrgyzstan)", "Bissau (Guinea-Bissau)", "Bogotá (Colombia)", "Boise (USA)", "Bologna (Italy)", "Bonn (Germany)", "Bordeaux (France)",
+	"Boston (USA)", "Brasília (Brazil)", "Bratislava (Slovakia)", "Brazzaville (Congo)", "Bridgetown (Barbados)", "Brisbane (Australia)", "Bristol (England)", "Brussels (Belgium)",
+	"Bucharest (Romania)", "Budapest (Hungary)", "Buenos Aires (Argentina)", "Bujumbura (Burundi)", "Busan (South Korea)", "Cairo (Egypt)", "Calgary (Canada)", "Cali (Colombia)",
+	"Canberra (Australia)", "Cape Town (South Africa)", "Caracas (Venezuela)", "Cardiff (Wales)", "Casablanca (Morocco)", "Castries (Saint Lucia)", "Cebu City (Philippines)", "Chandigarh (India)",
+	"Chengdu (China)", "Chennai (India)", "Chicago (USA)", "Chihuahua (Mexico)", "Chisinau (Moldova)", "Chittagong (Bangladesh)", "Christchurch (New Zealand)", "Cluj-Napoca (Romania)",
+	"Cologne (Germany)", "Colombo (Sri Lanka)", "Conakry (Guinea)", "Copenhagen (Denmark)", "Cordoba (Argentina)", "Curitiba (Brazil)", "Dakar (Senegal)", "Dallas (USA)",
+	"Damascus (Syria)", "Da Nang (Vietnam)", "Dar es Salaam (Tanzania)", "Denver (USA)", "Detroit (USA)", "Dhaka (Bangladesh)", "Dijon (France)", "Dili (Timor-Leste)",
+	"Djibouti (Djibouti)", "Doha (Qatar)", "Dodoma (Tanzania)", "Doncaster (England)", "Dortmund (Germany)", "Dresden (Germany)", "Dubai (UAE)", "Dublin (Ireland)",
+	"Dushanbe (Tajikistan)", "Düsseldorf (Germany)", "Edinburgh (Scotland)", "Edmonton (Canada)", "Erbil (Iraq)", "Faisalabad (Pakistan)", "Florence (Italy)", "Fortaleza (Brazil)",
+	"Frankfurt (Germany)", "Freetown (Sierra Leone)", "Fresno (USA)", "Fukuoka (Japan)", "Funafuti (Tuvalu)", "Gaborone (Botswana)", "Gaziantep (Turkey)", "Geneva (Switzerland)",
+	"Genoa (Italy)", "Georgetown (Guyana)", "Gothenburg (Sweden)", "Guadalajara (Mexico)", "Guangzhou (China)", "Guatemala City (Guatemala)", "Guayaquil (Ecuador)", "The Hague (Netherlands)",
+	"Hamburg (Germany)", "Hangzhou (China)", "Hanoi (Vietnam)", "Harare (Zimbabwe)", "Harbin (China)", "Havana (Cuba)", "Helsinki (Finland)", "Ho Chi Minh City (Vietnam)",
+	"Hobart (Australia)", "Honiara (Solomon Islands)", "Honolulu (USA)", "Houston (USA)", "Hyderabad (India)", "Ibadan (Nigeria)", "Incheon (South Korea)", "Indianapolis (USA)",
+	"Islamabad (Pakistan)", "Istanbul (Turkey)", "Jaipur (India)", "Jakarta (Indonesia)", "Jeddah (Saudi Arabia)", "Jerusalem (Israel)", "Johannesburg (South Africa)", "Juba (South Sudan)",
+	"Kabul (Afghanistan)", "Kampala (Uganda)", "Kano (Nigeria)", "Kansas City (USA)", "Karachi (Pakistan)", "Kathmandu (Nepal)", "Kaunas (Lithuania)", "Kigali (Rwanda)",
+	"Kingston (Jamaica)", "Kingstown (Saint Vincent and the Grenadines)", "Kinshasa (DR Congo)", "Kobe (Japan)", "Kolkata (India)", "Krakow (Poland)", "Kuala Lumpur (Malaysia)", "Kuching (Malaysia)",
+	"Kuwait City (Kuwait)", "Kyiv (Ukraine)", "Kyoto (Japan)", "La Paz (Bolivia)", "Lagos (Nigeria)", "Lahore (Pakistan)", "Las Vegas (USA)", "Leeds (England)",
+	"Leipzig (Germany)", "Libreville (Gabon)", "Lilongwe (Malawi)", "Lima (Peru)", "Lisbon (Portugal)", "Ljubljana (Slovenia)", "Lomé (Togo)", "London (England)",
+	"Los Angeles (USA)", "Luanda (Angola)", "Lubumbashi (DR Congo)", "Lucknow (India)", "Lusaka (Zambia)", "Luxembourg City (Luxembourg)", "Lyon (France)", "Macau (China)",
+	"Madrid (Spain)", "Majuro (Marshall Islands)", "Malabo (Equatorial Guinea)", "Malé (Maldives)", "Managua (Nicaragua)", "Manama (Bahrain)", "Manaus (Brazil)", "Manchester (England)",
+	"Manila (Philippines)", "Maputo (Mozambique)", "Marrakesh (Morocco)", "Marseille (France)", "Maseru (Lesotho)", "Mbabane (Eswatini)", "Medellín (Colombia)", "Melbourne (Australia)",
+	"Memphis (USA)", "Mexico City (Mexico)", "Miami (USA)", "Milan (Italy)", "Minsk (Belarus)", "Mogadishu (Somalia)", "Monaco (Monaco)", "Monrovia (Liberia)",
+	"Monterrey (Mexico)", "Montevideo (Uruguay)", "Montreal (Canada)", "Moroni (Comoros)", "Moscow (Russia)", "Mumbai (India)", "Munich (Germany)", "Muscat (Oman)",
+	"Nagoya (Japan)", "Nairobi (Kenya)", "Nanjing (China)", "Naples (Italy)", "Nassau (Bahamas)", "N'Djamena (Chad)", "New Delhi (India)", "New Orleans (USA)",
+	"New York City (USA)", "Niamey (Niger)", "Nicosia (Cyprus)", "Nouakchott (Mauritania)", "Nur-Sultan (Kazakhstan)", "Nuremberg (Germany)", "Oklahoma City (USA)", "Omaha (USA)",
+	"Osaka (Japan)", "Oslo (Norway)", "Ottawa (Canada)", "Ouagadougou (Burkina Faso)", "Palikir (Micronesia)", "Panama City (Panama)", "Paramaribo (Suriname)", "Paris (France)",
+	"Perth (Australia)", "Phnom Penh (Cambodia)", "Phoenix (USA)", "Podgorica (Montenegro)", "Port-au-Prince (Haiti)", "Port Louis (Mauritius)", "Port Moresby (Papua New Guinea)", "Port of Spain (Trinidad and Tobago)",
+	"Port Vila (Vanuatu)", "Porto (Portugal)", "Porto Alegre (Brazil)", "Portland (USA)", "Poznań (Poland)", "Prague (Czech Republic)", "Praia (Cape Verde)", "Pretoria (South Africa)",
+	"Pristina (Kosovo)", "Pusan (South Korea)", "Pyongyang (North Korea)", "Quebec City (Canada)", "Quito (Ecuador)", "Rabat (Morocco)", "Raleigh (USA)", "Ramallah (Palestine)",
+	"Recife (Brazil)", "Reykjavik (Iceland)", "Riga (Latvia)", "Rio de Janeiro (Brazil)", "Riyadh (Saudi Arabia)", "Rome (Italy)", "Rosario (Argentina)", "Rotterdam (Netherlands)",
+	"Sacramento (USA)", "Saint-Denis (Réunion, France)", "Salt Lake City (USA)", "Salvador (Brazil)", "Samara (Russia)", "San Antonio (USA)", "San Diego (USA)", "San José (Costa Rica)",
+	"San Juan (Puerto Rico)", "San Marino (San Marino)", "San Salvador (El Salvador)", "Sana'a (Yemen)", "Santiago (Chile)", "Santo Domingo (Dominican Republic)", "São Paulo (Brazil)", "Sapporo (Japan)",
+	"Sarajevo (Bosnia and Herzegovina)", "Seattle (USA)", "Seoul (South Korea)", "Sevilla (Spain)", "Shanghai (China)", "Shenzhen (China)", "Singapore (Singapore)", "Skopje (North Macedonia)",
+	"Sofia (Bulgaria)", "Split (Croatia)", "St. Louis (USA)", "St. Petersburg (Russia)", "Stockholm (Sweden)", "Strasbourg (France)", "Stuttgart (Germany)", "Suva (Fiji)",
+	"Suzhou (China)", "Sydney (Australia)", "Taipei (Taiwan)", "Tallinn (Estonia)", "Tashkent (Uzbekistan)", "Tbilisi (Georgia)", "Tegucigalpa (Honduras)", "Tehran (Iran)",
+	"Tel Aviv (Israel)", "Thimphu (Bhutan)", "Tianjin (China)", "Tijuana (Mexico)", "Tirana (Albania)", "Tokyo (Japan)", "Toronto (Canada)", "Toulouse (France)",
+	"Tripoli (Libya)", "Tunis (Tunisia)", "Turin (Italy)", "Ulaanbaatar (Mongolia)", "Utrecht (Netherlands)", "Vaduz (Liechtenstein)", "Valencia (Spain)", "Valletta (Malta)",
+	"Vancouver (Canada)", "Vatican City (Vatican City)", "Venice (Italy)", "Victoria (Seychelles)", "Vienna (Austria)", "Vientiane (Laos)", "Vilnius (Lithuania)", "Warsaw (Poland)",
+	"Washington DC (USA)", "Wellington (New Zealand)", "Winnipeg (Canada)", "Wuhan (China)", "Xi'an (China)", "Yamoussoukro (Ivory Coast)", "Yangon (Myanmar)", "Yaoundé (Cameroon)",
+	"Yekaterinburg (Russia)", "Yerevan (Armenia)", "Yokohama (Japan)", "Zagreb (Croatia)", "Zürich (Switzerland)", "Aarhus (Denmark)", "Aberdeen (Scotland)", "Adana (Turkey)",
+	"Agra (India)", "Ahmedabad (India)", "Akron (USA)", "Albany (USA)", "Albuquerque (USA)", "Alexandria (Egypt)", "Amritsar (India)", "Anaheim (USA)",
+	"Ankara (Turkey)", "Ann Arbor (USA)", "Antalya (Turkey)", "Antioch (USA)", "Arequipa (Peru)", "Arlington (USA)", "Aruba (Aruba)", "Astana (Kazakhstan)",
+	"Athens, Georgia (USA)", "Augsburg (Germany)", "Aurora (USA)", "Austin (USA)", "Bahia Blanca (Argentina)", "Baku (Azerbaijan)", "Balikpapan (Indonesia)", "Baltimore (USA)",
+	"Bamberg (Germany)", "Bandung (Indonesia)", "Bataan (Philippines)", "Bath (England)", "Baton Rouge (USA)", "Bedford (England)", "Belém (Brazil)", "Belgorod (Russia)",
+	"Bendigo (Australia)", "Bergen (Norway)", "Bexley (England)", "Bhubaneswar (India)", "Białystok (Poland)", "Blackpool (England)", "Bloemfontein (South Africa)", "Bolton (England)",
+	"Bordertown (Australia)", "Bradford (England)", "Braga (Portugal)", "Brampton (Canada)", "Brighton (England)", "Brno (Czech Republic)", "Buffalo (USA)", "Burgas (Bulgaria)",
+	"Bydgoszcz (Poland)", "Cagliari (Italy)", "Cairns (Australia)", "Calabar (Nigeria)", "Calgary East (Canada)", "Cambridge (England)", "Campinas (Brazil)", "Cancún (Mexico)",
+	"Canterbury (England)", "Cape Coral (USA)", "Cartagena (Colombia)", "Catania (Italy)", "Cebu (Philippines)", "Charleston (USA)", "Charlotte (USA)", "Chattanooga (USA)",
+	"Cherbourg (France)", "Chiba (Japan)", "Chico (USA)", "Cincinnati (USA)", "Ciudad Juárez (Mexico)", "Cleveland (USA)", "Coimbra (Portugal)", "Colombo, Sri Lanka (Sri Lanka)",
+	"Columbus (USA)", "Constanța (Romania)", "Coventry (England)", "Coyoacán (Mexico)", "Cuiabá (Brazil)", "Culiacán (Mexico)", "Cuzco (Peru)", "Dammam (Saudi Arabia)",
+	"Davao City (Philippines)", "Dayton (USA)", "Debrecen (Hungary)", "Delft (Netherlands)", "Derby (England)", "Des Moines (USA)", "Dnipro (Ukraine)", "Donetsk (Ukraine)",
+	"Durban (South Africa)", "Durham (England)", "East London (South Africa)", "Eindhoven (Netherlands)", "El Paso (USA)", "Erie (USA)", "Essen (Germany)", "Exeter (England)",
+	"Fez (Morocco)", "Florianópolis (Brazil)", "Fort Worth (USA)", "Fukushima (Japan)", "Gdańsk (Poland)", "Gdynia (Poland)", "Gent (Belgium)", "Gijón (Spain)",
+	"Glasgow (Scotland)", "Goiânia (Brazil)", "Gold Coast (Australia)", "Graz (Austria)", "Grenoble (France)", "Guadalupe (Mexico)", "Gwangju (South Korea)", "Halifax (Canada)",
+	"Hamilton (Canada)", "Hangzhou West (China)", "Hartford (USA)", "Heraklion (Greece)", "Hermosillo (Mexico)", "Hiroshima (Japan)", "Hobart Town (Australia)", "Hokkaido (Japan)",
+	"Holguín (Cuba)", "Iasi (Romania)", "Ibiza Town (Spain)", "Indore (India)", "Inverness (Scotland)", "Iquitos (Peru)", "Ipoh (Malaysia)", "Irkutsk (Russia)",
+	"Izmir (Turkey)", "Jacksonville (USA)", "Jerez de la Frontera (Spain)", "Jinan (China)", "João Pessoa (Brazil)", "Johor Bahru (Malaysia)", "Jönköping (Sweden)", "Kaliningrad (Russia)",
+	"Kanazawa (Japan)", "Kanpur (India)", "Katowice (Poland)", "Kazan (Russia)", "Kelowna (Canada)", "Kemerovo (Russia)", "Khabarovsk (Russia)", "Kharkiv (Ukraine)",
+	"Kingston upon Hull (England)", "Kirov (Russia)", "Kitakyushu (Japan)", "Klagenfurt (Austria)", "Kobenhavn (Denmark)", "Kochi (India)", "Košice (Slovakia)", "Kraków (Poland)",
+	"Kumamoto (Japan)", "Kunming (China)", "La Coruña (Spain)", "Lausanne (Switzerland)", "Le Havre (France)", "León (Mexico)", "Liège (Belgium)", "Lille (France)",
+	"Limoges (France)", "Linz (Austria)", "Little Rock (USA)", "Liverpool (England)", "Łódź (Poland)", "Louisville (USA)", "Lviv (Ukraine)", "Maastricht (Netherlands)",
+	"Makassar (Indonesia)", "Malaga (Spain)", "Mandalay (Myanmar)", "Mannheim (Germany)", "Maracaibo (Venezuela)", "Mar del Plata (Argentina)", "Matsuyama (Japan)", "Medan (Indonesia)",
+	"Mérida (Mexico)", "Messina (Italy)", "Milwaukee (USA)", "Minneapolis (USA)", "Mombasa (Kenya)", "Montpellier (France)", "Montreux (Switzerland)", "Mysore (India)",
+	"Nagano (Japan)", "Nagasaki (Japan)", "Nairobi West (Kenya)", "Nanaimo (Canada)", "Nancy (France)", "Nanning (China)", "Nantes (France)", "Nashville (USA)",
+	"Newcastle (England)", "Niigata (Japan)", "Nizhny Novgorod (Russia)", "Northampton (England)", "Norwich (England)", "Novosibirsk (Russia)", "Nur City (Kazakhstan)", "Oaxaca (Mexico)",
+	"Odense (Denmark)", "Odesa (Ukraine)", "Okayama (Japan)", "Omdurman (Sudan)", "Ontario (USA)", "Orenburg (Russia)", "Orlando (USA)", "Oshawa (Canada)",
+	"Oulu (Finland)", "Padua (Italy)", "Palembang (Indonesia)", "Palermo (Italy)", "Pamplona (Spain)", "Panama (Panama)", "Pärnu (Estonia)", "Peoria (USA)",
+	"Perm (Russia)", "Perpignan (France)", "Philadelphia (USA)", "Pittsburgh (USA)", "Plymouth (England)", "Poitiers (France)", "Ponce (Puerto Rico)", "Portsmouth (England)",
+	"Poznan (Poland)", "Puebla (Mexico)", "Pune (India)", "Querétaro (Mexico)", "Quezon City (Philippines)", "Regina (Canada)", "Reims (France)", "Rennes (France)",
+	"Richmond (USA)", "Rochester (USA)", "Rostock (Germany)", "Rostov-on-Don (Russia)", "Rotterdam West (Netherlands)", "Sacramento North (USA)", "Saitama (Japan)", "Salamanca (Spain)",
+	"Salzburg (Austria)", "San Bernardino (USA)", "San Luis Potosí (Mexico)", "Sankt Pölten (Austria)", "Santa Cruz (Bolivia)", "Santa Fe (USA)", "Santander (Spain)", "Saratov (Russia)",
+	"Saskatoon (Canada)", "Semarang (Indonesia)", "Sendai (Japan)", "Sheffield (England)", "Shizuoka (Japan)", "Sibiu (Romania)", "Sochi (Russia)", "Southampton (England)",
+	"Split, Croatia (Croatia)", "St. John's (Canada)", "Stavanger (Norway)", "Stavropol (Russia)", "Stoke-on-Trent (England)", "Sucre (Bolivia)", "Surabaya (Indonesia)", "Surat (India)",
+	"Sverdlovsk (Russia)", "Szczecin (Poland)", "Tacoma (USA)", "Tainan (Taiwan)", "Taichung (Taiwan)", "Tallahassee (USA)", "Tampa (USA)", "Tampere (Finland)",
+	"Tangier (Morocco)", "Tarragona (Spain)", "Thessaloniki (Greece)", "Tijuana North (Mexico)", "Timişoara (Romania)", "Toledo (USA)", "Tomsk (Russia)", "Torreón (Mexico)",
+	"Toulon (France)", "Townsville (Australia)", "Trieste (Italy)", "Trois-Rivières (Canada)", "Trondheim (Norway)", "Tucson (USA)", "Tulsa (USA)", "Turku (Finland)",
+	"Ufa (Russia)", "Umeå (Sweden)", "Valdivia (Chile)", "Valparaíso (Chile)", "Varna (Bulgaria)", "Vaasa (Finland)", "Verona (Italy)", "Veracruz (Mexico)",
+	"Vigo (Spain)", "Villahermosa (Mexico)", "Vitoria-Gasteiz (Spain)", "Vladivostok (Russia)", "Volgograd (Russia)", "Wakayama (Japan)", "Waterloo (Canada)", "Wichita (USA)",
+	"Wiesbaden (Germany)", "Windhoek (Namibia)", "Windsor (Canada)", "Winston-Salem (USA)", "Wolverhampton (England)", "Worcester (England)", "Wrocław (Poland)", "Wuppertal (Germany)",
+	"Wuxi (China)", "Xiamen (China)", "Yangzhou (China)", "Yaroslavl (Russia)", "Yokosuka (Japan)", "York (England)", "Yueyang (China)", "Zadar (Croatia)",
+	"Zaragoza (Spain)", "Zhengzhou (China)", "Zibo (China)", "Zonguldak (Turkey)",
+	"Aachen (Germany)", "Aalborg (Denmark)", "Abakan (Russia)", "Abbotsford (Canada)", "Aberystwyth (Wales)", "Abilene (USA)", "Acapulco (Mexico)", "Adelaide Hills (Australia)",
+	"Ain Sokhna (Egypt)", "Ajaccio (France)", "Ajman (UAE)", "Akita (Japan)", "Al Ain (UAE)", "Albacete (Spain)", "Alesund (Norway)", "Alicante (Spain)",
+	"Almere (Netherlands)", "Alofi (Niue)", "Amarillo (USA)", "Amravati (India)", "Anchorage (USA)", "Ancona (Italy)", "Andorra la Vella (Andorra)", "Angeles City (Philippines)",
+	"Ankeny (USA)", "Annecy (France)", "Antipolo (Philippines)", "Antofagasta (Chile)", "Aomori (Japan)", "Apeldoorn (Netherlands)", "Appleton (USA)", "Arad (Romania)",
+	"Aracaju (Brazil)", "Arad, Israel (Israel)", "Arkhangelsk (Russia)", "Arles (France)", "Arnhem (Netherlands)", "Ashdod (Israel)", "Asheville (USA)", "Ashkelon (Israel)",
+	"Assisi (Italy)", "Astrakhan (Russia)", "Asuncion Bay (Paraguay)", "Athlone (Ireland)", "Atlantic City (USA)", "Auburn (USA)", "Augusta (USA)", "Aviemore (Scotland)",
+	"Avignon (France)", "Ayr (Scotland)", "Bacolod (Philippines)", "Badajoz (Spain)", "Baden-Baden (Germany)", "Baguio (Philippines)", "Bahawalpur (Pakistan)", "Baie-Comeau (Canada)",
+	"Bakersfield (USA)", "Balashikha (Russia)", "Ballarat (Australia)", "Banff (Canada)", "Bangor (Wales)", "Baoding (China)", "Baotou (China)", "Baracoa (Cuba)",
+	"Barcelona, Venezuela (Venezuela)", "Bari (Italy)", "Barquisimeto (Venezuela)", "Barrie (Canada)", "Basseterre (Saint Kitts and Nevis)", "Bathurst (Australia)", "Batumi (Georgia)", "Bayreuth (Germany)",
+	"Beaufort West (South Africa)", "Beira (Mozambique)", "Bellingham (USA)", "Benalmadena (Spain)", "Bend (USA)", "Bendery (Moldova)", "Bengaluru Rural (India)", "Benidorm (Spain)",
+	"Bergamo (Italy)", "Berkeley (USA)", "Bethlehem (Palestine)", "Beziers (France)", "Bhavnagar (India)", "Biarritz (France)", "Bielefeld (Germany)", "Bikaner (India)",
+	"Billings (USA)", "Biloxi (USA)", "Bishop's Stortford (England)", "Bitola (North Macedonia)", "Blantyre (Malawi)", "Bloomington (USA)", "Bodo (Norway)", "Bogor (Indonesia)",
+	"Boise City (USA)", "Bolzano (Italy)", "Bonaire (Bonaire)", "Bordeaux Lac (France)", "Boryeong (South Korea)", "Bratsk (Russia)", "Bregenz (Austria)", "Bremerton (USA)",
+	"Brest, France (France)", "Bridgeport (USA)", "Bridgetown Village (Barbados)", "Brindisi (Italy)", "Broken Hill (Australia)", "Brownsville (USA)", "Bruges (Belgium)", "Bucaramanga (Colombia)",
+	"Bukhara (Uzbekistan)", "Bundaberg (Australia)", "Burlington (USA)", "Bydgoszcz East (Poland)", "Caen (France)", "Cagayan de Oro (Philippines)", "Cairo, USA (USA)", "Cajamarca (Peru)",
+	"Calais (France)", "Caldas Novas (Brazil)", "Cali Valle (Colombia)", "Callao (Peru)", "Camaguey (Cuba)", "Campeche (Mexico)", "Canakkale (Turkey)", "Cannes (France)",
+	"Canoas (Brazil)", "Canyonville (USA)", "Cape Girardeau (USA)", "Carcassonne (France)", "Cardenas (Cuba)", "Carletonville (South Africa)", "Carrara (Italy)", "Cartago (Costa Rica)",
+	"Casper (USA)", "Catanzaro (Italy)", "Caxias do Sul (Brazil)", "Cayenne (French Guiana)", "Cebu Lapu-Lapu (Philippines)", "Cedar Rapids (USA)", "Celle (Germany)", "Chachapoyas (Peru)",
+	"Chalkida (Greece)", "Champaign (USA)", "Changwon (South Korea)", "Charleroi (Belgium)", "Chelmsford (England)", "Cheltenham (England)", "Chemnitz (Germany)", "Cherkasy (Ukraine)",
+	"Chester (England)", "Chetumal (Mexico)", "Chiang Mai (Thailand)", "Chibougamau (Canada)", "Chichester (England)", "Chillan (Chile)", "Chimoio (Mozambique)", "Chinandega (Nicaragua)",
+	"Christiansted (US Virgin Islands)", "Cienfuegos (Cuba)", "Cirebon (Indonesia)", "Ciudad Bolivar (Venezuela)", "Ciudad del Este (Paraguay)", "Ciudad Guayana (Venezuela)", "Clermont-Ferrand (France)", "Cluj (Romania)",
+	"Cochabamba (Bolivia)", "Coeur d'Alene (USA)", "Colchester (England)", "Cologne West (Germany)", "Colonia del Sacramento (Uruguay)", "Colorado Springs (USA)", "Comayagua (Honduras)", "Constantine (Algeria)",
+	"Copacabana, Bolivia (Bolivia)", "Cordoba, Spain (Spain)", "Corfu Town (Greece)", "Cork (Ireland)", "Corner Brook (Canada)", "Cortina d'Ampezzo (Italy)", "Corumba (Brazil)", "Cotonou (Benin)",
+	"Coventry East (England)", "Cozumel (Mexico)", "Cremona (Italy)", "Crestview (USA)", "Cuenca (Ecuador)", "Cuernavaca (Mexico)", "Culebra (Puerto Rico)", "Cusco Region (Peru)",
+	"Dagupan (Philippines)", "Dalian (China)", "Danang Bay (Vietnam)", "Danville (USA)", "Darmstadt (Germany)", "Darwin (Australia)", "Datong (China)", "Daugavpils (Latvia)",
+	"Davenport (USA)", "David (Panama)", "Deauville (France)", "Denpasar (Indonesia)", "Derry (Northern Ireland)", "Dessau (Germany)", "Dijon Nord (France)", "Dinard (France)",
+	"Diyarbakir (Turkey)", "Dodge City (USA)", "Dolores, Argentina (Argentina)", "Dordrecht (Netherlands)", "Dortmund Ost (Germany)", "Douala (Cameroon)", "Douglas (Isle of Man)", "Dover (England)",
+	"Dubrovnik (Croatia)", "Duluth (USA)", "Dunedin (New Zealand)", "Durres (Albania)", "Eau Claire (USA)", "Edirne (Turkey)", "Eilat (Israel)", "Ekaterinburg Oblast (Russia)",
+	"El Jadida (Morocco)", "Ely (England)", "Enschede (Netherlands)", "Erie County (USA)", "Erlangen (Germany)", "Esbjerg (Denmark)", "Eskisehir (Turkey)", "Essaouira (Morocco)",
+	"Ferrara (Italy)", "Figueira da Foz (Portugal)", "Flagstaff (USA)", "Flensburg (Germany)", "Florence, USA (USA)", "Foggia (Italy)", "Fontainebleau (France)", "Fort Collins (USA)",
+	"Fort Lauderdale (USA)", "Fort Myers (USA)", "Frankfurt Oder (Germany)", "Fredericton (Canada)", "Fribourg (Switzerland)", "Fuerteventura (Spain)", "Fujairah (UAE)", "Fukui (Japan)",
+	"Gaborone North (Botswana)", "Galway (Ireland)", "Gandia (Spain)", "Garda (Italy)", "Gaza City (Palestine)", "Gdansk Oliwa (Poland)", "Geelong (Australia)", "Genk (Belgium)",
+	"George Town (Malaysia)", "Georgetown, Guyana (Guyana)", "Gera (Germany)", "Gerona (Spain)", "Gijon Nuevo (Spain)", "Girona (Spain)", "Gisborne (New Zealand)", "Gjirokaster (Albania)",
+	"Gliwice (Poland)", "Gold Coast West (Australia)", "Goma (DR Congo)", "Gore (New Zealand)", "Gorakhpur (India)", "Gothenburg Archipelago (Sweden)", "Granada (Spain)", "Grand Rapids (USA)",
+	"Graz Ost (Austria)", "Great Falls (USA)", "Greeley (USA)", "Grenada Town (Grenada)", "Groningen (Netherlands)", "Guarulhos (Brazil)", "Guaruja (Brazil)", "Gulfport (USA)",
+	"Gwalior (India)", "Halden (Norway)", "Halle (Germany)", "Hamamatsu (Japan)", "Hamilton, New Zealand (New Zealand)", "Hangzhou Bay (China)", "Harlingen (USA)", "Harrisburg (USA)",
+	"Hartlepool (England)", "Hastings (England)", "Hat Yai (Thailand)", "Havelock North (New Zealand)", "Helsingborg (Sweden)", "Hermiston (USA)", "Hilo (USA)", "Hobart North (Australia)",
+	"Hoi An (Vietnam)", "Homs (Syria)", "Hong Kong Island (Hong Kong)", "Honolulu East (USA)", "Hoorn (Netherlands)", "Horsham (England)", "Huelva (Spain)", "Huntsville (USA)",
+	"Hyderabad, Pakistan (Pakistan)", "Iasi Vale (Romania)", "Ibadan North (Nigeria)", "Iloilo (Philippines)", "Innsbruck (Austria)", "Inuvik (Canada)", "Ioannina (Greece)", "Ipswich (England)",
+	"Isafjordur (Iceland)", "Ischia (Italy)", "Isfahan (Iran)", "Ithaca (USA)", "Jaen (Spain)", "Jalandhar (India)", "Jamestown, Saint Helena (Saint Helena)", "Jasper (Canada)",
+	"Jerez (Spain)", "Jinja (Uganda)", "Jodhpur (India)", "Joensuu (Finland)", "Joetsu (Japan)", "Johor Bahru East (Malaysia)", "Joinville (Brazil)", "Jonkoping (Sweden)",
+	"Jos (Nigeria)", "Jyvaskyla (Finland)", "Kaduna (Nigeria)", "Kaifeng (China)", "Kalamata (Greece)", "Kalgoorlie (Australia)", "Kamloops (Canada)", "Kandy (Sri Lanka)",
+	"Kano North (Nigeria)", "Karlsruhe (Germany)", "Karlstad (Sweden)", "Kars (Turkey)", "Kassel (Germany)", "Katmandu Valley (Nepal)", "Kelowna West (Canada)", "Kemi (Finland)",
+	"Kermanshah (Iran)", "Khartoum (Sudan)", "Kielce (Poland)", "Kimberley (South Africa)", "Kingston, New York (USA)", "Kirkcaldy (Scotland)", "Kisumu (Kenya)", "Kitchener (Canada)",
+	"Klaipeda (Lithuania)", "Knoxville (USA)", "Kobe Port (Japan)", "Koh Samui (Thailand)", "Koln Deutz (Germany)", "Kolobrzeg (Poland)", "Konya (Turkey)", "Kosice East (Slovakia)",
+	"Kota Kinabalu (Malaysia)", "Krasnodar (Russia)", "Krasnoyarsk (Russia)", "Kristiansand (Norway)", "Kuantan (Malaysia)", "Kumasi (Ghana)", "Kunshan (China)", "Kuopio (Finland)",
+	"Kutaisi (Georgia)", "La Ceiba (Honduras)", "La Rochelle (France)", "La Serena (Chile)", "Labuan (Malaysia)", "Lafayette (USA)", "Lampang (Thailand)", "Langkawi (Malaysia)",
+	"Lansing (USA)", "Larnaca (Cyprus)", "Las Palmas (Spain)", "Latacunga (Ecuador)", "Lecce (Italy)", "Leon, Nicaragua (Nicaragua)", "Leon, Spain (Spain)", "Lerwick (Scotland)",
+	"Levuka (Fiji)", "Lexington (USA)", "Liberec (Czech Republic)", "Libourne (France)", "Ljubljana Sever (Slovenia)", "Llandudno (Wales)", "Loja (Ecuador)", "Lokoja (Nigeria)",
+	"Lombok (Indonesia)", "Longyearbyen (Norway)", "Lorient (France)", "Los Cabos (Mexico)", "Lubango (Angola)", "Lubbock (USA)", "Lubeck (Germany)", "Lucerne (Switzerland)",
+	"Lugano (Switzerland)", "Lusaka South (Zambia)", "Luton (England)", "Luxor (Egypt)", "Lyon Confluence (France)", "Maastricht Oost (Netherlands)", "Machu Picchu (Peru)", "Madison (USA)",
+	"Magadan (Russia)", "Magdeburg (Germany)", "Malacca (Malaysia)", "Malaga Puerto (Spain)", "Malmo (Sweden)", "Manado (Indonesia)", "Manavgat (Turkey)", "Manzanillo (Mexico)",
+	"Maputo Sul (Mozambique)", "Maracay (Venezuela)", "Marbella (Spain)", "Marrakech Medina (Morocco)", "Marsa Alam (Egypt)", "Maseru East (Lesotho)", "Matamoros (Mexico)", "Mataro (Spain)",
+	"Mazatlan (Mexico)", "Mbale (Uganda)", "Medan Kota (Indonesia)", "Mendoza (Argentina)", "Merida, Venezuela (Venezuela)", "Meridian (USA)", "Merida Yucatan (Mexico)", "Metz (France)",
+	"Mikkeli (Finland)", "Milford Haven (Wales)", "Missoula (USA)", "Mobile (USA)", "Modena (Italy)", "Mombasa North (Kenya)", "Mons (Belgium)", "Montego Bay (Jamaica)",
+	"Monterey (USA)", "Montpellier Sud (France)", "Morelia (Mexico)", "Moron, Argentina (Argentina)", "Mostar (Bosnia and Herzegovina)", "Mtwara (Tanzania)", "Mudanya (Turkey)", "Mumbai Suburban (India)",
+	"Mumbles (Wales)", "Murcia (Spain)", "Muscat Old Town (Oman)", "Mysore East (India)", "Nakhon Ratchasima (Thailand)", "Nanaimo North (Canada)", "Nanchang (China)", "Nancy Est (France)",
+	"Nanjing East (China)", "Napier (New Zealand)", "Naples, USA (USA)", "Narvik (Norway)", "Nassau North (Bahamas)", "Nazareth (Israel)", "Nelson (New Zealand)", "Newport (Wales)",
+	"Newquay (England)", "Niagara Falls (Canada)", "Nice (France)", "Niksic (Montenegro)", "Nogales (Mexico)", "Nong Khai (Thailand)", "Norfolk (USA)", "Norrkoping (Sweden)",
+	"North Bay (Canada)", "Northampton West (England)", "Novi Sad (Serbia)", "Nuku'alofa (Tonga)", "Nyeri (Kenya)", "Oaxaca de Juarez (Mexico)", "Odawara (Japan)", "Ohrid (North Macedonia)",
+	"Okinawa (Japan)", "Olbia (Italy)", "Olomouc (Czech Republic)", "Olsztyn (Poland)", "Omaha South (USA)", "Ontario, Canada (Canada)", "Opatija (Croatia)", "Oradea (Romania)",
+	"Oran (Algeria)", "Orense (Spain)", "Orizaba (Mexico)", "Orsk (Russia)", "Osijek (Croatia)", "Ostrava (Czech Republic)", "Otago (New Zealand)", "Oxford (England)",
+	"Padang (Indonesia)", "Paducah (USA)", "Palanga (Lithuania)", "Palma de Mallorca (Spain)", "Pamukkale (Turkey)", "Panama La Vieja (Panama)", "Papeete (French Polynesia)", "Paphos (Cyprus)",
+	"Parana (Argentina)", "Parintins (Brazil)", "Parma (Italy)", "Pasadena (USA)", "Pattaya (Thailand)", "Pau (France)", "Penang (Malaysia)", "Perpignan Centre (France)",
+	"Perugia (Italy)", "Pescara (Italy)", "Petaling Jaya (Malaysia)", "Phan Thiet (Vietnam)", "Phuket (Thailand)", "Piraeus (Greece)", "Pisa (Italy)", "Plzen (Czech Republic)",
+	"Pointe-a-Pitre (Guadeloupe)", "Pokhara (Nepal)", "Ponta Delgada (Portugal)", "Poole (England)", "Port Elizabeth (South Africa)", "Port Harcourt (Nigeria)", "Port Said (Egypt)", "Portimao (Portugal)",
+	"Porto-Novo (Benin)", "Potsdam (Germany)", "Poznan Old Town (Poland)", "Pucon (Chile)", "Puebla de Zaragoza (Mexico)", "Puerto Iguazu (Argentina)", "Puerto Montt (Chile)", "Puerto Plata (Dominican Republic)",
+	"Puerto Princesa (Philippines)", "Pula (Croatia)", "Punta Arenas (Chile)", "Punta Cana (Dominican Republic)", "Pushkar (India)", "Quang Ngai (Vietnam)", "Queenstown (New Zealand)", "Quimper (France)",
+	"Racine (USA)", "Rangpur (Bangladesh)", "Ras al-Khaimah (UAE)", "Rawalpindi (Pakistan)", "Regensburg (Germany)", "Reggio Calabria (Italy)", "Rethymno (Greece)", "Reus (Spain)",
+	"Rimini (Italy)", "Roanoke (USA)", "Rockford (USA)", "Rockhampton (Australia)", "Rostock Ost (Germany)", "Rotorua (New Zealand)", "Rovaniemi (Finland)", "Ruse (Bulgaria)",
+	"Saarbrucken (Germany)", "Sabadell (Spain)", "Saguenay (Canada)", "Saint-Malo (France)", "Salem, USA (USA)", "Salta (Argentina)", "Saltillo (Mexico)", "San Cristobal, Venezuela (Venezuela)",
+	"San Ignacio, Belize (Belize)", "San Pedro Sula (Honduras)", "Sandakan (Malaysia)", "Santa Barbara (USA)", "Santa Marta (Colombia)", "Santarem (Brazil)", "Santiago de Compostela (Spain)", "Sapporo Chuo (Japan)",
+	"Sarajevo Novo (Bosnia and Herzegovina)", "Saskatoon East (Canada)", "Savannah (USA)", "Semporna (Malaysia)", "Setubal (Portugal)", "Sevilla Este (Spain)", "Shizuoka Chuo (Japan)", "Siauliai (Lithuania)",
+	"Siem Reap (Cambodia)", "Sihanoukville (Cambodia)", "Sioux Falls (USA)", "Skagway (USA)", "Skiathos (Greece)", "Sligo (Ireland)", "Sochi Adler (Russia)", "Sofia Ovcha Kupel (Bulgaria)",
+	"Songkhla (Thailand)", "Sopot (Poland)", "Sorrento (Italy)", "South Bend (USA)", "Split Sustipan (Croatia)", "Spokane (USA)", "St. Augustine (USA)", "St. George's (Grenada)",
+	"St. Moritz (Switzerland)", "Stara Zagora (Bulgaria)", "Strasbourg Neudorf (France)", "Sucre Centro (Bolivia)", "Sukhumi (Georgia)", "Surakarta (Indonesia)", "Sylhet (Bangladesh)", "Szeged (Hungary)",
+	"Tabuk (Saudi Arabia)", "Taganrog (Russia)", "Tainan City (Taiwan)", "Taipei East (Taiwan)", "Takamatsu (Japan)", "Tallahassee North (USA)", "Tampico (Mexico)", "Tangalle (Sri Lanka)",
+	"Tanger Med (Morocco)", "Taormina (Italy)", "Tarnow (Poland)", "Tartu (Estonia)", "Tashkent Sity (Uzbekistan)", "Taupo (New Zealand)", "Tbilisi Vake (Georgia)", "Tegucigalpa Sur (Honduras)",
+	"Terrassa (Spain)", "Thessaloniki Kalamaria (Greece)", "Thimphu Valley (Bhutan)", "Thunder Bay (Canada)", "Tiflis (Georgia)", "Tijuana Playas (Mexico)", "Timmins (Canada)", "Tirana Ere (Albania)",
+	"Toamasina (Madagascar)", "Toledo, Spain (Spain)", "Toluca (Mexico)", "Tomsk Oblast (Russia)", "Topeka (USA)", "Torun (Poland)", "Toulon Est (France)", "Trabzon (Turkey)",
+	"Trelew (Argentina)", "Trichy (India)", "Trollhattan (Sweden)", "Tromso (Norway)", "Trujillo, Peru (Peru)", "Tulcan (Ecuador)", "Turku Saaristo (Finland)", "Tuscaloosa (USA)",
+	"Uberlandia (Brazil)", "Udaipur (India)", "Uddevalla (Sweden)", "Uithoorn (Netherlands)", "Ulan-Ude (Russia)", "Umtata (South Africa)", "Uppsala (Sweden)", "Urumqi (China)",
+	"Usti nad Labem (Czech Republic)", "Utica (USA)", "Vaduz Old Town (Liechtenstein)", "Valdez (USA)", "Valdosta (USA)", "Valencia West (Spain)", "Vallejo (USA)", "Valletta Waterfront (Malta)",
+	"Vancouver Island (Canada)", "Varanasi (India)", "Varberg (Sweden)", "Varkaus (Finland)", "Vasteras (Sweden)", "Vejle (Denmark)", "Ventimiglia (Italy)", "Veracruz Puerto (Mexico)",
+	"Vernon (Canada)", "Vicenza (Italy)", "Victoria Falls (Zimbabwe)", "Vientiane Sud (Laos)", "Vigo Ria (Spain)", "Vila Nova de Gaia (Portugal)", "Villa Carlos Paz (Argentina)", "Vinnytsia (Ukraine)",
+	"Visby (Sweden)", "Vlissingen (Netherlands)", "Vologda (Russia)", "Waco (USA)", "Wagga Wagga (Australia)", "Wanaka (New Zealand)", "Warri (Nigeria)", "Waterford (Ireland)",
+	"Whistler (Canada)", "Whitehorse (Canada)", "Wichita Falls (USA)", "Windermere (England)", "Winkler (Canada)", "Wollongong (Australia)", "Worthing (England)", "Wroclaw Stare Miasto (Poland)",
+	"Xalapa (Mexico)", "Xiamen Gulangyu (China)", "Yakutsk (Russia)", "Yalta (Ukraine)", "Yangzhou Old Town (China)", "Yazd (Iran)", "Yellowknife (Canada)", "Yerevan Kentron (Armenia)",
+	"York Region (Canada)", "Yuma (USA)", "Zacatecas (Mexico)", "Zadar Stari Grad (Croatia)", "Zakynthos (Greece)", "Zamboanga (Philippines)", "Zamora, Spain (Spain)", "Zanzibar City (Tanzania)",
+	"Zaporizhzhia (Ukraine)", "Zermatt (Switzerland)", "Zhuhai (China)", "Zilina (Slovakia)", "Zug (Switzerland)",
 }
 
 var cityCurrentName string
@@ -7658,20 +9440,36 @@ var cityIndex int
 var cityOrder []int
 var cityIndexLoaded bool
 
+// cityMajorCount marks the boundary in cityNames between world capitals /
+// major global cities (index < cityMajorCount, skyline-worthy) and the
+// smaller secondary cities/towns appended afterward, which read as more of
+// a countryside/small-town place — those get the grass-and-river scene
+// instead of a skyline.
+const cityMajorCount = 357
+
+var cityIsCountryside bool
+
 var cityBuildings []cityBuilding
 var cityLastGen time.Time
 var cityMu sync.Mutex
 
-const cityRegenInterval = 10 * time.Second
+const cityRegenInterval = 15 * time.Second
 
 // buildCityScene lays out a skyline, regenerating it every cityRegenInterval
 // — buildings keep a fixed silhouette and a golden-angle hue each (like the
 // "ASCII City" reference) between regens, only their lit-window shimmer
 // animates per tick.
-func buildCityScene() {
+func buildCityScene(width int) {
+	if width < 20 {
+		width = 20
+	}
 	cityMu.Lock()
 	defer cityMu.Unlock()
-	if cityBuildings != nil && time.Since(cityLastGen) < cityRegenInterval {
+	widthChanged := width != cityCols
+	if widthChanged {
+		cityCols = width
+	}
+	if cityBuildings != nil && !widthChanged && time.Since(cityLastGen) < cityRegenInterval {
 		return
 	}
 	r := mrand.New(mrand.NewSource(time.Now().UnixNano()))
@@ -7714,8 +9512,76 @@ func buildCityScene() {
 	}
 	cityIndex = cityIndex % len(cityOrder)
 	cityCurrentName = cityNames[cityOrder[cityIndex]]
+	cityIsCountryside = cityOrder[cityIndex] >= cityMajorCount
 	saveCityProgress(cityProgress{Order: cityOrder, Position: cityIndex})
 	cityLastGen = time.Now()
+}
+
+// countryUTCOffset is a coarse, DST-ignoring approximation — good enough
+// for a decorative day/night sky, not for anything that needs to be exact.
+// Multi-timezone countries get one representative offset (their capital's).
+var countryUTCOffset = map[string]float64{
+	"USA": -5, "Canada": -5, "Mexico": -6, "Brazil": -3, "Argentina": -3,
+	"Chile": -4, "Peru": -5, "Colombia": -5, "Venezuela": -4, "Ecuador": -5,
+	"Bolivia": -4, "Paraguay": -4, "Uruguay": -3, "Guyana": -4, "Suriname": -3,
+	"Cuba": -5, "Jamaica": -5, "Haiti": -5, "Dominican Republic": -4, "Puerto Rico": -4,
+	"Belize": -6, "Guatemala": -6, "Honduras": -6, "El Salvador": -6, "Nicaragua": -6,
+	"Costa Rica": -6, "Panama": -5, "Bahamas": -5, "Barbados": -4, "Trinidad and Tobago": -4,
+	"Saint Lucia": -4, "Saint Vincent and the Grenadines": -4, "Aruba": -4,
+	"England": 0, "Scotland": 0, "Wales": 0, "Northern Ireland": 0, "Ireland": 0,
+	"Portugal": 0, "Spain": 1, "France": 1, "Germany": 1, "Netherlands": 1,
+	"Belgium": 1, "Switzerland": 1, "Austria": 1, "Italy": 1, "Poland": 1,
+	"Czech Republic": 1, "Slovakia": 1, "Hungary": 1, "Slovenia": 1, "Croatia": 1,
+	"Bosnia and Herzegovina": 1, "Serbia": 1, "Montenegro": 1, "North Macedonia": 1,
+	"Albania": 1, "Kosovo": 1, "Denmark": 1, "Norway": 1, "Sweden": 1,
+	"Luxembourg": 1, "Malta": 1, "Monaco": 1, "Liechtenstein": 1, "San Marino": 1,
+	"Vatican City": 1, "Greece": 2, "Romania": 2, "Bulgaria": 2, "Finland": 2,
+	"Estonia": 2, "Latvia": 2, "Lithuania": 2, "Cyprus": 2, "Ukraine": 2,
+	"Moldova": 2, "Israel": 2, "Palestine": 2, "Lebanon": 2, "Egypt": 2,
+	"Russia": 3, "Turkey": 3, "Iraq": 3, "Jordan": 3, "Syria": 3, "Belarus": 3,
+	"Kenya": 3, "Tanzania": 3, "Ethiopia": 3, "Sudan": 2, "Somalia": 3, "Djibouti": 3,
+	"Yemen": 3, "Saudi Arabia": 3, "Qatar": 3, "Bahrain": 3, "Kuwait": 3,
+	"Iran": 3.5, "UAE": 4, "Oman": 4, "Georgia": 4, "Armenia": 4, "Azerbaijan": 4,
+	"Afghanistan": 4.5, "Pakistan": 5, "India": 5.5, "Sri Lanka": 5.5,
+	"Nepal": 5.75, "Bhutan": 6, "Bangladesh": 6, "Kazakhstan": 6, "Uzbekistan": 5,
+	"Kyrgyzstan": 6, "Tajikistan": 5, "Turkmenistan": 5, "Myanmar": 6.5,
+	"Thailand": 7, "Vietnam": 7, "Cambodia": 7, "Laos": 7, "Indonesia": 7,
+	"Malaysia": 8, "Singapore": 8, "Philippines": 8, "China": 8, "Taiwan": 8,
+	"Brunei": 8, "Mongolia": 8, "Hong Kong": 8, "North Korea": 9, "South Korea": 9,
+	"Japan": 9, "Timor-Leste": 9, "Papua New Guinea": 10, "Australia": 10,
+	"New Zealand": 12, "Fiji": 12, "Vanuatu": 11, "Solomon Islands": 11,
+	"Tuvalu": 12, "Micronesia": 11, "Marshall Islands": 12,
+	"Nigeria": 1, "Ghana": 0, "Ivory Coast": 0, "Senegal": 0, "Mali": 0,
+	"Gambia": 0, "Guinea": 0, "Guinea-Bissau": 0, "Sierra Leone": 0, "Liberia": 0,
+	"Togo": 0, "Benin": 1, "Burkina Faso": 0, "Niger": 1, "Chad": 1, "Cameroon": 1,
+	"Central African Republic": 1, "Gabon": 1, "Congo": 1, "DR Congo": 1,
+	"Equatorial Guinea": 1, "Angola": 1, "Zambia": 2, "Zimbabwe": 2, "Malawi": 2,
+	"Mozambique": 2, "Namibia": 2, "Botswana": 2, "South Africa": 2, "Lesotho": 2,
+	"Eswatini": 2, "Madagascar": 3, "Mauritius": 4, "Seychelles": 4, "Comoros": 3,
+	"Rwanda": 2, "Uganda": 3, "Burundi": 2, "South Sudan": 2, "Eritrea": 3,
+	"Algeria": 1, "Morocco": 1, "Tunisia": 1, "Libya": 2, "Mauritania": 0,
+	"Cape Verde": -1, "Réunion, France": 4,
+}
+
+// cityIsDaylight approximates whether it's roughly daytime (6:00-18:00
+// local) in the country named in cityCurrentName — purely decorative, so
+// an unrecognized/multi-zone country just falls back to false (night look).
+func cityIsDaylight() bool {
+	start := strings.LastIndexByte(cityCurrentName, '(')
+	end := strings.LastIndexByte(cityCurrentName, ')')
+	if start < 0 || end < 0 || end <= start {
+		return false
+	}
+	country := cityCurrentName[start+1 : end]
+	offset, ok := countryUTCOffset[country]
+	if !ok {
+		return false
+	}
+	localHour := math.Mod(float64(time.Now().UTC().Hour())+offset, 24)
+	if localHour < 0 {
+		localHour += 24
+	}
+	return localHour >= 6 && localHour < 18
 }
 
 type cityProgress struct {
@@ -7788,7 +9654,26 @@ func pseudoHash(a, b int) uint32 {
 }
 
 func (m model) renderCityBanner() string {
-	buildCityScene()
+	width := m.width - 4 // matches renderBody's box Padding(1, 2): 2 cols each side
+	if width <= 0 {
+		width = 58
+	}
+	buildCityScene(width)
+
+	var scene string
+	if cityIsCountryside {
+		scene = m.renderCountrysideScene()
+	} else {
+		scene = m.renderSkylineScene()
+	}
+
+	imgSearchURL := "https://www.google.com/search?tbm=isch&q=" + url.QueryEscape(cityCurrentName)
+	labelText := lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#EEF3FF")).Render(cityCurrentName)
+	label := "\x1b]8;;" + imgSearchURL + "\x1b\\" + labelText + "\x1b]8;;\x1b\\"
+	return label + "\n" + scene + "\n"
+}
+
+func (m model) renderSkylineScene() string {
 	buildingAt := make([]*cityBuilding, cityCols)
 	for i := range cityBuildings {
 		b := &cityBuildings[i]
@@ -7806,6 +9691,9 @@ func (m model) renderCityBanner() string {
 		skyStyle[hex] = s
 		return s
 	}
+
+	daylight := cityIsDaylight()
+	daySkyStyle := lipgloss.NewStyle().Background(lipgloss.Color("#5AA9D6"))
 
 	var out strings.Builder
 	for row := 0; row < cityRows; row++ {
@@ -7826,6 +9714,11 @@ func (m model) renderCityBanner() string {
 				}
 				hex := hslHex(b.hue, 0.72, 0.58)
 				out.WriteString(styleFor(hex).Render(" "))
+			} else if daylight {
+				// It's currently daytime in this city's country — a plain
+				// blue sky reads more truthfully than the default starry
+				// night look. No stars, no other change.
+				out.WriteString(daySkyStyle.Render(" "))
 			} else {
 				// Sky: almost every cell stays blank. The rare star holds a
 				// fixed position and only pulses slowly, so motion reads as
@@ -7851,10 +9744,137 @@ func (m model) renderCityBanner() string {
 	}
 	ground := lipgloss.NewStyle().Foreground(lipgloss.Color("#2BE3A6")).Render(strings.Repeat("‾", cityCols))
 	out.WriteString(ground)
-	imgSearchURL := "https://www.google.com/search?tbm=isch&q=" + url.QueryEscape(cityCurrentName)
-	labelText := lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#EEF3FF")).Render(cityCurrentName)
-	label := "\x1b]8;;" + imgSearchURL + "\x1b\\" + labelText + "\x1b]8;;\x1b\\"
-	return label + "\n" + out.String() + "\n"
+	return out.String()
+}
+
+// renderCountrysideScene draws a daytime grass/river/sky scene — used for
+// the smaller/secondary place names in cityNames (index >= cityMajorCount)
+// that read more as a small town or countryside than a skyline. Same
+// cityRows x cityCols grid as the skyline, laid out top (sky) to bottom
+// (grass), with a full-width river band a couple rows above the ground.
+func (m model) renderCountrysideScene() string {
+	skyRows := 2
+	riverRow := skyRows + 1 // one hill row, then the river
+	bgStyle := map[string]lipgloss.Style{}
+	styleFor := func(hex string) lipgloss.Style {
+		if s, ok := bgStyle[hex]; ok {
+			return s
+		}
+		s := lipgloss.NewStyle().Background(lipgloss.Color(hex))
+		bgStyle[hex] = s
+		return s
+	}
+	fgStyle := map[string]lipgloss.Style{}
+	glyphFor := func(bgHex, fgHex string) lipgloss.Style {
+		key := bgHex + fgHex
+		if s, ok := fgStyle[key]; ok {
+			return s
+		}
+		s := lipgloss.NewStyle().Background(lipgloss.Color(bgHex)).Foreground(lipgloss.Color(fgHex))
+		fgStyle[key] = s
+		return s
+	}
+
+	// Sun/moon position is stable for the scene's lifetime (seeded off the
+	// city index, not time), so it doesn't jump around every regen tick.
+	sunSeed := pseudoHash(cityIndex, 99)
+	sunCol := int(sunSeed % uint32(cityCols))
+	daylight := cityIsDaylight()
+
+	var out strings.Builder
+	for row := 0; row < cityRows; row++ {
+		switch {
+		case row < skyRows:
+			if daylight {
+				skyHex := "#5AA9D6"
+				for col := 0; col < cityCols; col++ {
+					if col == sunCol && row == 0 {
+						out.WriteString(glyphFor(skyHex, "#FFE9A8").Render("@"))
+						continue
+					}
+					seed := pseudoHash(col*13, row*29)
+					if seed%23 == 0 {
+						out.WriteString(glyphFor(skyHex, "#FFFFFF").Render("~"))
+						continue
+					}
+					out.WriteString(styleFor(skyHex).Render(" "))
+				}
+			} else {
+				// Night: dark sky, a static moon, and slow-pulsing stars —
+				// mirrors the skyline's night treatment for consistency.
+				skyHex := "#0B1E33"
+				for col := 0; col < cityCols; col++ {
+					if col == sunCol && row == 0 {
+						out.WriteString(glyphFor(skyHex, "#E8ECF5").Render("☾"))
+						continue
+					}
+					seed := pseudoHash(col*31, row*17)
+					if seed%14 != 0 {
+						out.WriteString(styleFor(skyHex).Render(" "))
+						continue
+					}
+					phase := math.Sin(m.cubeAngle*0.1 + float64(seed%991)*0.05)
+					if phase < 0.4 {
+						out.WriteString(styleFor(skyHex).Render(" "))
+						continue
+					}
+					ch := "."
+					if phase > 0.8 {
+						ch = "*"
+					}
+					out.WriteString(glyphFor(skyHex, "#EEF3FF").Render(ch))
+				}
+			}
+		case row == skyRows:
+			// Hill line with tree silhouettes poking above the grass.
+			hillHex := "#4C8C4A"
+			for col := 0; col < cityCols; col++ {
+				seed := pseudoHash(col*7, 3)
+				if seed%9 == 0 {
+					out.WriteString(glyphFor(hillHex, "#1F5C2E").Render("▲"))
+					continue
+				}
+				out.WriteString(styleFor(hillHex).Render(" "))
+			}
+		case row == riverRow:
+			// River flows: the shimmer pattern scrolls with m.cubeAngle
+			// instead of just blinking in place, so it actually reads as
+			// moving water rather than static texture.
+			riverHex := "#2E86DE"
+			offset := int(m.cubeAngle * 6)
+			for col := 0; col < cityCols; col++ {
+				if ((col+offset)%7 == 0) || ((col+offset*2)%11 == 0) {
+					out.WriteString(glyphFor(riverHex, "#BEE7F5").Render("~"))
+					continue
+				}
+				out.WriteString(styleFor(riverHex).Render(" "))
+			}
+		default:
+			// Grass, darker toward the bottom, with static blade ticks.
+			depth := row - riverRow
+			grassHex := "#3D8B40"
+			bladeHex := "#79C36B"
+			if depth >= 2 {
+				grassHex, bladeHex = "#2F6B3B", "#5CAE52"
+			}
+			for col := 0; col < cityCols; col++ {
+				seed := pseudoHash(col*17, row*31)
+				if seed%3 == 0 {
+					ch := "'"
+					if seed%2 == 0 {
+						ch = "/"
+					}
+					out.WriteString(glyphFor(grassHex, bladeHex).Render(ch))
+					continue
+				}
+				out.WriteString(styleFor(grassHex).Render(" "))
+			}
+		}
+		out.WriteByte('\n')
+	}
+	ground := lipgloss.NewStyle().Foreground(lipgloss.Color("#2F6B3B")).Render(strings.Repeat("‾", cityCols))
+	out.WriteString(ground)
+	return out.String()
 }
 
 func (m model) renderBanner() string {
@@ -7883,6 +9903,14 @@ func (m model) renderBody() string {
 		return box.Render(m.scrollHelpBody(m.renderTavilySettings()))
 	case viewTelegramSettings:
 		return box.Render(m.scrollHelpBody(m.renderTelegramSettings()))
+	case viewAutopilot:
+		return box.Render(m.renderAutopilot())
+	case viewEmailSettings:
+		return box.Render(m.scrollHelpBody(m.renderEmailSettings()))
+	case viewBackupSettings:
+		return box.Render(m.scrollHelpBody(m.renderBackupSettings()))
+	case viewBackupBrowser:
+		return box.Render(m.scrollHelpBody(m.renderBackupBrowser()))
 	case viewWebServerSettings:
 		return box.Render(m.renderWebServerSettings())
 	case viewWebServerModelSelect:
@@ -7892,7 +9920,10 @@ func (m model) renderBody() string {
 	case viewDisclaimerText:
 		return box.Render(m.scrollHelpBody(renderDisclaimerText()))
 	case viewLogText:
-		return box.Render(m.scrollHelpBody(renderLogText()))
+		// No top padding here (unlike the shared `box`) — Search must be
+		// the literal first row right under the title bar, not pushed
+		// down by a blank padding line first.
+		return lipgloss.NewStyle().Padding(0, 2).Render(m.scrollHelpBody(m.renderLogText()))
 	case viewUpdateText:
 		return box.Render(m.renderUpdateText())
 	case viewWizard:
@@ -8021,6 +10052,23 @@ func hyperlink(url string, style lipgloss.Style) string {
 func (m model) renderTavilySettings() string {
 	var b strings.Builder
 	b.WriteString("tavily API key\n\n")
+
+	current := os.Getenv("TAVILY_API_KEY")
+	if current != "" && !m.tavilyEditing {
+		greyed := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+		masked := current
+		if len(masked) > 8 {
+			masked = masked[:4] + strings.Repeat("*", len(masked)-8) + masked[len(masked)-4:]
+		}
+		b.WriteString(helpKeyStyle.Render("● configured") + "\n\n")
+		b.WriteString(greyed.Render("Key: "+masked) + "\n")
+		if m.tavilyKeyMsg != "" {
+			b.WriteString("\n" + m.tavilyKeyMsg + "\n")
+		}
+		b.WriteString("\n[r] reconfigure    Esc: back\n")
+		return b.String()
+	}
+
 	b.WriteString("HOW TO GET A KEY (takes 2 minutes, free):\n")
 	b.WriteString("  1. Open " + hyperlink("https://app.tavily.com/", greenLinkStyle) + " and sign up (email or Google).\n")
 	b.WriteString("  2. It opens straight to \"API Playground\". In the \"API key\" box, top\n")
@@ -8036,13 +10084,12 @@ func (m model) renderTavilySettings() string {
 	b.WriteString("                    read_webpage can't: cookie walls, JS-only shells)\n")
 	b.WriteString("Nothing else in this app needs a key — skip this screen if you don't want it.\n\n")
 
-	current := os.Getenv("TAVILY_API_KEY")
 	if current != "" {
 		masked := current
 		if len(masked) > 8 {
 			masked = masked[:4] + strings.Repeat("*", len(masked)-8) + masked[len(masked)-4:]
 		}
-		b.WriteString(helpKeyStyle.Render("current key: "+masked) + "\n\n")
+		b.WriteString(helpKeyStyle.Render("current key (reconfiguring): "+masked) + "\n\n")
 	} else {
 		b.WriteString(agentToolStyle.Render("no key set — tavily_search/tavily_extract will return an error until one is") + "\n\n")
 	}
@@ -8061,6 +10108,28 @@ func (m model) renderTelegramSettings() string {
 
 	cfg := loadTelegramConfig()
 	running := isTelegramRunning()
+
+	if cfg.Token != "" && !m.telegramEditing {
+		greyed := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+		masked := maskAppPassword(cfg.Token)
+		b.WriteString(helpKeyStyle.Render("● configured") + "\n\n")
+		b.WriteString(greyed.Render("Token: "+masked) + "\n")
+		if running {
+			b.WriteString(greyed.Render(fmt.Sprintf("Running — model: %s", cfg.Model)))
+			if cfg.ChatID != 0 {
+				b.WriteString(greyed.Render(fmt.Sprintf("  —  bound to chat %d", cfg.ChatID)) + "\n")
+			} else {
+				b.WriteString("\n" + agentToolStyle.Render("Not bound yet — message the bot on Telegram to bind it.") + "\n")
+			}
+		} else {
+			b.WriteString(redStyle.Render("Saved but not running.") + "\n")
+		}
+		if m.telegramMsg != "" {
+			b.WriteString("\n" + m.telegramMsg + "\n")
+		}
+		b.WriteString("\n[r] reconfigure    Esc: back\n")
+		return b.String()
+	}
 
 	if running {
 		// Already set up — the step-by-step guide is just noise once it's
@@ -8096,6 +10165,190 @@ func (m model) renderTelegramSettings() string {
 	return b.String()
 }
 
+// maskAppPassword shows only the last 4 characters — enough to recognize
+// which password is saved without ever fully displaying it on screen.
+func maskAppPassword(s string) string {
+	if s == "" {
+		return ""
+	}
+	n := len(s)
+	if n <= 4 {
+		return strings.Repeat("•", n)
+	}
+	return strings.Repeat("•", n-4) + s[n-4:]
+}
+
+func (m model) renderEmailSettings() string {
+	var b strings.Builder
+	b.WriteString("email (Gmail)\n\n")
+	cfg := loadEmailConfig()
+
+	configured := cfg.FromAddress != "" && !m.emailEditing && !m.emailSending
+	if configured {
+		greyed := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+		b.WriteString(helpKeyStyle.Render("● configured") + "\n\n")
+		b.WriteString(greyed.Render(fmt.Sprintf("Gmail address: %s", cfg.FromAddress)) + "\n")
+		displayName := cfg.DisplayName
+		if displayName == "" {
+			displayName = "(none)"
+		}
+		b.WriteString(greyed.Render(fmt.Sprintf("Display name:  %s", displayName)) + "\n")
+		b.WriteString(greyed.Render("App password:  XXXXXXX") + "\n")
+		if m.emailMsg != "" {
+			b.WriteString("\n" + m.emailMsg + "\n")
+		}
+		b.WriteString("\n[r] reconfigure    Esc: back\n")
+		return b.String()
+	}
+
+	b.WriteString("HOW TO GET A GMAIL APP PASSWORD (takes ~2 minutes):\n")
+	b.WriteString("  1. Your Google account needs 2-Step Verification turned on first:\n")
+	b.WriteString("     " + hyperlink("https://myaccount.google.com/security", greenLinkStyle) + "\n")
+	b.WriteString("  2. Then generate an App Password here:\n")
+	b.WriteString("     " + hyperlink("https://myaccount.google.com/apppasswords", greenLinkStyle) + "\n")
+	b.WriteString("     Name it anything (e.g. \"llama-shell\") and click Create.\n")
+	b.WriteString("  3. Google shows a 16-character code (spaces don't matter) — copy it,\n")
+	b.WriteString("     that's the App Password below, NOT your normal Gmail password.\n\n")
+	b.WriteString(agentToolStyle.Render(fmt.Sprintf("SMTP server: %s:%s (STARTTLS) — fixed, this is Gmail's real one", emailSMTPHost, emailSMTPPort)) + "\n\n")
+
+	cursorFor := func(field int) string {
+		if m.emailFieldFocus == field {
+			return "█"
+		}
+		return ""
+	}
+	styleFor := func(field int) lipgloss.Style {
+		if m.emailFieldFocus == field {
+			return helpKeyStyle
+		}
+		return unselectedStyle
+	}
+	b.WriteString(styleFor(0).Render(fmt.Sprintf("Gmail address: %s%s", m.emailAddrInput, cursorFor(0))) + "\n")
+	b.WriteString(styleFor(1).Render(fmt.Sprintf("Display name:  %s%s", m.emailDisplayNameInput, cursorFor(1))) + agentToolStyle.Render(" (optional)") + "\n")
+	b.WriteString(styleFor(2).Render(fmt.Sprintf("App password:  %s%s", maskAppPassword(m.emailPassInput), cursorFor(2))) + "\n")
+
+	if m.emailSending {
+		b.WriteString("\nSending a test email to confirm it works...\n")
+	} else if m.emailMsg != "" {
+		b.WriteString("\n" + m.emailMsg + "\n")
+	}
+	b.WriteString("\nTab: switch field   Enter: save + send test email   Esc: back\n")
+	return b.String()
+}
+
+// renderBackupSettings shows either the export/import chooser or the
+// path+password form for whichever one was picked. There's no
+// "configured" summary here (unlike email/tavily/telegram) — backup
+// isn't a persistent credential, it's a one-shot action you take
+// whenever you want a fresh export or a restore.
+func (m model) renderBackupSettings() string {
+	var b strings.Builder
+	b.WriteString("backup / restore\n\n")
+	b.WriteString("Exports every setting in this app (email, telegram, tavily, web\n")
+	b.WriteString("server, auto-update, disclaimer, etc.) into one encrypted file — or\n")
+	b.WriteString("restores them from one made earlier. AES-256-GCM, so the file isn't\n")
+	b.WriteString("plain text if opened or edited directly. No password to set or\n")
+	b.WriteString("remember — " + agentToolStyle.Render("this protects against casual viewing/editing, not a\ndetermined attacker with this app's source code.") + "\n\n")
+	b.WriteString(helpKeyStyle.Render("[e]") + " export settings to a new encrypted file\n")
+	b.WriteString(helpKeyStyle.Render("[i]") + " import settings from an encrypted file (overwrites current settings)\n")
+
+	if m.backupMsg != "" {
+		b.WriteString("\n" + m.backupMsg + "\n")
+	}
+	b.WriteString("\nEsc: back\n")
+	return b.String()
+}
+
+// renderBackupBrowser draws the in-terminal directory browser used by
+// both export (with an editable destination filename below the list)
+// and import (Enter on a .lsb file restores it immediately).
+func (m model) renderBackupBrowser() string {
+	var b strings.Builder
+	verb := "Export to"
+	if m.backupMode == "import" {
+		verb = "Import from"
+	}
+	b.WriteString(helpKeyStyle.Render(verb) + "\n")
+	b.WriteString(agentToolStyle.Render(m.backupBrowseDir) + "\n\n")
+
+	for i, e := range m.backupBrowseEntries {
+		line := e.name
+		if e.isDir {
+			line += "/"
+		}
+		style := unselectedStyle
+		if i == m.backupBrowseCursor && !m.backupBrowseEditingName {
+			style = helpKeyStyle
+			line = "> " + line
+		} else {
+			line = "  " + line
+		}
+		b.WriteString(style.Render(line) + "\n")
+	}
+	if len(m.backupBrowseEntries) == 0 {
+		b.WriteString(agentToolStyle.Render("  (empty directory)") + "\n")
+	}
+
+	if m.backupMode == "export" {
+		cursor := ""
+		nameStyle := unselectedStyle
+		if m.backupBrowseEditingName {
+			cursor = "█"
+			nameStyle = helpKeyStyle
+		}
+		b.WriteString("\n" + nameStyle.Render(fmt.Sprintf("File name: %s%s", m.backupBrowseFilename, cursor)) + "\n")
+	}
+
+	if m.backupMsg != "" {
+		b.WriteString("\n" + m.backupMsg + "\n")
+	}
+
+	if m.backupMode == "export" {
+		b.WriteString("\nUp/Down: move   Enter: open folder / edit name   Tab: switch to file name   Enter on name: save   Esc: cancel\n")
+	} else {
+		b.WriteString("\nUp/Down: move   Enter: open folder / import file   Esc: cancel\n")
+	}
+	return b.String()
+}
+
+// parseHHMM parses a 24-hour "HH:MM" string, tolerating single-digit hours
+// (e.g. "3:00"). Used for the auto-update check-time setting.
+func parseHHMM(s string) (hour, minute int, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(s), ":", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	mi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || mi < 0 || mi > 59 {
+		return 0, 0, false
+	}
+	return h, mi, true
+}
+
+func (m model) renderAutopilot() string {
+	var b strings.Builder
+	b.WriteString(helpKeyStyle.Render("autopilot") + "\n\n")
+	switch m.autopilotPhase {
+	case "installing_ollama":
+		b.WriteString("Ollama isn't installed — opening the installer download page...\n")
+	case "waiting_for_manual_install":
+		b.WriteString(m.autopilotMsg + "\n\n")
+		b.WriteString(redStyle.Render("Windows/macOS installers aren't scriptable — finish the install, "+
+			"then relaunch llama-shell and run autopilot again.") + "\n")
+	case "pulling_model":
+		b.WriteString(fmt.Sprintf("Downloading %s (this app's default model)... this can take a while.\n", autopilotModel))
+	case "error":
+		b.WriteString(redStyle.Render(m.autopilotMsg) + "\n")
+	case "done":
+		b.WriteString(helpKeyStyle.Render("● ready") + "\n\n")
+		b.WriteString(fmt.Sprintf("%s installed, web server enabled with model %s:\n\n", autopilotModel, autopilotModel))
+		b.WriteString("  " + hyperlink(m.autopilotMsg, greenLinkStyle) + "\n")
+	}
+	b.WriteString("\nEsc: back to main menu\n")
+	return b.String()
+}
+
 func (m model) renderWebServerSettings() string {
 	var b strings.Builder
 	b.WriteString("web server\n\n")
@@ -8111,11 +10364,12 @@ func (m model) renderWebServerSettings() string {
 	b.WriteString("first time; allow it if you want LAN/phone access to work.\n\n")
 
 	cfg := loadWebServerConfig()
+	port := webServerEffectivePort(cfg)
 	running := isWebServerRunning()
 	switch {
 	case running:
 		b.WriteString(helpKeyStyle.Render("● running") + fmt.Sprintf("  —  model: %s\n\n", cfg.Model))
-		b.WriteString("  " + hyperlink(webServerURL(cfg.Token), greenLinkStyle) + "\n\n")
+		b.WriteString("  " + hyperlink(webServerURL(cfg.Token, port), greenLinkStyle) + "\n\n")
 	case cfg.Enabled:
 		b.WriteString(redStyle.Render("● enabled in settings, but not running right now") + "\n")
 		webServerMu.Lock()
@@ -8140,10 +10394,22 @@ func (m model) renderWebServerSettings() string {
 		return b.String()
 	}
 
+	if m.webServerEditingPort {
+		cursor := ""
+		if len(m.webServerPortInput) < 5 {
+			cursor = "█"
+		}
+		b.WriteString(helpKeyStyle.Render(fmt.Sprintf("Port: %s%s", m.webServerPortInput, cursor)) + "\n")
+		b.WriteString(agentToolStyle.Render(fmt.Sprintf("(currently %d)", port)) + "\n\n")
+		b.WriteString("Enter: save   Esc: cancel\n")
+		return b.String()
+	}
+
+	b.WriteString(fmt.Sprintf("Port: %d\n\n", port))
 	if m.webServerMsg != "" {
 		b.WriteString(m.webServerMsg + "\n\n")
 	}
-	b.WriteString(helpKeyStyle.Render("[e] enable") + " (choose/confirm model)    " + helpKeyStyle.Render("[d] disable") + "\n")
+	b.WriteString(helpKeyStyle.Render("[e] enable") + " (choose/confirm model)    " + helpKeyStyle.Render("[d] disable") + "    " + helpKeyStyle.Render("[p] port") + "\n")
 	b.WriteString("Esc: back\n")
 	return b.String()
 }
@@ -8389,6 +10655,11 @@ func (m model) renderUpdateText() string {
 		return helpKeyStyle.Render("update") + "\n\n" + m.updateResult +
 			"\n\n(press any key to continue)\n"
 	}
+	if m.autoUpdateEditingTime {
+		return helpKeyStyle.Render("update") + "\n\n" +
+			"new auto-update check time (24h HH:MM), then Enter to save, Esc to cancel:\n" +
+			"> " + m.autoUpdateTimeInput + "█\n"
+	}
 
 	var b strings.Builder
 	b.WriteString(helpKeyStyle.Render("update") + "\n\n")
@@ -8413,6 +10684,19 @@ func (m model) renderUpdateText() string {
 	default:
 		b.WriteString(fmt.Sprintf("latest version  : %s  (up to date)\n", m.updateLatest))
 	}
+
+	b.WriteString("\n")
+	autoCfg := loadAutoUpdateConfig()
+	b.WriteString(helpKeyStyle.Render("auto-update") + "\n")
+	if autoCfg.Enabled {
+		b.WriteString(helpKeyStyle.Render("● enabled") + fmt.Sprintf("  —  daily check at %02d:%02d\n", autoCfg.Hour, autoCfg.Minute))
+	} else {
+		b.WriteString(agentToolStyle.Render("○ disabled") + fmt.Sprintf("  —  would check daily at %02d:%02d\n", autoCfg.Hour, autoCfg.Minute))
+	}
+	if m.autoUpdateMsg != "" {
+		b.WriteString(m.autoUpdateMsg + "\n")
+	}
+	b.WriteString("[e] enable    [d] disable    [t] set check time\n")
 
 	b.WriteString("\nEsc: back\n")
 	return b.String()
@@ -8518,8 +10802,33 @@ func (m model) renderWizard() string {
 	return b.String()
 }
 
-func renderLogText() string {
-	return "activity log (most recent entries)\n\n" + readLogTail(200) + "\n\nEsc: back\n"
+// logSearchLabelStyle renders the word "Search" in green so the log
+// screen's search box reads as an actual UI control on row 1, not just
+// text buried in a description line.
+var logSearchLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FFF5F"))
+
+func (m model) renderLogText() string {
+	label := logSearchLabelStyle.Render("Search")
+	var searchRow, subRow string
+	switch {
+	case m.logSearchMode:
+		searchRow = label + ": " + m.logQuery + "█"
+		subRow = "(Enter to lock filter, Esc to clear/exit search)"
+	case m.logQuery != "":
+		searchRow = label + fmt.Sprintf(": %q", m.logQuery)
+		subRow = "(/ to change, Esc on this screen to clear)"
+	default:
+		searchRow = label + ": " + lipgloss.NewStyle().Bold(true).Blink(true).Render("(press / to type)")
+		subRow = fmt.Sprintf("activity log — most recent %d events", maxDisplayedLogLines)
+	}
+	header := searchRow + "\n" + subRow + "\n\n"
+
+	lines := readLogLines(m.logQuery)
+	body := "no matching log entries."
+	if len(lines) > 0 {
+		body = strings.Join(lines, "\n")
+	}
+	return header + body + "\n\nEsc: back\n"
 }
 
 func (m model) renderDeviceInfo() string {
@@ -9149,6 +11458,45 @@ func containsRTL(s string) bool {
 	return false
 }
 
+// reorderMixedToken fixes a word that mixes RTL letters with an embedded
+// LTR run (digits, a number like "150", a Latin abbreviation) — e.g. a
+// Hebrew word glued to a number by a hyphen. Reversing the whole token's
+// characters (the old behavior) also reversed the digits themselves
+// ("150" -> "051"), which is wrong: digits are logically LTR even inside
+// an RTL sentence. This splits the token into maximal RTL/non-RTL rune
+// runs, reverses the RUN ORDER (the word still flows right-to-left) and
+// reverses characters only within each RTL run, leaving any embedded
+// digit/Latin run's internal character order untouched.
+func reorderMixedToken(text string) string {
+	type run struct {
+		text string
+		rtl  bool
+	}
+	runes := []rune(text)
+	var runs []run
+	i := 0
+	for i < len(runes) {
+		start := i
+		rtl := isRTLRune(runes[i])
+		for i < len(runes) && isRTLRune(runes[i]) == rtl {
+			i++
+		}
+		runs = append(runs, run{text: string(runes[start:i]), rtl: rtl})
+	}
+	for a, b := 0, len(runs)-1; a < b; a, b = a+1, b-1 {
+		runs[a], runs[b] = runs[b], runs[a]
+	}
+	var out strings.Builder
+	for _, r := range runs {
+		if r.rtl {
+			out.WriteString(reverseRunes(r.text))
+		} else {
+			out.WriteString(r.text)
+		}
+	}
+	return out.String()
+}
+
 func reverseRunes(s string) string {
 	r := []rune(s)
 	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
@@ -9211,7 +11559,7 @@ func fixRTLDisplay(line string) string {
 	}
 	for idx := range run {
 		if !run[idx].isSpace && containsRTL(run[idx].text) {
-			run[idx].text = reverseRunes(run[idx].text)
+			run[idx].text = reorderMixedToken(run[idx].text)
 		}
 	}
 
@@ -9294,20 +11642,48 @@ func cleanMarkdownForDisplay(s string) string {
 	return stripMarkdownCodeSpans(stripMarkdownBold(stripMarkdownLinks(s)))
 }
 
+// rightAlignIfRTL pads s with leading spaces so it hugs the right edge of
+// width columns — an RTL (Hebrew/Arabic) line reads naturally anchored to
+// the right, not flush against the left margin like LTR text. A no-op for
+// lines with no RTL content, or that already fill the width.
+func rightAlignIfRTL(s string, width int) string {
+	if !containsRTL(s) {
+		return s
+	}
+	pad := width - lipgloss.Width(s)
+	if pad <= 0 {
+		return s
+	}
+	return strings.Repeat(" ", pad) + s
+}
+
 func renderPrefixedChatLines(prefix, content string, width int, prefixStyle lipgloss.Style) []string {
 	wrapped := wrapLines(prefix+content, width)
 	out := make([]string, len(wrapped))
 	for i, l := range wrapped {
 		if i == 0 && strings.HasPrefix(l, prefix) {
-			out[i] = prefixStyle.Render(prefix) + linkifyLine(l[len(prefix):], agentToolStyle)
+			rest := rightAlignIfRTL(l[len(prefix):], width-lipgloss.Width(prefix))
+			out[i] = prefixStyle.Render(prefix) + linkifyLine(rest, agentToolStyle)
 		} else {
-			out[i] = linkifyLine(l, agentToolStyle)
+			out[i] = linkifyLine(rightAlignIfRTL(l, width), agentToolStyle)
 		}
 	}
 	return out
 }
 
-func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string, spinnerFrame int, warmupElapsed time.Duration) []string {
+// lastAssistantContent returns the last non-empty assistant message's
+// content in msgs, or "" if none — used to decide whether a completed turn
+// actually produced a displayed reply (vs. an error with nothing to show).
+func lastAssistantContent(msgs []ollamaChatMsg) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" && strings.TrimSpace(msgs[i].Content) != "" {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
+func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string, spinnerFrame int, warmupElapsed time.Duration, turnTimes []time.Duration) []string {
 	var lines []string
 	toolNames := flatToolNames()
 	lines = append(lines, agentHeadStyle.Render(fmt.Sprintf("%d tools available — Alt+T to browse by category", len(toolNames))))
@@ -9316,6 +11692,7 @@ func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, 
 		lines = append(lines, s)
 	}
 	lines = append(lines, "")
+	replyIdx := 0
 	for _, msg := range messages {
 		before := len(lines)
 		switch msg.Role {
@@ -9332,6 +11709,14 @@ func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, 
 		case "assistant":
 			if strings.TrimSpace(msg.Content) != "" {
 				lines = append(lines, renderPrefixedChatLines(modelName+"> ", cleanMarkdownForDisplay(msg.Content), width, agentReplyStyle)...)
+				// Elapsed time for this turn, display-only (never fed back
+				// into msg.Content, so it never pollutes the model's own
+				// context on the next turn) — mirrors the web UI/Telegram
+				// timing footer so all three surfaces show it consistently.
+				if replyIdx < len(turnTimes) {
+					lines = append(lines, agentToolStyle.Render("⏱ "+formatElapsedDuration(turnTimes[replyIdx])))
+				}
+				replyIdx++
 			}
 		}
 		// Only add a separating blank line for messages that actually
@@ -9351,7 +11736,7 @@ func (m *model) syncAgentViewport() {
 	if !m.agentVPReady {
 		return
 	}
-	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup, m.agentSpinner, time.Since(m.agentWarmupStarted))
+	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup, m.agentSpinner, time.Since(m.agentWarmupStarted), m.agentTurnTimes)
 	m.agentViewport.SetContent(strings.Join(lines, "\n"))
 	m.agentViewport.GotoBottom()
 }
@@ -9396,12 +11781,19 @@ func (m model) renderAgentChat() string {
 			bottom.WriteString(fmt.Sprintf("%s (%s)\n", frame, elapsed))
 		}
 	} else {
-		// Not reordered here on purpose: this is the live, still-being-typed
-		// input line, and flipping word/character order on every keystroke
-		// would make the cursor position and text jump around as you type.
-		// Once the message is sent it renders through linkifyLine (via
-		// renderPrefixedChatLines), which does apply the RTL fix.
-		bottom.WriteString(agentUserStyle.Render("you> ") + agentToolStyle.Render(m.agentInput+"█") + "\n")
+		// Reordered live, same as a sent message — a Hebrew/Arabic typist
+		// needs to read what they're typing as they type it, not just once
+		// it's sent. The cursor moves to the left edge of the RTL span
+		// instead of trailing at the end, matching where the next
+		// (logically-appended, visually-leftward) character will land.
+		liveInput := m.agentInput
+		var inputRendered string
+		if containsRTL(liveInput) {
+			inputRendered = "█" + fixRTLDisplay(liveInput)
+		} else {
+			inputRendered = liveInput + "█"
+		}
+		bottom.WriteString(agentUserStyle.Render("you> ") + agentToolStyle.Render(inputRendered) + "\n")
 	}
 
 	if m.agentVPReady {
@@ -9561,7 +11953,7 @@ var agentToolCategories = []toolCategory{
 	}},
 	{"Networking & Web", []string{
 		"web_search", "read_webpage", "rss_feed", "find_rss_feed", "tavily_search", "tavily_extract", "http_get", "http_post", "download_file", "ping_host",
-		"get_public_ip", "get_web_ui_url", "ssh_run", "list_network_interfaces",
+		"get_public_ip", "get_web_ui_url", "ssh_run", "list_network_interfaces", "send_email",
 	}},
 	{"System & Environment", []string{
 		"system_info", "list_env_vars", "get_env", "get_clipboard", "set_clipboard",
@@ -9631,6 +12023,8 @@ var toolExamples = map[string][2]string{
 	"http_post":                  {"POST this JSON payload to my webhook URL", "Send a test request to the local API"},
 	"download_file":              {"Download this ZIP to the downloads folder", "Save this image to disk"},
 	"ping_host":                  {"Is 8.8.8.8 reachable?", "Ping github.com to check connectivity"},
+	"get_stock_quote":            {"What is the NASDAQ-100 index value right now?", "What's Apple's stock price?"},
+	"send_email":                 {"Email test@example.com with subject 'Hi' and body 'Just testing'", "Send an email summarizing this conversation to my boss"},
 	"get_public_ip":              {"What's my public IP address?", "Check what IP this machine shows on the internet"},
 	"get_web_ui_url":             {"What's the URL to browse to the web UI?", "Give me the link to open llama-shell in a browser"},
 	"ssh_run":                    {"Run \"uptime\" on my home server", "SSH into the pi and check disk usage"},
@@ -9774,11 +12168,250 @@ func (m model) renderCmdView(label string) string {
 	return fmt.Sprintf("%s\n\n%s\nEsc: back", label, m.output)
 }
 
+// pendingRelaunchExePath is set by the auto-update daemon right before it
+// calls p.Quit() — main() checks it after p.Run() returns (so the TUI has
+// already restored the terminal cleanly) and, if set, execs the freshly
+// swapped-in binary and exits this process.
+var pendingRelaunchExePath string
+
+// durationUntilNextClockTime returns how long to sleep until the next local
+// occurrence of hour:minute, today's if it hasn't passed yet, otherwise
+// tomorrow's. Read fresh from config each loop iteration (not cached), so
+// changing the time in settings takes effect on the very next wake cycle.
+func durationUntilNextClockTime(hour, minute int) time.Duration {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	return next.Sub(now)
+}
+
+// runAutoUpdateDaemon wakes once a day at the configured time and, if the
+// auto-update checkbox is on and a newer release exists, downloads it,
+// swaps it into place, and asks the running TUI to quit so main() can
+// relaunch the new binary. Runs for the whole process lifetime; never
+// returns on its own.
+func runAutoUpdateDaemon(p *tea.Program) {
+	for {
+		cfg := loadAutoUpdateConfig()
+		time.Sleep(durationUntilNextClockTime(cfg.Hour, cfg.Minute))
+		if !loadAutoUpdateConfig().Enabled {
+			continue
+		}
+		latest, assetURL, err := checkForUpdateSync()
+		if err != nil {
+			appendLog("auto-update: check failed: %s", err.Error())
+			continue
+		}
+		if assetURL == "" || !isNewerVersion(appVersion, latest) {
+			continue
+		}
+		exePath, err := os.Executable()
+		if err != nil {
+			appendLog("auto-update: could not resolve exe path: %s", err.Error())
+			continue
+		}
+		exePath, err = filepath.EvalSymlinks(exePath)
+		if err != nil {
+			appendLog("auto-update: could not resolve exe path: %s", err.Error())
+			continue
+		}
+		result := applyUpdateAt(exePath, assetURL)
+		if result.err != "" {
+			appendLog("auto-update: failed to apply %s: %s", latest, result.err)
+			continue
+		}
+		appendLog("auto-update: downloaded %s, relaunching", latest)
+		pendingRelaunchExePath = exePath
+		p.Quit()
+		return
+	}
+}
+
+// startupAutopilot is set by handleCLIArgs when llama-shell was launched
+// with --autopilot — initialModel() checks it to jump straight into the
+// same autopilot flow the main menu's [a] triggers, instead of showing
+// the menu first.
+var startupAutopilot bool
+
+// startupMinimized is set by handleCLIArgs when launched with
+// --minimized — main() minimizes the console window (Windows only, see
+// minimizeConsoleWindow) right after starting the TUI, so llama-shell can
+// be launched e.g. from a startup script without popping a window in the
+// user's face.
+var startupMinimized bool
+
+// handleCLIArgs checks os.Args for flags that print-and-exit (help,
+// --tools[-extended], --log) before the TUI (tea.NewProgram) ever starts
+// — these are meant to work from a plain terminal pipe (e.g.
+// `llama-shell --tools | grep ...`), which an alt-screen TUI can't do.
+// --autopilot and --minimized instead just set a startup flag and fall
+// through to the normal TUI startup, since both affect how the TUI itself
+// comes up rather than replacing it.
+func handleCLIArgs() {
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h", "/help", "/?", "-?", "help":
+			printCLIHelp()
+			os.Exit(0)
+		case "--tools":
+			printCLITools(false)
+			os.Exit(0)
+		case "--tools-extended":
+			printCLITools(true)
+			os.Exit(0)
+		case "--autopilot":
+			startupAutopilot = true
+		case "--minimized":
+			startupMinimized = true
+		case "--log":
+			n := 100
+			if i+1 < len(args) {
+				if parsed, err := strconv.Atoi(args[i+1]); err == nil {
+					n = parsed
+					i++ // consume the number too
+				}
+			}
+			printCLILog(n)
+			os.Exit(0)
+		case "--export-backup":
+			path := defaultBackupPath()
+			if i+1 < len(args) {
+				path = args[i+1]
+				i++
+			}
+			if err := exportBackup(path); err != nil {
+				fmt.Fprintln(os.Stderr, "export failed: "+err.Error())
+				os.Exit(1)
+			}
+			fmt.Println("exported settings to " + path)
+			os.Exit(0)
+		case "--import-backup":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "usage: llama-shell --import-backup <path>")
+				os.Exit(1)
+			}
+			path := args[i+1]
+			i++
+			if err := importBackup(path); err != nil {
+				fmt.Fprintln(os.Stderr, "import failed: "+err.Error())
+				os.Exit(1)
+			}
+			fmt.Println("imported settings from " + path)
+			os.Exit(0)
+		}
+	}
+}
+
+func printCLIHelp() {
+	fmt.Println("llama-shell — Ollama TUI")
+	fmt.Println()
+	fmt.Println("Usage: llama-shell [flag]")
+	fmt.Println()
+	fmt.Println("  --help, -h, /help, /?, -?   Show this help and exit.")
+	fmt.Println("  --autopilot                 Skip the menu: check Ollama is installed (opens")
+	fmt.Println("                              the installer page if not), pull " + autopilotModel)
+	fmt.Println("                              if missing, enable + start the web server, then")
+	fmt.Println("                              load straight into the agentic chat with it —")
+	fmt.Println("                              the same flow as pressing [a] in the main menu.")
+	fmt.Println("  --minimized                 Start normally, but minimize the console window")
+	fmt.Println("                              right away (Windows only) — for launching from a")
+	fmt.Println("                              startup script without popping up in your face.")
+	fmt.Println("  --tools                     List every agent tool, grouped by category, and")
+	fmt.Println("                              exit — the same tool list shown in the TUI")
+	fmt.Println("                              (Alt+T), the web UI's Tools panel, and used by")
+	fmt.Println("                              the agent itself; this is just a plain-text dump")
+	fmt.Println("                              of it for scripting/piping from a shell.")
+	fmt.Println("  --tools-extended            Same, but numbered and with the two example")
+	fmt.Println("                              prompts shown for each tool (matches the TUI's")
+	fmt.Println("                              Alt+T detail view) instead of just the name and")
+	fmt.Println("                              one-line description.")
+	fmt.Println("  --log [N]                   Print the last N activity log lines (default 100")
+	fmt.Println("                              if N is omitted) and exit. Same log the TUI's")
+	fmt.Println("                              [h] -> [g] view-log screen and its search read.")
+	fmt.Println("  --export-backup [path]      Export every setting (email, telegram, tavily,")
+	fmt.Println("                              web server, auto-update, disclaimer, etc.) to an")
+	fmt.Println("                              encrypted file and exit. Path defaults to")
+	fmt.Println("                              " + defaultBackupPath() + " if omitted.")
+	fmt.Println("                              Same feature as [h] -> [x] in the menu.")
+	fmt.Println("  --import-backup <path>      Import settings from an encrypted file made by")
+	fmt.Println("                              --export-backup (or [h] -> [x]) and exit —")
+	fmt.Println("                              overwrites current settings.")
+	fmt.Println()
+	fmt.Println("Run with no flags to open the normal interactive menu.")
+}
+
+// printCLITools dumps agentToolCategories — the exact same data structure
+// the TUI's Alt+T browser and the web UI's /api/tools endpoint read from
+// — as plain text, so all three surfaces (TUI, web UI, and this CLI
+// listing) can never drift apart into three different tool lists.
+func printCLITools(extended bool) {
+	total := len(flatToolNames())
+	fmt.Printf("llama-shell tools (%d)\n\n", total)
+	num := 0
+	for _, cat := range agentToolCategories {
+		fmt.Println(cat.name + ":")
+		for _, name := range cat.tools {
+			num++
+			if !extended {
+				fmt.Printf("  %-26s %s\n", name, toolDescription(name))
+				continue
+			}
+			fmt.Printf("  %d. %s\n", num, name)
+			fmt.Printf("     %s\n", toolDescription(name))
+			if ex, ok := toolExamples[name]; ok {
+				fmt.Printf("     e.g. \"%s\"\n", ex[0])
+				fmt.Printf("     e.g. \"%s\"\n", ex[1])
+			}
+			fmt.Println()
+		}
+		fmt.Println()
+	}
+}
+
+// printCLILog prints the last n activity log lines, oldest first (a
+// terminal reads top-to-bottom, so ascending timestamp order reads
+// naturally, unlike the TUI/web UI's newest-first list view). Same
+// underlying source (readLogLines) as those two.
+func printCLILog(n int) {
+	if n <= 0 {
+		n = 100
+	}
+	lines := readLogLines("") // newest first
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	if len(lines) == 0 {
+		fmt.Println("no log entries yet.")
+		return
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		fmt.Println(lines[i])
+	}
+}
+
 func main() {
+	handleCLIArgs()
 	cleanupOldExe()
+	preventSleep()
+	if startupMinimized {
+		minimizeConsoleWindow()
+	}
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	go runAutoUpdateDaemon(p)
 	if _, err := p.Run(); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
+	}
+	if pendingRelaunchExePath != "" {
+		cmd := exec.Command(pendingRelaunchExePath)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Start(); err != nil {
+			fmt.Println("auto-update: relaunch failed:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 }
