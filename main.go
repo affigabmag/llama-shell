@@ -648,7 +648,7 @@ type ollamaChatRequest struct {
 // far larger than this (gemma4:e2b: 131072), so this is well within what
 // the model itself supports — the constraint is available RAM for the
 // larger KV cache, not the model's own limit.
-const agentContextTokens = 8192
+const agentContextTokens = 16384
 
 type ollamaChatResponse struct {
 	Message ollamaChatMsg `json:"message"`
