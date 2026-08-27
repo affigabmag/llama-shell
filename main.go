@@ -2832,6 +2832,15 @@ var liveDataRe = regexp.MustCompile(`(?i)\b(stock price|share price|stock index|
 	`current price|current value|closing value|closing price|live score|` +
 	`weather (in|for|today)|forecast)\b`)
 
+// liveDateTimeRe catches the other common shape of this same refusal —
+// a small model saying "I don't have access to the current date/time"
+// to a plain "what day is it" question, even though get_datetime (a
+// real local system call, not a live web fetch) answers it directly.
+// Kept separate from liveDataRe since the nudge text for this case is
+// unrelated to stocks/weather/web_search.
+var liveDateTimeRe = regexp.MustCompile(`(?i)\b(what (day|date|time) is it|current (date|time)|` +
+	`today'?s date|what'?s today|what day is today|what time is it)\b`)
+
 // liveDataNudge returns a one-off system reminder to inject right before
 // the model call when the latest user message asks for a live value — it
 // is never stored back into the conversation history, only sent for this
@@ -2852,7 +2861,17 @@ func liveDataNudge(msgs []ollamaChatMsg) *ollamaChatMsg {
 		return nil
 	}
 	last := msgs[len(msgs)-1]
-	if last.Role != "user" || !liveDataRe.MatchString(last.Content) {
+	if last.Role != "user" {
+		return nil
+	}
+	if liveDateTimeRe.MatchString(last.Content) {
+		return &ollamaChatMsg{Role: "system", Content: "The message right above asks what the " +
+			"current date/day/time is. Call get_datetime — it reads this machine's real system " +
+			"clock, not a live web fetch, so it always works and is always accurate. Do NOT say " +
+			"you don't have real-time access; call the tool and answer with the real value it " +
+			"returns."}
+	}
+	if !liveDataRe.MatchString(last.Content) {
 		return nil
 	}
 	return &ollamaChatMsg{Role: "system", Content: "The message right above asks for a live/" +

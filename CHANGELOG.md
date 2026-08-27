@@ -3,6 +3,13 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Date/time refusal nudge — fourteenth session (2026-08-27)
+
+- Extended the live-data nudge to cover "what day is it today"-style
+  questions, not just stocks/weather — the model was refusing these
+  too, even though `get_datetime` reads the real local system clock and
+  always works.
+
 ## Short-terminal banner, frozen warmup timer, backup browser scroll — thirteenth session (2026-08-27)
 
 - Main menu banner now truncates from the bottom on a short terminal
