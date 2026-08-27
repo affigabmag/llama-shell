@@ -9146,7 +9146,7 @@ func (m model) renderFooter() string {
 	// them being the first thing clipped off-screen.
 	buildLabel := fmt.Sprintf("build %s", buildTime)
 	if appVersion != "" && appVersion != "dev" {
-		buildLabel += " " + appVersion
+		buildLabel = "llama-shell " + appVersion
 	}
 	left := plain.Render(buildLabel) + plain.Render("  ") + status
 

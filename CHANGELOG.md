@@ -5,12 +5,13 @@ versioning — the app footer shows a build timestamp instead (see README).
 
 ## Footer shows appVersion — eleventh session (2026-08-27)
 
-- Footer now shows `appVersion` next to the build timestamp when the
-  binary was built with `-X main.appVersion=...` (e.g.
-  `build 20260827-105727 v0.5.0`) — previously only the build timestamp
-  ever showed, which caused real confusion distinguishing the running
+- Footer now shows `llama-shell v0.6.0` (the `appVersion` build tag) in
+  place of the build timestamp when the binary was built with
+  `-X main.appVersion=...` — previously only the build timestamp ever
+  showed, which caused real confusion distinguishing the running
   llama-shell version from Ollama's own server version already shown in
-  the same footer (`ollama v0.32.15`).
+  the same footer (`ollama v0.32.15`). Falls back to `build <timestamp>`
+  on a plain `go build .` with no version set.
 
 ## Autopilot, email, RTL fixes, encrypted backup, city banner — tenth session (2026-08-27)
 
