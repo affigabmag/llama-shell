@@ -7113,12 +7113,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != "" {
 			m.updateResultErr = msg.err
 			appendLog("update failed: %s", msg.err)
-		} else {
-			m.updateResult = msg.message
-			m.updateAvailable = false
-			appendLog("update applied: %s", m.updateLatest)
+			return m, nil
 		}
-		return m, nil
+		m.updateResult = msg.message
+		m.updateAvailable = false
+		appendLog("update applied: %s", m.updateLatest)
+		// Relaunch into the newly-swapped binary immediately instead of
+		// making the user manually quit and restart — same mechanism the
+		// auto-update daemon already uses (pendingRelaunchExePath, checked
+		// in main() after p.Run() returns so the terminal is already
+		// restored cleanly before the new process starts).
+		exePath, err := os.Executable()
+		if err == nil {
+			exePath, err = filepath.EvalSymlinks(exePath)
+		}
+		if err != nil {
+			// Update did succeed on disk — just can't self-relaunch, so
+			// fall back to the old "restart yourself" message rather than
+			// losing the update or crashing.
+			appendLog("update applied but couldn't resolve exe path to relaunch: %s", err.Error())
+			return m, nil
+		}
+		appendLog("relaunching into updated binary")
+		pendingRelaunchExePath = exePath
+		return m, tea.Quit
 
 	case emailTestResultMsg:
 		m.emailSending = false

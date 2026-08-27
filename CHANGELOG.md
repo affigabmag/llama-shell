@@ -3,6 +3,16 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Manual update now auto-relaunches (2026-08-27)
+
+- `[u] download and install` on the update screen used to leave you on a
+  "press any key to continue" screen and required manually quitting and
+  restarting to actually run the new version. Now reuses the exact
+  relaunch mechanism the daily auto-update daemon already had
+  (`pendingRelaunchExePath` + quitting the TUI, checked in `main()` after
+  the terminal is already restored cleanly) — download, install, and
+  relaunch into the new binary now happen in one step.
+
 ## Context-window truncation was gutting tool instructions (2026-08-27)
 
 - Found the real cause of the model refusing to use tools it had: Ollama
