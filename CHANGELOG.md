@@ -3,6 +3,24 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Short-terminal banner, frozen warmup timer, backup browser scroll — thirteenth session (2026-08-27)
+
+- Main menu banner now truncates from the bottom on a short terminal
+  (found on an LXC console) instead of letting View()'s own
+  clampToLastLines safety net cut from the top, which was hiding the
+  city/country label. The label also now shares row 0 with the scene's
+  first row instead of a whole line of its own, saving a row.
+- Fixed autopilot's "loading model into memory... (0s)" looking frozen —
+  its chat-entry point never started the spinner/redraw tick loop that
+  the normal (non-autopilot) entry point already did.
+- The update screen's `[r] re-check` hint now shows on the up-to-date
+  and available cases too, not just the error case — the key always
+  worked, it just wasn't discoverable, which mattered on a long-running
+  deploy checking against a stale cached "latest".
+- The backup export/import directory browser now scrolls — previously
+  Up/Down past the bottom of a 100+-entry directory just walked the
+  cursor off-screen with no way to see it.
+
 ## Autopilot scans capabilities before chat — twelfth session (2026-08-27)
 
 - Autopilot now runs `ollama show` on the freshly pulled model right

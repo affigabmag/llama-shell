@@ -4559,6 +4559,37 @@ func listDirEntries(dir string) ([]fileBrowseEntry, error) {
 	return entries, nil
 }
 
+// backupBrowseVisibleRows is how many directory entries fit on screen at
+// once — the rest of the screen (path line, filename field, hints,
+// header/footer/box padding) needs room too, same reasoning as
+// bannerMaxSceneRows.
+func (m model) backupBrowseVisibleRows() int {
+	reserved := 2 /* header */ + 1 /* footer */ + 2 /* box padding */ +
+		2 /* verb + dir path lines */ + 2 /* blank + filename field */ + 2 /* blank + hint line */
+	rows := m.height - reserved
+	if rows < 3 {
+		rows = 3
+	}
+	return rows
+}
+
+// clampBackupBrowseScroll keeps backupBrowseCursor inside the visible
+// window, scrolling backupBrowseScroll up or down as needed — without
+// this, Up/Down past the bottom of a long directory listing (100+
+// entries) just walks the cursor off-screen with no way to see it.
+func (m *model) clampBackupBrowseScroll() {
+	visible := m.backupBrowseVisibleRows()
+	if m.backupBrowseCursor < m.backupBrowseScroll {
+		m.backupBrowseScroll = m.backupBrowseCursor
+	}
+	if m.backupBrowseCursor >= m.backupBrowseScroll+visible {
+		m.backupBrowseScroll = m.backupBrowseCursor - visible + 1
+	}
+	if m.backupBrowseScroll < 0 {
+		m.backupBrowseScroll = 0
+	}
+}
+
 // enterBackupBrowser switches into the in-terminal directory browser,
 // starting in the same folder defaultBackupPath() suggests (the user's
 // home directory). mode is "export" or "import".
@@ -4567,6 +4598,7 @@ func (m model) enterBackupBrowser(mode string) model {
 	m.backupMsg = ""
 	m.backupBrowseDir = filepath.Dir(defaultBackupPath())
 	m.backupBrowseCursor = 0
+	m.backupBrowseScroll = 0
 	m.backupBrowseFilename = filepath.Base(defaultBackupPath())
 	m.backupBrowseEditingName = mode == "export"
 	entries, err := listDirEntries(m.backupBrowseDir)
@@ -6493,6 +6525,11 @@ type model struct {
 	backupBrowseDir     string
 	backupBrowseEntries []fileBrowseEntry
 	backupBrowseCursor  int
+	// backupBrowseScroll is the index of the topmost entry currently
+	// shown — a long directory (100+ entries) is taller than the
+	// terminal, so Up/Down must scroll the window, not just move a
+	// cursor that silently walks off the visible list.
+	backupBrowseScroll int
 	// backupBrowseFilename/backupBrowseEditingName: export mode only —
 	// the typed destination filename and whether the filename field (vs.
 	// the directory list) currently has keyboard focus.
@@ -6844,7 +6881,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.syncAgentViewport()
 			m.view = viewAgentChat
 			appendLog("autopilot: started agentic chat with %s", autopilotModel)
-			return m, tea.Batch(warmupPollTick(m.agentModelName), agentKeepWarmTickCmd())
+			return m, tea.Batch(warmupPollTick(m.agentModelName), agentTickCmd(), agentKeepWarmTickCmd())
 		}
 		if msg.err != "" {
 			m.webServerMsg = "download failed: " + msg.err
@@ -8132,6 +8169,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.backupBrowseCursor > 0 {
 					m.backupBrowseCursor--
 				}
+				m.clampBackupBrowseScroll()
 				return m, nil
 			case "down":
 				if m.backupBrowseEditingName {
@@ -8140,6 +8178,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.backupBrowseCursor < len(m.backupBrowseEntries)-1 {
 					m.backupBrowseCursor++
 				}
+				m.clampBackupBrowseScroll()
 				return m, nil
 			case "tab":
 				// Export mode only — toggle focus between the directory
@@ -8165,6 +8204,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.backupBrowseDir = next
 					m.backupBrowseCursor = 0
+					m.backupBrowseScroll = 0
 					entries, err := listDirEntries(next)
 					if err != nil {
 						m.backupMsg = redStyle.Render("can't open " + next + ": " + err.Error())
@@ -9679,11 +9719,62 @@ func (m model) renderCityBanner() string {
 	} else {
 		scene = m.renderSkylineScene()
 	}
+	scene = truncateSceneBottom(scene, m.bannerMaxSceneRows())
 
 	imgSearchURL := "https://www.google.com/search?tbm=isch&q=" + url.QueryEscape(cityCurrentName)
 	labelText := lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#EEF3FF")).Render(cityCurrentName)
 	label := "\x1b]8;;" + imgSearchURL + "\x1b\\" + labelText + "\x1b]8;;\x1b\\"
-	return label + "\n" + scene + "\n"
+	if scene == "" {
+		// Terminal's too short to fit any of the picture — the label
+		// alone is still worth showing rather than nothing at all.
+		return label + "\n"
+	}
+	// The label shares row 0 with the scene's own first row (prefixed,
+	// not overlaid — splicing text into the middle of a row that's
+	// already full of per-cell ANSI color codes would misalign the
+	// visible columns) instead of taking a whole extra line for itself,
+	// saving a full row of height on a short terminal.
+	lines := strings.SplitN(scene, "\n", 2)
+	lines[0] = label + "  " + lines[0]
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// bannerMaxSceneRows caps the city/countryside scene's row count to what
+// actually fits above the main menu's own content on a short terminal
+// (the LXC console this was found on) — the label line, "Welcome to
+// llama-shell", the menu items, the hint line, and the surrounding
+// box/header/footer all need room too. Without this, View()'s own
+// clampToLastLines safety net kicks in and cuts from the TOP instead —
+// hiding the city/country name label rather than the scene's grass/river
+// rows, which is backwards from what actually matters here.
+func (m model) bannerMaxSceneRows() int {
+	// No separate reserve for the label line — it now shares row 0 with
+	// the scene's own first row instead of taking a whole line of its
+	// own (see renderCityBanner).
+	reserved := 2 /* header */ + 1 /* footer */ + 2 /* box padding */ +
+		2 /* "Welcome to llama-shell" + blank line before it */ +
+		len(menuItems) + 2 /* blank + hint line */
+	avail := m.height - reserved
+	if avail > cityRows {
+		avail = cityRows
+	}
+	if avail < 0 {
+		// Genuinely no room at all — skip the picture entirely rather
+		// than force a fragment that just looks broken.
+		avail = 0
+	}
+	return avail
+}
+
+// truncateSceneBottom drops trailing rows off scene (dropping from the
+// bottom — grass/river first, sky/label last) so it fits within maxRows
+// lines, instead of relying on a downstream top-cutting safety net.
+func truncateSceneBottom(scene string, maxRows int) string {
+	lines := strings.Split(scene, "\n")
+	if len(lines) <= maxRows {
+		return scene
+	}
+	return strings.Join(lines[:maxRows], "\n")
 }
 
 func (m model) renderSkylineScene() string {
@@ -10284,7 +10375,14 @@ func (m model) renderBackupBrowser() string {
 	b.WriteString(helpKeyStyle.Render(verb) + "\n")
 	b.WriteString(agentToolStyle.Render(m.backupBrowseDir) + "\n\n")
 
-	for i, e := range m.backupBrowseEntries {
+	visible := m.backupBrowseVisibleRows()
+	start := m.backupBrowseScroll
+	end := start + visible
+	if end > len(m.backupBrowseEntries) {
+		end = len(m.backupBrowseEntries)
+	}
+	for i := start; i < end; i++ {
+		e := m.backupBrowseEntries[i]
 		line := e.name
 		if e.isDir {
 			line += "/"
@@ -10300,6 +10398,8 @@ func (m model) renderBackupBrowser() string {
 	}
 	if len(m.backupBrowseEntries) == 0 {
 		b.WriteString(agentToolStyle.Render("  (empty directory)") + "\n")
+	} else if len(m.backupBrowseEntries) > visible {
+		b.WriteString(agentToolStyle.Render(fmt.Sprintf("  (%d-%d of %d)", start+1, end, len(m.backupBrowseEntries))) + "\n")
 	}
 
 	if m.backupMode == "export" {
@@ -10696,6 +10796,14 @@ func (m model) renderUpdateText() string {
 		b.WriteString("running a dev build (no version tag) — can't compare against latest release.\n")
 	default:
 		b.WriteString(fmt.Sprintf("latest version  : %s  (up to date)\n", m.updateLatest))
+	}
+	if m.updateChecked && current != "dev" {
+		// [r] always works from this screen (it just re-runs the same
+		// check), but was only ever shown as a hint in the error branch
+		// above — shown here too now, since a long-running process (a
+		// server deploy that's been up for days) is exactly the case
+		// where "up to date" is stale and a manual re-check matters most.
+		b.WriteString("[r] re-check\n")
 	}
 
 	b.WriteString("\n")
