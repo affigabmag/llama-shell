@@ -6819,8 +6819,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentModelName = autopilotModel
 			m.agentWorkDir = wd
 			m.agentReturnView = viewMenu
-			m.agentCapabilities = "" // unknown for a freshly pulled model; runAgentTurn falls back if tools aren't supported
-			m.agentToolsSupported = true
+			// Scanned synchronously (a plain local `ollama show`, no
+			// network — near-instant) rather than left "unknown" the
+			// way a freshly pulled model normally would be, since
+			// autopilot's whole point is skipping every manual step —
+			// including the one that would otherwise be needed just to
+			// see this model's real capability badges in the first chat.
+			if out, err := exec.Command("ollama", "show", autopilotModel).CombinedOutput(); err == nil {
+				m.agentCapabilities = extractCapabilities(string(out))
+			}
+			m.agentToolsSupported = m.agentCapabilities == "" || m.agentCapabilities == "-" ||
+				strings.Contains(m.agentCapabilities, "too")
 			m.agentToolMode = "auto"
 			m.agentWarmup = "pending"
 			m.agentMessages = []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(wd)}}

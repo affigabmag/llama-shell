@@ -3,6 +3,13 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## Autopilot scans capabilities before chat — twelfth session (2026-08-27)
+
+- Autopilot now runs `ollama show` on the freshly pulled model right
+  before dropping into chat, instead of leaving capabilities "unknown"
+  until the user separately visits "show model info" — the first chat
+  message now shows real capability badges immediately.
+
 ## Footer shows appVersion — eleventh session (2026-08-27)
 
 - Footer now shows `llama-shell v0.6.0` (the `appVersion` build tag) in
