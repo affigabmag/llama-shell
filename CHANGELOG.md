@@ -3,6 +3,72 @@
 All entries are from the initial build-out session (2026-08-22). No semantic
 versioning — the app footer shows a build timestamp instead (see README).
 
+## v0.8.9-test: header/context UI + model was hiding its real tool count (2026-08-28)
+
+- **Footer no longer says "llama-shell v0.8.9-test"** — just the version
+  (`v0.8.9-test`), since the app name was redundant with the terminal
+  tab/window title already showing it.
+- **Chat header split into two pinned rows**: row 1 is title/model/cwd as
+  before; row 2 is the live token-usage counter (`renderContextUsage`),
+  moved out of the scrollable transcript into the header itself so it
+  can't scroll out of view — it used to be just another line in
+  `buildAgentChatLines`, which meant scrolling up during a long chat hid
+  the one indicator meant to warn about truncation risk.
+- **Model was claiming its per-turn tool subset was the complete tool
+  list.** Dynamic tool selection only sends the ~10-16 tools relevant to
+  the current message (by keyword match) — `list_tool_categories` exists
+  specifically to report the true full count/breakdown on demand, but the
+  model would just answer "here are all my tools" from the schemas
+  visible that turn instead of calling it. Added a HARD RULE to
+  `agentSystemPrompt` telling it the visible set is never complete and it
+  must call `list_tool_categories` first for any "list all tools / how
+  many tools do you have" question. Verified via `--test-chat`: now calls
+  the tool and reports the real breakdown (67 tools across 9 categories)
+  instead of describing the 10 tools it happened to see.
+- **Auto-detect (`[a]`) on the context-size settings screen now resets
+  first.** `recommendContextTokens`'s own gradual-growth cap
+  (`current * 4`) and shrink-floor (`never recommend below current`) were
+  both keyed off whatever was already saved — so a previous manual choice
+  quietly capped or floored every later auto-detect click, defeating the
+  point of a "just detect it for me" button. `[a]` now clears the saved
+  override before computing the recommendation, so it always measures
+  against actual free RAM instead of the old value. No separate
+  reset-then-detect step needed anymore.
+- **CT 102 performance root-caused and fixed** (RAM allocation, host
+  swappiness, Ollama `keep_alive`, `num_ctx`) — infra-side, not a code
+  change; full writeup in `gm-datacenter/doc/credentials.md` under CT 102
+  ("RAM/swap tuning for Ollama").
+
+### Verification trail (every change built + deployed + confirmed, not just claimed)
+
+- **Footer/header/auto-detect changes:** `gofmt -w main.go` + `go build`
+  clean each time; deployed to both targets after every edit (never
+  batched untested changes) — local Windows `llama-shell.exe` (killed via
+  `Stop-Process`, rebuilt with `-ldflags "-X main.buildTime=... -X
+  main.appVersion=v0.8.9-test"`, relaunched) and CT 102 (`scp main.go` →
+  `go build -o /root/llama-shell-src/llama-shell-test` for a pre-prod
+  check → same ldflags build to `/root/llama-shell/llama-shell` →
+  `systemctl restart llama-shell` → `systemctl is-active` confirmed
+  `active` each time).
+- **`list_tool_categories` hard-rule fix**, confirmed via
+  `--test-chat "but i know that i have about 70 tools list allllll"
+  --model gemma4:e2b` on CT 102 before deploying to production: model
+  called `list_tool_categories` and returned the real per-category
+  breakdown (Files & Archives 14, Shell & Processes 6, Web Search & Live
+  Data 9, Network Diagnostics 8, System & Environment 13, Git & Ollama 8,
+  Vision & Media 4, Data 3, Open/Launch 2 — sums to 67) instead of
+  describing only the ~10 tools sent that turn.
+- **Weather/context baseline**, confirmed via
+  `--test-chat "show me weather forcast for beer sheva israel"
+  --model gemma4:e2b` on CT 102: real `get_weather` call returned a
+  correct 5-day forecast for Beer Sheva; system-prompt+tools baseline
+  measured at ~2805-2933 estimated tokens across three separate
+  `--test-chat` runs (local Windows machine and CT 102), which is why the
+  in-app token counter starts around 20-34% of an 8192/16384 budget
+  before the user types anything — confirmed as the counter's real
+  behavior, not a bug (it excludes tool-schema tokens from what it
+  displays, only summing message content).
+
 ## HOTFIX: revert forced num_ctx — it broke model loading (2026-08-27)
 
 - v0.8.4/v0.8.5 forced `num_ctx` to 8192 then 16384 to fix requests being

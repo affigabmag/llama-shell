@@ -41,6 +41,15 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
+	_ "modernc.org/sqlite"
+	"rsc.io/qr"
 )
 
 // buildTime is overridden at build time via:
@@ -490,6 +499,9 @@ const (
 	viewEmailSettings
 	viewBackupSettings
 	viewBackupBrowser
+	viewToolsSettings
+	viewContextSettings
+	viewWhatsAppSettings
 )
 
 type cmdResultMsg struct {
@@ -629,11 +641,41 @@ type ollamaTool struct {
 }
 
 type ollamaChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []ollamaChatMsg `json:"messages"`
-	Tools    []ollamaTool    `json:"tools,omitempty"`
-	Stream   bool            `json:"stream"`
+	Model    string                 `json:"model"`
+	Messages []ollamaChatMsg        `json:"messages"`
+	Tools    []ollamaTool           `json:"tools,omitempty"`
+	Stream   bool                   `json:"stream"`
+	Options  map[string]interface{} `json:"options,omitempty"`
 }
+
+// agentTemperature overrides the model's own default sampling temperature
+// (confirmed via `ollama show`: gemma4:e2b defaults to 1.0, fairly random)
+// for agentic turns specifically. Unlike the earlier num_ctx mistake, this
+// carries no memory/context risk at all — it only changes how the model
+// samples the next token, not how much it can hold. Lower means more
+// consistently picking the single most-likely next action (e.g. "call
+// read_webpage after a successful web_search") instead of sometimes
+// wandering into filler — directly targets the turn-to-turn variance
+// observed for real on identical requests (same prompt, same tools,
+// wildly different outcomes) rather than raising the model's actual
+// capability ceiling, which no sampling setting can do.
+const agentTemperature = 0.25
+
+// agentContextTokens overrides Ollama's default context window (4096 for
+// most models unless OLLAMA_CONTEXT_LENGTH is set server-side). A forced
+// value here was tried once before and reverted — on a RAM-starved
+// deployment, forcing num_ctx disabled Ollama's own auto-fit logic (which
+// normally shrinks context automatically to fit available memory), so the
+// model failed to load entirely instead of degrading gracefully. That
+// deployment has since gained real RAM headroom (9GB allocated vs. 6.7GB
+// the model needs), and gemma4:e2b's own architecture (single KV head,
+// mostly sliding-window attention) makes the actual cost of a bigger
+// context small — roughly 50MB per doubling, confirmed by calculation
+// against `ollama show --verbose`'s reported layer/head counts, not
+// measured gigabytes. 8192 doubles the 4096 default, giving real
+// multi-turn headroom without the aggressive risk of the earlier 16384
+// attempt.
+const agentContextTokens = 8192
 
 // A forced num_ctx override was tried here (8192, then 16384) to fix
 // requests being truncated at Ollama's 4096-token default. Reverted: on a
@@ -924,6 +966,35 @@ func agentTools() []ollamaTool {
 			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		}},
 		{Type: "function", Function: ollamaToolFunction{
+			Name:        "list_tool_categories",
+			Description: "List tool categories. With no argument, returns just category names with tool/keyword counts (small — use this first). Pass \"category\" (an exact name from that list) to get one category's full keyword and tool list. Call this whenever the user asks what tools/categories/keywords exist, or before calling add_tool_keyword so you use an exact valid category name — never guess one.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"category": strProp("Optional — an exact category name from a prior no-argument call, to get its full keyword/tool list.")},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "add_tool_keyword",
+			Description: "Teach the app a new trigger word/phrase for a tool category, so future messages containing it automatically get that category's tools offered. Call this when the user asks to add/teach a keyword for some action or category (e.g. \"add 'flight status' to networking\", \"whenever I mention X, use the git tools\"). category must be an EXACT name from list_tool_categories — call that first if unsure. This changes behavior going forward, not this turn.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"category": strProp("Exact category name, e.g. \"Networking & Web\" — from list_tool_categories."),
+					"keyword":  strProp("The word or short phrase to add as a trigger for that category."),
+				},
+				"required": []string{"category", "keyword"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "set_context_size",
+			Description: "Change the model's context window (num_ctx) — how many tokens of conversation it can hold at once before older content gets silently cut off. Call this when the user asks to raise/lower/change the context size, or reports answers getting cut off mid-reply on a machine with RAM to spare. Bigger uses a bit more RAM per conversation (roughly 50MB per 4096-token increase for this model) but reduces truncation; too big on a RAM-constrained machine can make the model fail to load entirely, so do not set it very high unless the user confirms they have RAM to spare.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"num_ctx": strProp("New context size in tokens, e.g. \"8192\", \"16384\". Must be a positive number, ideally a power of 2.")},
+				"required":   []string{"num_ctx"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
 			Name:        "get_stock_quote",
 			Description: "Get the actual current/live price for a stock ticker or a market index, straight from a JSON API — no scraping, no cookie-consent walls. Use this INSTEAD OF web_search/read_webpage for any stock/index price question. Common symbols: NASDAQ-100 -> ^NDX, S&P 500 -> ^GSPC, Dow Jones -> ^DJI, VIX -> ^VIX, TA-35 -> TA35.TA, FTSE 100 -> ^FTSE, DAX -> ^GDAXI, Nikkei 225 -> ^N225, Hang Seng -> ^HSI, a company -> its ticker (e.g. AAPL, MSFT, TSLA). Resolve autocorrect-garbled wording to the real symbol yourself. If unlisted here or no data comes back, fall back to web_search for the right Yahoo Finance symbol.",
 			Parameters: map[string]interface{}{
@@ -933,14 +1004,26 @@ func agentTools() []ollamaTool {
 			},
 		}},
 		{Type: "function", Function: ollamaToolFunction{
-			Name:        "send_email",
-			Description: "Send an email through the Gmail account configured in llama-shell's help/settings ([e] email). Only 'to' and 'subject' are required — never ask the user for a body if they didn't give one, just send it without one (or write a short reasonable body yourself from context if that makes sense). Fails with a clear error if no account has been set up yet — tell the user to configure it there rather than trying anything else.",
+			Name:        "get_weather",
+			Description: "Get the actual current conditions and multi-day forecast for a city, straight from a JSON weather API — no scraping, no cookie-consent walls, no JS-only pages with nothing to extract. Use this INSTEAD OF web_search/read_webpage for ANY weather/forecast/temperature question, for any city worldwide.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"to":      strProp("Recipient email address."),
+					"city":    strProp("City name, e.g. \"Beer Sheva\", \"Tokyo\", \"New York\". Resolve autocorrect-garbled wording to the real city name yourself."),
+					"country": strProp("Optional country name/code to disambiguate a common city name, e.g. \"Israel\", \"US\"."),
+				},
+				"required": []string{"city"},
+			},
+		}},
+		{Type: "function", Function: ollamaToolFunction{
+			Name:        "send_email",
+			Description: "Send an email through the Gmail account configured in llama-shell's help/settings ([e] email). Only 'to' and 'subject' are required, but 'body' must be filled with the ACTUAL content whenever any exists — if the user asks to email something specific (a joke you just told, a forecast/quote/article you fetched, a reminder text they gave you, etc.), copy that real content into 'body' verbatim; leaving 'body' empty when real content is sitting right there earlier in this conversation is WRONG, even though the field is technically optional. Only skip 'body' entirely when the user's request truly has no content to send (e.g. just 'email me the subject X' with nothing else). Never ask the user for a body if they didn't give one and none exists in context — in that case send without one. Fails with a clear error if no account has been set up yet — tell the user to configure it there rather than trying anything else. If the user asks to send something 'to me'/'send me' (or Hebrew 'לי'/'אלי') without giving an actual address, pass the literal word \"me\" as 'to' — never guess or invent an address; the app resolves \"me\" to whatever address is configured as the user's own in settings.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"to":      strProp("Recipient email address, or the literal word \"me\" when the user means themselves."),
 					"subject": strProp("Email subject line."),
-					"body":    strProp("Plain-text email body. Optional — omit or leave empty if the user didn't ask for specific content."),
+					"body":    strProp("Plain-text email body. Fill this with the real content being sent (copy it verbatim from earlier in the conversation if it's already there) whenever any exists. Only omit/leave empty if there truly is no content — a bare subject request with nothing else to send."),
 				},
 				"required": []string{"to", "subject"},
 			},
@@ -1319,6 +1402,61 @@ func toolArgString(args map[string]interface{}, key string) string {
 	return ""
 }
 
+// toolArgURL reads the "url" argument, falling back to common wrong-but-
+// close names a small model sometimes uses instead ("path", "link",
+// "href") — confirmed for real: gemma4:e2b called read_webpage with
+// {"path": "https://..."} instead of {"url": ...}, silently sending an
+// empty URL and producing an opaque "unsupported protocol scheme" error
+// instead of the page it clearly meant to fetch.
+func toolArgURL(args map[string]interface{}) string {
+	for _, key := range []string{"url", "path", "link", "href", "uri"} {
+		if v := toolArgString(args, key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// weatherCodeDescription translates Open-Meteo's WMO weather-interpretation
+// codes into plain English — https://open-meteo.com/en/docs, "WMO Weather
+// interpretation codes" table.
+func weatherCodeDescription(code int) string {
+	switch code {
+	case 0:
+		return "clear sky"
+	case 1:
+		return "mainly clear"
+	case 2:
+		return "partly cloudy"
+	case 3:
+		return "overcast"
+	case 45, 48:
+		return "fog"
+	case 51, 53, 55:
+		return "drizzle"
+	case 56, 57:
+		return "freezing drizzle"
+	case 61, 63, 65:
+		return "rain"
+	case 66, 67:
+		return "freezing rain"
+	case 71, 73, 75:
+		return "snow"
+	case 77:
+		return "snow grains"
+	case 80, 81, 82:
+		return "rain showers"
+	case 85, 86:
+		return "snow showers"
+	case 95:
+		return "thunderstorm"
+	case 96, 99:
+		return "thunderstorm with hail"
+	default:
+		return "unknown conditions"
+	}
+}
+
 // executeAgentTool runs one tool call locally and returns its text result,
 // which is fed back to the model as a "tool" role message.
 var (
@@ -1532,6 +1670,25 @@ func tavilyPost(endpoint string, body []byte) ([]byte, error) {
 // fetchURL issues a GET with browser-like headers and retries once after a
 // short backoff on 429, since many sites (e.g. Yahoo Finance) block Go's
 // default User-Agent outright.
+// fetchErrorHint appends an actionable instruction to a fetch failure so
+// the model sees it right where it decides what to do next, instead of
+// relying only on a system-prompt-level nudge — that alone proved
+// unreliable on a small model (confirmed for real: it followed a "try a
+// different source" system instruction once, then ignored the identical
+// instruction on a near-identical later request and just gave up after
+// one failed fetch). Putting the instruction in the tool result itself
+// means it's impossible to miss at the exact decision point.
+func fetchErrorHint(target string, err error) string {
+	msg := err.Error()
+	hint := " — this specific URL is broken, do NOT give up: pick a DIFFERENT result from " +
+		"the earlier web_search/tavily_search and fetch that one instead."
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "certificate") || strings.Contains(lower, "x509") || strings.Contains(lower, "tls") {
+		return fmt.Sprintf("error: %s has an invalid/expired TLS certificate (%s)%s", target, msg, hint)
+	}
+	return fmt.Sprintf("error: couldn't fetch %s (%s)%s", target, msg, hint)
+}
+
 func fetchURL(target string) (*http.Response, []byte, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
 	for attempt := 0; ; attempt++ {
@@ -1812,7 +1969,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		return truncateToolOutput(result)
 
 	case "open_url":
-		url := toolArgString(args, "url")
+		url := toolArgURL(args)
 		if !strings.Contains(url, "://") {
 			url = "https://" + url
 		}
@@ -1867,7 +2024,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		return truncateToolOutput(result)
 
 	case "http_get":
-		resp, data, err := fetchURL(toolArgString(args, "url"))
+		resp, data, err := fetchURL(toolArgURL(args))
 		if err != nil {
 			return "error: " + err.Error()
 		}
@@ -1918,16 +2075,18 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		return result
 
 	case "read_webpage":
-		_, data, err := fetchURL(toolArgString(args, "url"))
+		url := toolArgURL(args)
+		_, data, err := fetchURL(url)
 		if err != nil {
-			return "error: " + err.Error()
+			return fetchErrorHint(url, err)
 		}
 		return truncateToolOutput(stripHTMLTags(string(data)))
 
 	case "rss_feed":
-		_, data, err := fetchURL(toolArgString(args, "url"))
+		url := toolArgURL(args)
+		_, data, err := fetchURL(url)
 		if err != nil {
-			return "error: " + err.Error()
+			return fetchErrorHint(url, err)
 		}
 		items, err := parseRSSFeed(data)
 		if err != nil {
@@ -1949,10 +2108,10 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		return truncateToolOutput(b.String())
 
 	case "find_rss_feed":
-		pageURL := toolArgString(args, "url")
+		pageURL := toolArgURL(args)
 		_, data, err := fetchURL(pageURL)
 		if err != nil {
-			return "error: " + err.Error()
+			return fetchErrorHint(pageURL, err)
 		}
 		feeds := findRSSFeedLinks(string(data), pageURL)
 		if len(feeds) == 0 {
@@ -2012,7 +2171,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		}
 		body, _ := json.Marshal(map[string]interface{}{
 			"api_key": apiKey,
-			"urls":    []string{toolArgString(args, "url")},
+			"urls":    []string{toolArgURL(args)},
 		})
 		data, err := tavilyPost("https://api.tavily.com/extract", body)
 		if err != nil {
@@ -2053,6 +2212,76 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 		}
 		b.WriteString("No tunnel (e.g. Cloudflare Tunnel) is set up, so none of these work from outside this network.")
 		return b.String()
+
+	case "list_tool_categories":
+		custom := loadCustomKeywords()
+		// Filtered to one category (the model's follow-up should pass this
+		// once it knows the name) stays small. Unfiltered dumping every
+		// category's full keyword+tool lists at once measured ~4700 chars
+		// — once that sits in conversation history, every LATER message in
+		// the same chat inherits the bloat and risks truncation (confirmed
+		// for real: a plain follow-up question hit task.n_tokens=4056 and
+		// got cut off mid-reply purely because of this one earlier result
+		// still sitting in context, nothing to do with the follow-up
+		// itself). Default output is now just names+counts; only a
+		// specifically-requested category gets its full keyword/tool list.
+		wantCategory := strings.TrimSpace(toolArgString(args, "category"))
+		if wantCategory != "" {
+			for _, cat := range agentToolCategories {
+				if !strings.EqualFold(cat.name, wantCategory) {
+					continue
+				}
+				var b strings.Builder
+				b.WriteString(cat.name + ":\n")
+				b.WriteString("  built-in keywords: " + strings.Join(toolCategoryKeywords[cat.name], ", ") + "\n")
+				if kws := custom.Keywords[cat.name]; len(kws) > 0 {
+					b.WriteString("  user-added keywords: " + strings.Join(kws, ", ") + "\n")
+				}
+				b.WriteString("  tools: " + strings.Join(cat.tools, ", "))
+				return b.String()
+			}
+			return fmt.Sprintf("error: no category named %q", wantCategory)
+		}
+		var b strings.Builder
+		b.WriteString("Categories (call again with a \"category\" argument for one's full keyword/tool list):\n")
+		for _, cat := range agentToolCategories {
+			total := len(toolCategoryKeywords[cat.name]) + len(custom.Keywords[cat.name])
+			fmt.Fprintf(&b, "  %s — %d tools, %d keywords\n", cat.name, len(cat.tools), total)
+		}
+		return b.String()
+
+	case "add_tool_keyword":
+		category := toolArgString(args, "category")
+		keyword := toolArgString(args, "keyword")
+		valid := false
+		for _, cat := range agentToolCategories {
+			if cat.name == category {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			var names []string
+			for _, cat := range agentToolCategories {
+				names = append(names, cat.name)
+			}
+			return "error: unknown category " + fmt.Sprintf("%q", category) + " — must be exactly one of: " + strings.Join(names, ", ")
+		}
+		if err := addCustomKeyword(category, keyword); err != nil {
+			return "error: " + err.Error()
+		}
+		return fmt.Sprintf("added %q as a trigger keyword for %s — any future message containing it will offer that category's tools.", strings.TrimSpace(strings.ToLower(keyword)), category)
+
+	case "set_context_size":
+		raw := strings.TrimSpace(toolArgString(args, "num_ctx"))
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return fmt.Sprintf("error: num_ctx must be a positive whole number, got %q", raw)
+		}
+		if err := saveContextConfig(contextConfig{NumCtx: n}); err != nil {
+			return "error: " + err.Error()
+		}
+		return fmt.Sprintf("Context size set to %d tokens. Takes effect on the NEXT message (the current conversation's already-loaded state doesn't change retroactively). If %d turns out too large for this machine's available RAM, the model may fail to load — if that happens, tell the user to lower it again.", n, n)
 
 	case "get_public_ip":
 		client := &http.Client{Timeout: 10 * time.Second}
@@ -2127,14 +2356,123 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 			name, meta.Symbol, meta.RegularMarketPrice, unit, meta.PreviousClose, change,
 			time.Unix(meta.RegularMarketTime, 0).Format(time.RFC1123))
 
+	case "get_weather":
+		city := strings.TrimSpace(toolArgString(args, "city"))
+		if city == "" {
+			return "error: city is required"
+		}
+		country := strings.TrimSpace(toolArgString(args, "country"))
+		client := &http.Client{Timeout: 10 * time.Second}
+
+		// Nominatim (OpenStreetMap), not Open-Meteo's own geocoder: found
+		// for real that Open-Meteo's geocoder only does a prefix match
+		// against its indexed name, so a transliteration variant a real
+		// person would type without thinking twice ("Beer Sheva" vs. the
+		// indexed "Beersheba" — an ordinary Hebrew-to-English v/b
+		// difference) returned zero results outright. Nominatim's search
+		// resolves this correctly out of the box (it indexes alternate
+		// names), at the cost of an extra request.
+		geoQuery := city
+		if country != "" {
+			geoQuery += ", " + country
+		}
+		geoReq, _ := http.NewRequest("GET", "https://nominatim.openstreetmap.org/search?format=json&limit=3&accept-language=en&addressdetails=1&q="+url.QueryEscape(geoQuery), nil)
+		// Nominatim's usage policy requires a real identifying User-Agent
+		// (a generic Go http.Client one gets rejected outright).
+		geoReq.Header.Set("User-Agent", "llama-shell (github.com/affigabmag/llama-shell)")
+		geoResp, err := client.Do(geoReq)
+		if err != nil {
+			return "error: geocoding lookup failed: " + err.Error()
+		}
+		geoData, err := io.ReadAll(geoResp.Body)
+		geoResp.Body.Close()
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		var geo []struct {
+			Name    string `json:"name"`
+			Lat     string `json:"lat"`
+			Lon     string `json:"lon"`
+			Address struct {
+				City    string `json:"city"`
+				Town    string `json:"town"`
+				State   string `json:"state"`
+				Country string `json:"country"`
+			} `json:"address"`
+		}
+		if err := json.Unmarshal(geoData, &geo); err != nil || len(geo) == 0 {
+			return fmt.Sprintf("error: no location found for %q — check the spelling or try a nearby larger city", city)
+		}
+		place := geo[0]
+		placeLat, _ := strconv.ParseFloat(place.Lat, 64)
+		placeLon, _ := strconv.ParseFloat(place.Lon, 64)
+
+		fcURL := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current=temperature_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto&forecast_days=5",
+			placeLat, placeLon)
+		fcResp, err := client.Get(fcURL)
+		if err != nil {
+			return "error: forecast lookup failed: " + err.Error()
+		}
+		fcData, err := io.ReadAll(fcResp.Body)
+		fcResp.Body.Close()
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		var fc struct {
+			Current struct {
+				Temperature float64 `json:"temperature_2m"`
+				WeatherCode int     `json:"weather_code"`
+				WindSpeed   float64 `json:"wind_speed_10m"`
+			} `json:"current"`
+			Daily struct {
+				Time        []string  `json:"time"`
+				WeatherCode []int     `json:"weather_code"`
+				TempMax     []float64 `json:"temperature_2m_max"`
+				TempMin     []float64 `json:"temperature_2m_min"`
+				Precip      []float64 `json:"precipitation_sum"`
+			} `json:"daily"`
+		}
+		if err := json.Unmarshal(fcData, &fc); err != nil {
+			return "error: could not parse forecast response: " + err.Error()
+		}
+		locLabel := place.Name
+		cityName := place.Address.City
+		if cityName == "" {
+			cityName = place.Address.Town
+		}
+		if cityName != "" && cityName != locLabel {
+			locLabel = cityName
+		}
+		if place.Address.State != "" && place.Address.State != locLabel {
+			locLabel += ", " + place.Address.State
+		}
+		if place.Address.Country != "" {
+			locLabel += ", " + place.Address.Country
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Weather for %s:\n\n", locLabel)
+		fmt.Fprintf(&b, "Current: %s, %.1f°C, wind %.0f km/h\n\n", weatherCodeDescription(fc.Current.WeatherCode), fc.Current.Temperature, fc.Current.WindSpeed)
+		b.WriteString("Forecast:\n")
+		for i := range fc.Daily.Time {
+			if i >= len(fc.Daily.WeatherCode) || i >= len(fc.Daily.TempMax) || i >= len(fc.Daily.TempMin) {
+				break
+			}
+			fmt.Fprintf(&b, "  %s: %s, high %.0f°C / low %.0f°C", fc.Daily.Time[i], weatherCodeDescription(fc.Daily.WeatherCode[i]), fc.Daily.TempMax[i], fc.Daily.TempMin[i])
+			if i < len(fc.Daily.Precip) && fc.Daily.Precip[i] > 0 {
+				fmt.Fprintf(&b, ", %.1fmm precipitation", fc.Daily.Precip[i])
+			}
+			b.WriteString("\n")
+		}
+		return b.String()
+
 	case "send_email":
-		to := toolArgString(args, "to")
+		cfg := loadEmailConfig()
+		to := resolveSelfEmail(toolArgString(args, "to"), cfg.MyEmail)
 		subject := toolArgString(args, "subject")
 		body := toolArgString(args, "body") // optional — fine to send empty
 		if to == "" || subject == "" {
 			return "error: to and subject are required"
 		}
-		cfg := loadEmailConfig()
 		if err := sendEmailViaGmail(cfg, to, subject, body); err != nil {
 			return "error: " + err.Error()
 		}
@@ -2339,7 +2677,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 			contentType = "application/json"
 		}
 		client := &http.Client{Timeout: 20 * time.Second}
-		resp, err := client.Post(toolArgString(args, "url"), contentType, strings.NewReader(toolArgString(args, "body")))
+		resp, err := client.Post(toolArgURL(args), contentType, strings.NewReader(toolArgString(args, "body")))
 		if err != nil {
 			return "error: " + err.Error()
 		}
@@ -2353,7 +2691,7 @@ func executeAgentTool(workDir, name string, args map[string]interface{}) string 
 	case "download_file":
 		full := resolveAgentPath(workDir, toolArgString(args, "path"))
 		client := &http.Client{Timeout: 60 * time.Second}
-		resp, err := client.Get(toolArgString(args, "url"))
+		resp, err := client.Get(toolArgURL(args))
 		if err != nil {
 			return "error: " + err.Error()
 		}
@@ -2548,6 +2886,19 @@ const agentKeepWarmInterval = 10 * time.Minute
 
 type agentKeepWarmTickMsg struct{}
 
+// whatsappTickMsg drives a 1-second refresh of the WhatsApp settings
+// screen while it's open — the QR code and linked/connecting status
+// change on their own timeline (driven by the pairing goroutine in
+// startWhatsAppBot), so the screen needs to re-read currentWhatsAppSnapshot()
+// periodically rather than only on a keypress.
+type whatsappTickMsg struct{}
+
+func whatsappTickCmd() tea.Cmd {
+	return tea.Tick(1*time.Second, func(time.Time) tea.Msg {
+		return whatsappTickMsg{}
+	})
+}
+
 func agentKeepWarmTickCmd() tea.Cmd {
 	return tea.Tick(agentKeepWarmInterval, func(time.Time) tea.Msg {
 		return agentKeepWarmTickMsg{}
@@ -2559,18 +2910,39 @@ type agentRewarmCheckedMsg struct {
 	wasLoaded bool
 }
 
-// checkAndRewarmModel runs `ollama ps` and, if the model isn't in the
-// list (Ollama unloaded it), fires off `ollama run <model> hi` in the
-// background to reload it — fire-and-forget, not awaited, so this never
-// blocks the UI waiting for a cold load to finish.
+// agentKeepAliveDuration is how long each keep-warm refresh asks Ollama
+// to hold the model in memory — kept in sync with the OLLAMA_KEEP_ALIVE
+// systemd override on deployed hosts, but set here too since a request's
+// own keep_alive field works regardless of server-side env config.
+const agentKeepAliveDuration = "30m"
+
+// checkAndRewarmModel used to only run `ollama ps` and reload via `ollama
+// run <model> hi` when it found the model already unloaded — purely
+// reactive, so it never actually prevented the unload it was named for.
+// Confirmed for real via activity.log: with a 30-minute Ollama keep_alive
+// and this 10-minute check interval, the model still went cold exactly
+// 30 minutes after last use every cycle, then sat cold for up to another
+// 10 minutes until the next check noticed and reloaded it — any real
+// message landing in that gap ate a full cold-load delay anyway, making
+// the whole mechanism close to a no-op for the case it exists to prevent.
+// Now sends a keep_alive-only request to Ollama's own HTTP API on every
+// tick regardless of current state — this resets Ollama's idle-unload
+// timer whether the model was warm or not, and loads it if it wasn't,
+// all in one lightweight call (no prompt, so no real generation cost).
 func checkAndRewarmModel(modelName string) tea.Cmd {
 	return func() tea.Msg {
-		out, err := exec.Command("ollama", "ps").CombinedOutput()
-		loaded := err == nil && strings.Contains(string(out), modelName)
-		if !loaded {
-			_ = exec.Command("ollama", "run", modelName, "hi").Start()
+		out, _ := exec.Command("ollama", "ps").CombinedOutput()
+		wasLoaded := strings.Contains(string(out), modelName)
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"model":      modelName,
+			"keep_alive": agentKeepAliveDuration,
+		})
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(reqBody))
+		if err == nil {
+			resp.Body.Close()
 		}
-		return agentRewarmCheckedMsg{modelName: modelName, wasLoaded: loaded}
+		return agentRewarmCheckedMsg{modelName: modelName, wasLoaded: wasLoaded}
 	}
 }
 
@@ -2581,12 +2953,19 @@ func checkAndRewarmModel(modelName string) tea.Cmd {
 // non-nil) as it arrives, and the fully assembled message is returned once
 // the stream ends.
 func ollamaChatStream(modelName string, messages []ollamaChatMsg, tools []ollamaTool, deltaCh chan<- string) (ollamaChatMsg, error) {
-	reqBody := ollamaChatRequest{Model: modelName, Messages: messages, Tools: tools, Stream: true}
+	reqBody := ollamaChatRequest{Model: modelName, Messages: messages, Tools: tools, Stream: true,
+		Options: map[string]interface{}{"temperature": agentTemperature, "num_ctx": currentContextTokens()}}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
 		return ollamaChatMsg{}, err
 	}
-	client := &http.Client{Timeout: 180 * time.Second}
+	// 480s, not 180s: a single tool-loop step on slow CPU-only inference
+	// (~30 tokens/sec, seen on a real deployment) can take 2-3 minutes to
+	// reprocess a few thousand tokens of prompt before it even starts
+	// generating — 180s was cutting off requests that ollama itself was
+	// still correctly working on (confirmed via ollama's own log: no
+	// truncation, no error, just still running past the old timeout).
+	client := &http.Client{Timeout: 480 * time.Second}
 	resp, err := client.Post("http://localhost:11434/api/chat", "application/json", bytes.NewReader(buf))
 	if err != nil {
 		return ollamaChatMsg{}, err
@@ -2813,7 +3192,14 @@ func agentSystemPrompt(wd string) string {
 			"each on its own line, exactly as returned. This is very often asked from a phone "+
 			"over Telegram, where the loopback (127.0.0.1) URL is USELESS — the LAN URLs are "+
 			"the ones that actually work from another device, so never trim the reply down to "+
-			"just the first link or summarize the rest as 'other links'.", wd,
+			"just the first link or summarize the rest as 'other links'. "+
+			"HARD RULE: only a SUBSET of all available tools is sent to you on any given turn "+
+			"(picked by keyword match against the user's message) — the tool list you can see "+
+			"right now is NEVER the complete set. If the user asks how many tools you have, or "+
+			"to list all/every tool, or what your full capabilities are, you MUST call "+
+			"list_tool_categories first and answer from its real result — never answer from the "+
+			"tool schemas visible to you this turn, and never claim the tools you can currently "+
+			"see are 'all' of them.", wd,
 	)
 }
 
@@ -2843,7 +3229,12 @@ var liveDataRe = regexp.MustCompile(`(?i)\b(stock price|share price|stock index|
 	`stock indices|market index|market indices|index value|index values|indices|nasdaq|s&p ?500|` +
 	`dow jones|kospi|kosdaq|nikkei|hang seng|sensex|nifty|exchange rate|currency rate|` +
 	`current price|current value|closing value|closing price|live score|` +
-	`weather (in|for|today)|forecast)\b`)
+	// weather/forecast (and forcast, the common typo without the middle 'e')
+	// deliberately not anchored to a specific following word — confirmed
+	// for real that "weather forcast for X" was missing this entirely,
+	// since the old pattern only matched "weather (in|for|today)" and the
+	// word right after "weather" here is the typo'd "forcast", not "for".
+	`weather|forecast|forcast|temperature in|temperature for)\b`)
 
 // liveDateTimeRe catches the other common shape of this same refusal —
 // a small model saying "I don't have access to the current date/time"
@@ -2888,31 +3279,16 @@ func liveDataNudge(msgs []ollamaChatMsg) *ollamaChatMsg {
 		return nil
 	}
 	return &ollamaChatMsg{Role: "system", Content: "The message right above asks for a live/" +
-		"current value. If it's a stock price or a market index, call get_stock_quote with the " +
-		"right Yahoo Finance symbol — a LARGE reference table, use it for ANY country's index, " +
-		"not just the well-known ones: NASDAQ-100 -> ^NDX, NASDAQ Composite -> ^IXIC, S&P 500 -> " +
-		"^GSPC, Dow Jones -> ^DJI, Russell 2000 -> ^RUT, VIX -> ^VIX, TA-35 -> TA35.TA, TA-125 -> " +
-		"TA125.TA, FTSE 100 -> ^FTSE, DAX (Germany) -> ^GDAXI, CAC 40 (France) -> ^FCHI, IBEX 35 " +
-		"(Spain) -> ^IBEX, FTSE MIB (Italy) -> FTSEMIB.MI, Euro Stoxx 50 -> ^STOXX50E, AEX " +
-		"(Netherlands) -> ^AEX, SMI (Switzerland) -> ^SSMI, OMX Stockholm -> ^OMX, Nikkei 225 -> " +
-		"^N225, Hang Seng -> ^HSI, Shanghai Composite -> 000001.SS, Shenzhen Component -> " +
-		"399001.SZ, KOSPI (South Korea) -> ^KS11, KOSDAQ -> ^KQ11, TAIEX (Taiwan) -> ^TWII, " +
-		"Nifty 50 (India) -> ^NSEI, Sensex (India) -> ^BSESN, Straits Times (Singapore) -> ^STI, " +
-		"ASX 200 (Australia) -> ^AXJO, NZX 50 (New Zealand) -> ^NZ50, TSX (Canada) -> ^GSPTSE, " +
-		"Bovespa (Brazil) -> ^BVSP, IPC (Mexico) -> ^MXX, MERVAL (Argentina) -> ^MERV, MOEX " +
-		"(Russia) -> IMOEX.ME, JSE Top 40 (South Africa) -> ^J200, EGX 30 (Egypt) -> ^CASE30, a " +
-		"company -> its ticker. The user's own wording may be garbled/typo'd (phone autocorrect, " +
-		"etc.) — figure out what they actually meant and use the REAL symbol from this list, " +
-		"never pass their garbled text straight through as the symbol. If the country/index " +
-		"isn't in this table, or get_stock_quote comes back with no data, call web_search first " +
-		"to find the right Yahoo Finance symbol/number instead of giving up or claiming you have " +
-		"no way to check it — you do, you just need the right symbol first. get_stock_quote hits " +
-		"a real JSON API and always returns the actual number, no scraping or consent walls " +
-		"involved, so prefer it over web_search/read_webpage once you have the right symbol. For " +
-		"anything else live (weather, a score, etc.), call web_search or tavily_search " +
-		"first — snippets often contain the number directly. Then answer with the actual number " +
-		"you got back. Do NOT say you lack real-time access and do NOT just hand back a list of " +
-		"links; fetch it yourself and report the real value."}
+		"current value. If it's a stock price or market index, call get_stock_quote. If it's " +
+		"weather/forecast/temperature for any city, call get_weather with the city name — a " +
+		"real JSON API, no scraping, always works, do NOT use web_search/read_webpage for " +
+		"weather at all. For a stock symbol not covered by get_stock_quote, or anything else " +
+		"live (a score, etc.), call web_search first — snippets often contain the number " +
+		"directly. If a snippet has it, use that. If not, fetch a result's page with " +
+		"read_webpage/tavily_extract. If THAT fetch errors (dead link, expired certificate, " +
+		"timeout, etc.), do NOT give up and just hand back the search links — pick a DIFFERENT " +
+		"result from the same web_search and fetch that one instead. Do NOT say you lack " +
+		"real-time access; get the actual value and report it."}
 }
 
 func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool, suppressTools bool) tea.Cmd {
@@ -2940,10 +3316,20 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 			return res.reply, res.err
 		}
 		const maxSteps = 8
+		var turnTools []ollamaTool
+		retriedNonAnswer := false
 		for i := 0; i < maxSteps; i++ {
 			var tools []ollamaTool
 			if toolsSupported && !suppressTools {
-				tools = agentTools()
+				if i == 0 {
+					// Computed once per turn from the original user
+					// message, not per step — a later step's "latest
+					// message" is a tool result, not a new request, so
+					// re-matching there would just lose whatever tools the
+					// model is already mid-chain with.
+					turnTools = agentRelevantTools(msgs)
+				}
+				tools = turnTools
 			}
 			nudged := false
 			if i == 0 {
@@ -2971,6 +3357,41 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 			}
 			msgs = append(msgs, reply)
 			if len(reply.ToolCalls) == 0 {
+				// A small model sometimes drops everything it just fetched
+				// and returns generic filler instead of an actual answer
+				// (confirmed for real: 3 correct tool calls, then "Hello!
+				// How can I assist you today?"). One retry, with an
+				// explicit nudge to use what's already in the transcript —
+				// never more than once, so a genuinely short real answer
+				// doesn't loop forever.
+				if !retriedNonAnswer && looksLikeNonAnswer(reply.Content, msgs) {
+					retriedNonAnswer = true
+					// Try the deterministic fix first: if there's a search
+					// result nothing ever fetched, fetch it ourselves — no
+					// dependence on the model choosing to. Only fall back
+					// to the text-only nudge when there's genuinely
+					// nothing to auto-fetch (e.g. it already tried a fetch
+					// and that itself came back thin/failed).
+					if fetched, ok := autoFetchFallback(msgs); ok {
+						msgs = append(msgs, fetched)
+						msgs = append(msgs, ollamaChatMsg{Role: "system", Content: "The system just " +
+							"fetched a real page for you (see the tool result right above) because " +
+							"your last reply ignored the search results instead of following up on " +
+							"them. Answer the user's original question now using that content."})
+					} else {
+						msgs = append(msgs, ollamaChatMsg{Role: "system", Content: "Your last reply " +
+							"was a non-answer (asking what to do / to repeat / a bare greeting) even " +
+							"though there are real tool results already above in this conversation — " +
+							"that's wrong. Check them: if they already contain the actual answer, use " +
+							"it now. If they're only a preview/snippet without the real data (e.g. a " +
+							"search result description with no real numbers), call read_webpage/" +
+							"tavily_extract on the best URL from those results to get the real content, " +
+							"THEN answer. Either way, take one concrete step forward — do not ask the " +
+							"user what to do, do not repeat a greeting, and do not say you need more " +
+							"information you could get yourself."})
+					}
+					continue
+				}
 				break
 			}
 			for _, tc := range reply.ToolCalls {
@@ -2990,10 +3411,15 @@ func runAgentTurn(modelName string, history []ollamaChatMsg, workDir string, too
 func runAgentTurnSync(modelName string, history []ollamaChatMsg, workDir string, toolsSupported bool) ([]ollamaChatMsg, error) {
 	msgs := append([]ollamaChatMsg(nil), history...)
 	const maxSteps = 8
+	var turnTools []ollamaTool
+	retriedNonAnswer := false
 	for i := 0; i < maxSteps; i++ {
 		var tools []ollamaTool
 		if toolsSupported {
-			tools = agentTools()
+			if i == 0 {
+				turnTools = agentRelevantTools(msgs)
+			}
+			tools = turnTools
 		}
 		nudged := false
 		if i == 0 {
@@ -3015,6 +3441,28 @@ func runAgentTurnSync(modelName string, history []ollamaChatMsg, workDir string,
 		}
 		msgs = append(msgs, reply)
 		if len(reply.ToolCalls) == 0 {
+			if !retriedNonAnswer && looksLikeNonAnswer(reply.Content, msgs) {
+				retriedNonAnswer = true
+				if fetched, ok := autoFetchFallback(msgs); ok {
+					msgs = append(msgs, fetched)
+					msgs = append(msgs, ollamaChatMsg{Role: "system", Content: "The system just " +
+						"fetched a real page for you (see the tool result right above) because " +
+						"your last reply ignored the search results instead of following up on " +
+						"them. Answer the user's original question now using that content."})
+				} else {
+					msgs = append(msgs, ollamaChatMsg{Role: "system", Content: "Your last reply " +
+						"was a non-answer (asking what to do / to repeat / a bare greeting) even " +
+						"though there are real tool results already above in this conversation — " +
+						"that's wrong. Check them: if they already contain the actual answer, use " +
+						"it now. If they're only a preview/snippet without the real data (e.g. a " +
+						"search result description with no real numbers), call read_webpage/" +
+						"tavily_extract on the best URL from those results to get the real content, " +
+						"THEN answer. Either way, take one concrete step forward — do not ask the " +
+						"user what to do, do not repeat a greeting, and do not say you need more " +
+						"information you could get yourself."})
+				}
+				continue
+			}
 			break
 		}
 		for _, tc := range reply.ToolCalls {
@@ -3235,6 +3683,673 @@ func saveWebServerConfig(cfg webServerConfig) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// toolsConfig persists the POOL of tools allowed to ever be sent to the
+// model — which tool actually goes out on a given request is chosen
+// dynamically per-message from within this pool (see agentRelevantTools).
+// Ollama's context window on constrained hardware is far smaller than it
+// looks (see estimateTokens) — sending all 63 tools regardless of
+// relevance can silently truncate the system prompt's own instructions
+// before the model ever sees them (found and fixed against a real
+// deployment, see CHANGELOG). Nil/empty Enabled (no saved file yet) means
+// "every tool is in the pool" until the user visits this screen and
+// excludes some.
+type toolsConfig struct {
+	Enabled map[string]bool `json:"enabled"`
+}
+
+func toolsConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "tools_config.json")
+}
+
+func loadToolsConfig() toolsConfig {
+	data, err := os.ReadFile(toolsConfigPath())
+	if err != nil {
+		return toolsConfig{}
+	}
+	var cfg toolsConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveToolsConfig(cfg toolsConfig) error {
+	path := toolsConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// contextConfig persists the num_ctx override — user-adjustable (settings
+// screen or the set_context_size tool) since the right value depends on
+// RAM actually available on whatever machine this runs on, which varies
+// deployment to deployment and isn't something a single hardcoded
+// constant can get right everywhere.
+type contextConfig struct {
+	NumCtx int `json:"num_ctx"`
+}
+
+func contextConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "context_config.json")
+}
+
+func loadContextConfig() contextConfig {
+	data, err := os.ReadFile(contextConfigPath())
+	if err != nil {
+		return contextConfig{}
+	}
+	var cfg contextConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveContextConfig(cfg contextConfig) error {
+	path := contextConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// currentContextTokens resolves the saved override, falling back to the
+// built-in default (8192) if nothing's been saved yet.
+func currentContextTokens() int {
+	cfg := loadContextConfig()
+	if cfg.NumCtx > 0 {
+		return cfg.NumCtx
+	}
+	return agentContextTokens
+}
+
+// modelWeightsGB is a rough per-model RAM footprint table for sizing the
+// auto-detect recommendation — gemma4:e2b (the only one this app installs
+// by default) confirmed at 6.7 GB via `ollama ps`; anything else falls
+// back to a conservative guess since we don't have a real number for it.
+var modelWeightsGB = map[string]float64{
+	"gemma4:e2b": 6.7,
+}
+
+// availableRAMGB reads how much RAM is actually free right now (not
+// total) — the number that matters for deciding a safe context size,
+// since total RAM says nothing about what else is already using it.
+// Falls back to 0 (caller treats that as "unknown, be conservative") if
+// the platform-specific read fails for any reason.
+// ramCacheTTL bounds how often availableRAMGB actually shells out (via
+// runQuick on Windows/macOS — a real subprocess spawn each time, ~100ms+)
+// — found for real that the context-size settings screen called this on
+// every single render frame (any keypress, any tick) with no caching at
+// all, making the screen feel "very very slow" from constant PowerShell
+// spawns. Free RAM doesn't meaningfully change frame-to-frame, so a few
+// seconds of staleness costs nothing real.
+const ramCacheTTL = 3 * time.Second
+
+var (
+	ramCacheMu       sync.Mutex
+	ramCacheValue    float64
+	ramCacheAt       time.Time
+	ramTotalCacheVal float64
+	ramTotalCacheAt  time.Time
+)
+
+func availableRAMGB() float64 {
+	ramCacheMu.Lock()
+	if time.Since(ramCacheAt) < ramCacheTTL {
+		v := ramCacheValue
+		ramCacheMu.Unlock()
+		return v
+	}
+	ramCacheMu.Unlock()
+	v := availableRAMGBUncached()
+	ramCacheMu.Lock()
+	ramCacheValue, ramCacheAt = v, time.Now()
+	ramCacheMu.Unlock()
+	return v
+}
+
+func availableRAMGBUncached() float64 {
+	switch runtime.GOOS {
+	case "linux":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemAvailable:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseFloat(fields[1], 64); err == nil {
+						return kb / 1024 / 1024
+					}
+				}
+			}
+		}
+		return 0
+	case "windows":
+		out := runQuick("powershell", "-NoProfile", "-Command",
+			"(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory")
+		if out == "" {
+			return 0
+		}
+		kb, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+		if err != nil {
+			return 0
+		}
+		return kb / 1024 / 1024
+	case "darwin":
+		// vm_stat reports free+inactive pages in 4KiB units — inactive
+		// pages are reclaimable, so counting them (not just "free") is
+		// the more honest picture of what's actually available.
+		out := runQuick("sh", "-c", `vm_stat | awk '/Pages free/{f=$3} /Pages inactive/{i=$3} END{gsub(/\./,"",f); gsub(/\./,"",i); print (f+i)*4096}'`)
+		if out == "" {
+			return 0
+		}
+		bytes, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+		if err != nil {
+			return 0
+		}
+		return bytes / 1024 / 1024 / 1024
+	default:
+		return 0
+	}
+}
+
+// totalRAMGB reads the machine's total physical RAM — paired with
+// availableRAMGB so the settings screen can show actual current usage
+// (total - free), not just the estimated cost of a context size, letting
+// the two be compared directly instead of taking the estimate on faith.
+func totalRAMGB() float64 {
+	ramCacheMu.Lock()
+	if time.Since(ramTotalCacheAt) < ramCacheTTL {
+		v := ramTotalCacheVal
+		ramCacheMu.Unlock()
+		return v
+	}
+	ramCacheMu.Unlock()
+	v := totalRAMGBUncached()
+	ramCacheMu.Lock()
+	ramTotalCacheVal, ramTotalCacheAt = v, time.Now()
+	ramCacheMu.Unlock()
+	return v
+}
+
+func totalRAMGBUncached() float64 {
+	switch runtime.GOOS {
+	case "linux":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseFloat(fields[1], 64); err == nil {
+						return kb / 1024 / 1024
+					}
+				}
+			}
+		}
+		return 0
+	case "windows":
+		out := runQuick("powershell", "-NoProfile", "-Command",
+			"(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory")
+		if out == "" {
+			return 0
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+		if err != nil {
+			return 0
+		}
+		return v / 1024 / 1024 / 1024
+	case "darwin":
+		out := runQuick("sysctl", "-n", "hw.memsize")
+		if out == "" {
+			return 0
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+		if err != nil {
+			return 0
+		}
+		return v / 1024 / 1024 / 1024
+	default:
+		return 0
+	}
+}
+
+// recommendContextTokens picks a context size from actual free RAM: reserve
+// the running model's own weights plus a safety margin for the OS and
+// everything else sharing the box (the exact mistake that broke this
+// before — maxing out context left ~750MB free on a 9GB box, no slack for
+// anything else), then spends whatever's left on context at a per-4096-
+// token cost that's DELIBERATELY pessimistic (3x the ~50MB/4096 figure
+// quoted elsewhere) — that number came from a theoretical calculation
+// against the model's architecture, never an actual measurement, and
+// recommending a value based on an unverified estimate deserves real
+// margin for being wrong, not the estimate taken at face value.
+//
+// Separately capped to never recommend more than a 4x jump from the
+// CURRENTLY SAVED value in one shot, even when RAM would technically
+// allow further — because this same settings screen tells the user to
+// "raise it in small steps, double it, not 10x it", and an auto-detect
+// button that ignores its own screen's advice and leaps straight to
+// 131072 in one click (confirmed for real: exactly what a well-resourced
+// machine's free RAM alone would otherwise justify) undermines the whole
+// point of that caution. Iterative growth, not one leap to the ceiling.
+// contextCostSafetyFactor hedges the ~50MB/4096-token estimate (a
+// theoretical calculation against the model's architecture, never an
+// actual measurement) — applied uniformly so the settings screen's table
+// and the auto-detect recommendation always agree with each other.
+const contextCostSafetyFactor = 3.0
+
+// contextSizeSteps are the standard options shown on the settings screen's
+// selectable list — the recommendContextTokens step list, plus the screen
+// always appends one more "Custom" row after these for a typed value.
+var contextSizeSteps = []int{4096, 8192, 16384, 32768, 65536, 131072}
+
+// estimatedContextCostMB is the extra RAM (beyond the 4096-token baseline)
+// a given context size is estimated to cost, in MB.
+func estimatedContextCostMB(step int) float64 {
+	extraSteps := (step - 4096) / 4096
+	return float64(extraSteps) * 50 * contextCostSafetyFactor
+}
+
+func recommendContextTokens(modelName string) (tokens int, ok bool) {
+	free := availableRAMGB()
+	if free <= 0 {
+		return agentContextTokens, false
+	}
+	weights, known := modelWeightsGB[modelName]
+	if !known {
+		weights = 5.0 // conservative guess for an unlisted model
+	}
+	const safetyMarginGB = 1.5
+	spendable := free - weights - safetyMarginGB
+	if spendable <= 0 {
+		return 4096, true
+	}
+	spendableMB := spendable * 1024
+	current := currentContextTokens()
+	maxJump := current * 4
+	best := 4096
+	for _, step := range contextSizeSteps {
+		if step > maxJump {
+			break
+		}
+		costMB := estimatedContextCostMB(step)
+		if costMB <= spendableMB {
+			best = step
+		}
+	}
+	if best < current {
+		best = current // never recommend shrinking — that's what [r] reset is for
+	}
+	return best, true
+}
+
+// customKeywordsConfig persists user-added keywords per category — a
+// self-service escape hatch for the fixed toolCategoryKeywords list, which
+// can never anticipate every phrasing (found and fixed for "weather"/
+// "forecast" once already; rather than every future gap needing a code
+// change and a rebuild, the settings screen can add one directly).
+type customKeywordsConfig struct {
+	Keywords map[string][]string `json:"keywords"` // category name -> extra keywords
+}
+
+func customKeywordsPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "custom_keywords.json")
+}
+
+func loadCustomKeywords() customKeywordsConfig {
+	data, err := os.ReadFile(customKeywordsPath())
+	if err != nil {
+		return customKeywordsConfig{}
+	}
+	var cfg customKeywordsConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveCustomKeywords(cfg customKeywordsConfig) error {
+	path := customKeywordsPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// addCustomKeyword appends keyword to category's list (case-insensitive
+// dedup) and saves. category must be an exact agentToolCategories name.
+func addCustomKeyword(category, keyword string) error {
+	keyword = strings.ToLower(strings.TrimSpace(keyword))
+	if keyword == "" {
+		return fmt.Errorf("empty keyword")
+	}
+	cfg := loadCustomKeywords()
+	if cfg.Keywords == nil {
+		cfg.Keywords = map[string][]string{}
+	}
+	for _, existing := range cfg.Keywords[category] {
+		if existing == keyword {
+			return nil // already there
+		}
+	}
+	cfg.Keywords[category] = append(cfg.Keywords[category], keyword)
+	return saveCustomKeywords(cfg)
+}
+
+// removeCustomKeyword deletes one previously-added keyword from category by
+// its position (0-indexed) in that category's current list.
+func removeCustomKeyword(category string, index int) error {
+	cfg := loadCustomKeywords()
+	list := cfg.Keywords[category]
+	if index < 0 || index >= len(list) {
+		return fmt.Errorf("no such keyword")
+	}
+	cfg.Keywords[category] = append(list[:index], list[index+1:]...)
+	return saveCustomKeywords(cfg)
+}
+
+// generalFallbackTools is what gets sent when the user's message doesn't
+// match any category's keywords (plain chat, a vague follow-up, etc.) —
+// small and broadly useful, so the model still has basic capability
+// without paying for the full 63-tool catalog on every single message.
+var generalFallbackTools = map[string]bool{
+	"read_file": true, "write_file": true, "list_dir": true,
+	"run_command": true, "get_datetime": true,
+	// web_search without read_webpage is close to useless for anything
+	// beyond what fits in a search snippet — found for real: a query whose
+	// wording missed every category keyword got only web_search, and the
+	// model gave up with a list of links instead of actually fetching one,
+	// since it had no declared way to. Both together cover most "find and
+	// read something" requests even when no more specific category
+	// keyword matched.
+	"web_search": true, "read_webpage": true,
+}
+
+// estimateTokens gives a rough token count for budgeting purposes only —
+// not a real tokenizer. Calibrated against real measured requests on the
+// actual deployment (via Ollama's own logged task.n_tokens): system prompt
+// + tool JSON + a short message came out to ~4.1 chars/token, not the ~5
+// chars/token a first pass assumed — Ollama's chat-template rendering of
+// tool definitions is more verbose than the raw JSON length suggests, so
+// this divides by 4 to stay conservative (slightly over- rather than
+// under-estimate) rather than land back on an optimistic number.
+func estimateTokens(s string) int {
+	return len(s)/4 + 1
+}
+
+// enabledToolSet resolves the saved config to a lookup set — the POOL of
+// tools allowed to be dynamically selected at all. Every tool defaults to
+// allowed; the saved config only ever RECORDS exclusions (the settings
+// screen writes an explicit false for anything unchecked). This matters
+// for any tool added to the app after a user already saved a config
+// (confirmed for real: a prior "allow all" snapshot silently excluded two
+// brand-new tools, since they simply weren't keys in that old map) — a
+// tool not yet known to the saved config must default to enabled, never
+// to Go's zero-value false, or every future addition needs the user to
+// manually re-opt-in.
+func enabledToolSet() map[string]bool {
+	cfg := loadToolsConfig()
+	out := map[string]bool{}
+	for _, n := range flatToolNames() {
+		out[n] = true
+	}
+	for k, v := range cfg.Enabled {
+		out[k] = v
+	}
+	return out
+}
+
+// toolCategoryKeywords maps each agentToolCategories name to the words in
+// a user message that suggest it's relevant. Matching is substring,
+// case-insensitive, against the single latest user message — deliberately
+// simple (no NLP/embedding) since this only needs to be right often
+// enough to keep the per-request tool list small, not perfect; a miss
+// just falls back to generalFallbackTools rather than failing the turn.
+// Hebrew terms are mixed directly into the same English lists rather than
+// kept in a parallel table — matchedCategoryTools does one lowercase
+// substring scan over the whole list per category, so there's no
+// language-specific branch to keep in sync. Added after finding Hebrew
+// had ZERO coverage at all: a Telegram message entirely in Hebrew never
+// matched any category (English-only substrings can't match Hebrew
+// script), always falling through to generalFallbackTools regardless of
+// what the user actually asked for — confirmed for real via a "שלח לי
+// למייל" (send it to my email) request that got "I can't send emails"
+// because send_email was never even in the tool set sent that turn.
+var toolCategoryKeywords = map[string][]string{
+	"Files & Archives":       {"file", "folder", "directory", "dir ", "zip", "archive", "read the", "write a", "save", "delete", "copy", "move", "rename", "hash", "unzip", "extract", "קובץ", "תיקייה", "תיקיה"},
+	"Shell & Processes":      {"run ", "command", "script", "process", "kill", "python", "powershell", "shell", "cmd", "terminal", "window title", "פקודה", "תהליך"},
+	"Web Search & Live Data": {"web", "news", "url", "site", "website", "search", "stock", "price", "index", "nasdaq", "rss", "feed", "browse", "internet", "link", "http://", "https://", "weather", "forecast", "forcast", "temperature", "rain", "score", "game result", "חדשות", "חפש", "חיפוש", "מזג אוויר", "מזג אויר", "תחזית", "מניה", "מניות", "מחיר", "אתר", "קישור"},
+	"Network Diagnostics":    {"download", "ping", "email", "mail", "ssh", "ip address", "public ip", "http request", "http get", "http post", "מייל", "אימייל", "דואר", "הורד"},
+	"System & Environment":   {"env var", "environment variable", "clipboard", "time", "date", "today", "disk space", "disk usage", "registry", "notification", "notify", "installed program", "hostname", "os ", "cpu", "ram", "שעה", "תאריך", "היום", "מחר", "מחרתיים"},
+	"Git & Ollama":           {"git ", "commit", "branch", "repo", "ollama", "pull model", "model list"},
+	"Vision & Media":         {"image", "screenshot", "picture", "photo", "pdf", "document", ".doc", ".pdf", "תמונה", "צילום מסך"},
+	"Data":                   {"sql", "csv", "json", "database", "query", "table"},
+	"Open / Launch":          {"open ", "launch", "פתח"},
+}
+
+// matchedCategoryTools returns the tool names in every category whose
+// keywords (built-in or user-added via the settings screen) appear in
+// msg. Empty if nothing matched.
+func matchedCategoryTools(msg string) map[string]bool {
+	lower := strings.ToLower(msg)
+	custom := loadCustomKeywords()
+	out := map[string]bool{}
+	for _, cat := range agentToolCategories {
+		kws := append(append([]string{}, toolCategoryKeywords[cat.name]...), custom.Keywords[cat.name]...)
+		matched := false
+		for _, kw := range kws {
+			if strings.Contains(lower, kw) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			for _, t := range cat.tools {
+				out[t] = true
+			}
+		}
+	}
+	return out
+}
+
+// lastUserContent returns the most recent user-role message's content, or
+// "" if none — used to decide which tools are relevant for this turn (a
+// tool-loop's later steps have "tool"/"assistant" as the latest role, so
+// this must specifically look for "user", not just take the last message).
+func lastUserContent(msgs []ollamaChatMsg) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
+// agentUnavailableTools reports tools that are foreseeably useless right
+// now because their required setup is missing — offering them just costs
+// tokens and burns a whole tool-call step for a guaranteed "not
+// configured" error (observed for real: the model tried tavily_search on
+// a box with no TAVILY_API_KEY set, wasting a step it could have spent on
+// something that would actually work).
+func agentUnavailableTools() map[string]bool {
+	out := map[string]bool{}
+	if os.Getenv("TAVILY_API_KEY") == "" {
+		out["tavily_search"] = true
+		out["tavily_extract"] = true
+	}
+	if loadEmailConfig().FromAddress == "" {
+		out["send_email"] = true
+	}
+	if !isWebServerRunning() {
+		out["get_web_ui_url"] = true
+	}
+	return out
+}
+
+// agentRelevantTools picks which tools actually get sent this turn:
+// intersect the always-allowed pool (enabledToolSet, from the settings
+// screen) with whatever agentToolCategories the latest user message's
+// keywords matched, falling back to generalFallbackTools when nothing
+// matched, then drop anything foreseeably unusable (agentUnavailableTools).
+// This is the real fix for a small model on constrained hardware silently
+// losing its own tool instructions to context truncation — sending all 63
+// tools regardless of relevance measured ~5400 tokens alone (found and
+// fixed against a real deployment, see CHANGELOG); every tool is still
+// reachable, just not on every request.
+// agentAlwaysOnTools are included on every turn regardless of category
+// match — meta-actions about the tool system itself, which by definition
+// can't be predicted by keyword (a user asking to add a new keyword has
+// no reason to also use existing ones in that same sentence).
+var agentAlwaysOnTools = map[string]bool{
+	"list_tool_categories": true, "add_tool_keyword": true, "set_context_size": true,
+}
+
+func agentRelevantTools(msgs []ollamaChatMsg) []ollamaTool {
+	pool := enabledToolSet()
+	want := matchedCategoryTools(lastUserContent(msgs))
+	if len(want) == 0 {
+		want = map[string]bool{}
+		for n := range generalFallbackTools {
+			want[n] = true
+		}
+	}
+	for n := range agentAlwaysOnTools {
+		want[n] = true
+	}
+	unavailable := agentUnavailableTools()
+	all := agentTools()
+	out := make([]ollamaTool, 0, len(all))
+	for _, t := range all {
+		if pool[t.Function.Name] && want[t.Function.Name] && !unavailable[t.Function.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// nonAnswerRe matches a small model's generic filler reply when it should
+// have synthesized real tool results into an actual answer instead.
+// Observed for real, two different shapes: a bare greeting ("Hello! How
+// can I assist you today?") after 3 correct tool calls gathering real
+// content, and — even with tool results from earlier in the SAME
+// conversation still sitting right there — "Please provide your request."
+// as if no request had been made at all. Broad on purpose: false
+// positives here just cost one extra (cheap, fast) retry turn, while a
+// miss means the user sees a useless non-answer with no recovery.
+var nonAnswerRe = regexp.MustCompile(`(?i)(^\s*(hi|hello|hey)[!.,]?\s*(there)?[!.,]?\s*(how can i (help|assist)|what can i do))|` +
+	`please (provide|specify|clarify|share|give me)|` +
+	`(what|how) (would you like|can i help|is your request)|` +
+	`let me know (if|what|how)|` +
+	`i('m| am) (not sure|unsure) what|` +
+	`could you (clarify|please)`)
+
+// looksLikeNonAnswer reports whether reply is exactly this kind of
+// generic filler — checked only when there ARE real tool results in msgs
+// to lose track of, so a genuine "hi" reply to an actual "hi" message
+// (no tools involved) is never mistaken for one.
+func looksLikeNonAnswer(reply string, msgs []ollamaChatMsg) bool {
+	hasToolResult := false
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			hasToolResult = true
+			break
+		}
+	}
+	if !hasToolResult {
+		return false
+	}
+	trimmed := strings.TrimSpace(reply)
+	return nonAnswerRe.MatchString(trimmed) || (trimmed != "" && len(trimmed) < 40)
+}
+
+// searchToolNames are the tools whose result is a list of links/snippets,
+// not real page content — a search that's never followed by an actual
+// fetch leaves the model with nothing but titles to answer from.
+var searchToolNames = map[string]bool{"web_search": true, "tavily_search": true}
+
+// fetchToolNames are the tools that turn a URL into real page content —
+// if one of these already ran after the last search, the model has
+// genuine content and autoFetchFallback has nothing useful to add.
+var fetchToolNames = map[string]bool{"read_webpage": true, "tavily_extract": true, "rss_feed": true}
+
+// autoFetchFallback deterministically recovers from the single most common
+// failure mode found on real hardware: a small model calls web_search,
+// gets back only titles/snippets, then gives up with filler instead of
+// following up with an actual page fetch — confirmed to still happen even
+// after a text-only retry nudge (the model can ignore a suggestion; it
+// can't ignore content that's already been fetched for it). Rather than
+// asking the model to try harder again, this walks the conversation,
+// finds the last search result with no fetch after it, pulls the first
+// URL out of that result, and fetches it directly — no model judgment
+// involved at all. Returns ok=false if there's no search-without-fetch to
+// recover, so callers know to fall back to (or skip) the text nudge.
+func autoFetchFallback(msgs []ollamaChatMsg) (ollamaChatMsg, bool) {
+	var lastSearchResult string
+	fetchedSince := false
+	pendingNames := []string{}
+	for _, m := range msgs {
+		switch {
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			for _, tc := range m.ToolCalls {
+				pendingNames = append(pendingNames, tc.Function.Name)
+			}
+		case m.Role == "tool":
+			if len(pendingNames) == 0 {
+				continue
+			}
+			name := pendingNames[0]
+			pendingNames = pendingNames[1:]
+			if searchToolNames[name] {
+				lastSearchResult = m.Content
+				fetchedSince = false
+			} else if fetchToolNames[name] {
+				fetchedSince = true
+			}
+		}
+	}
+	if lastSearchResult == "" || fetchedSince {
+		appendLog("auto-fetch fallback: nothing to do (no unfollowed search result)")
+		return ollamaChatMsg{}, false
+	}
+	url := chatURLRe.FindString(lastSearchResult)
+	if url == "" {
+		appendLog("auto-fetch fallback: no URL found in the last search result")
+		return ollamaChatMsg{}, false
+	}
+	_, data, err := fetchURL(url)
+	if err != nil {
+		appendLog("auto-fetch fallback: fetching %s failed: %s", url, err.Error())
+		return ollamaChatMsg{}, false
+	}
+	content := truncateToolOutput(stripHTMLTags(string(data)))
+	appendLog("auto-fetch fallback: fetched %s (%d chars)", url, len(content))
+	return ollamaChatMsg{Role: "tool", Content: "(auto-fetched " + url + ", since the earlier search result was never followed up on)\n\n" + content}, true
+}
+
 const webServerDefaultPort = 8787
 
 var (
@@ -3429,6 +4544,7 @@ const webChatPageHTML = `<!DOCTYPE html>
   .badge.on { background: rgba(74,222,128,0.12); color: #4ade80; }
   .badge.warn { background: rgba(255,215,0,0.12); color: #FFD700; }
   .badge.off { background: var(--bg-raised); color: var(--text-dim); }
+  .badge.danger { background: rgba(255,85,85,0.12); color: #ff5555; }
 
   #chatWrap { padding-top: 56px; padding-bottom: 140px; min-height: 100vh; }
   #chat { max-width: 720px; margin: 0 auto; padding: 8px 24px; }
@@ -3587,6 +4703,7 @@ const webChatPageHTML = `<!DOCTYPE html>
     <span class="meta">model: <span class="mono">__MODEL__</span> · cwd: <span class="mono">__CWD__</span></span>
   </div>
   <span id="badges"></span>
+  <span id="ctxBadge" class="badge off"></span>
   <div class="icons">
     <a class="iconbtn gh-link" href="https://github.com/affigabmag/llama-shell" target="_blank" rel="noopener" style="text-decoration:none">GitHub</a>
     <span class="iconbtn" id="toolsBtn">🛠 Tools</span>
@@ -3910,6 +5027,18 @@ let currentController = null;
 // from the messages array itself so this display-only text never gets
 // sent back to the model as part of the conversation history.
 let turnElapsed = [];
+// contextInfo mirrors the TUI's live "context: ~N / M tokens" counter —
+// added after several rounds of chasing silent truncation bugs blind, so
+// "answers cut off mid-reply" is visible right in the UI on whichever
+// surface hit it, not just discoverable by SSHing in to read server logs.
+let contextInfo = { used: 0, limit: 0 };
+function updateContextBadge() {
+  const el = document.getElementById('ctxBadge');
+  if (!el || !contextInfo.limit) return;
+  const pct = Math.round((contextInfo.used / contextInfo.limit) * 100);
+  el.textContent = 'ctx: ~' + contextInfo.used + ' / ' + contextInfo.limit + ' (' + pct + '%)';
+  el.className = 'badge ' + (pct < 60 ? 'off' : pct < 85 ? 'warn' : 'danger');
+}
 function setBusy(b) {
   busy = b;
   sendBtn.textContent = b ? '■' : '➤';
@@ -3951,10 +5080,24 @@ async function send() {
       messages.push({ role: 'assistant', content: '(error) ' + data.error });
     } else {
       messages = data.messages;
+      if (data.contextLimit) {
+        contextInfo = { used: data.contextUsed, limit: data.contextLimit };
+        updateContextBadge();
+      }
     }
   } catch (e) {
     if (e.name === 'AbortError') {
       messages.push({ role: 'assistant', content: '(stopped)' });
+    } else if (e instanceof TypeError) {
+      // A bare TypeError here means the browser's own connection to the
+      // server dropped mid-request (WiFi hiccup, phone backgrounded,
+      // screen lock) — it says nothing about whether the backend actually
+      // finished. Confirmed for real: the server went on to complete the
+      // turn (including a real send_email call) after the browser had
+      // already given up and shown this error, which reads as a failure
+      // even though the action succeeded. Framed as "check" rather than
+      // "failed" since we genuinely don't know from here.
+      messages.push({ role: 'assistant', content: '(connection lost) The request may still have completed on the server even though this browser lost the connection — check your chat history/inbox/whatever the request affected before retrying, to avoid doing it twice.' });
     } else {
       messages.push({ role: 'assistant', content: '(error) ' + e });
     }
@@ -4072,8 +5215,22 @@ type webChatRequest struct {
 }
 
 type webChatResponse struct {
-	Messages []ollamaChatMsg `json:"messages,omitempty"`
-	Error    string          `json:"error,omitempty"`
+	Messages     []ollamaChatMsg `json:"messages,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	ContextUsed  int             `json:"contextUsed"`
+	ContextLimit int             `json:"contextLimit"`
+}
+
+// conversationTokenEstimate sums the same rough per-message estimate the
+// TUI's live counter uses (renderContextUsage), so the web UI's own
+// counter is consistent with it — neither is Ollama's real tokenizer, but
+// at least the two surfaces never disagree with each other.
+func conversationTokenEstimate(messages []ollamaChatMsg) int {
+	total := 0
+	for _, m := range messages {
+		total += estimateTokens(m.Content)
+	}
+	return total
 }
 
 func webHandleChatAPI(w http.ResponseWriter, r *http.Request) {
@@ -4104,7 +5261,16 @@ func webHandleChatAPI(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(webChatResponse{Error: err.Error(), Messages: updated})
 		return
 	}
-	json.NewEncoder(w).Encode(webChatResponse{Messages: updated})
+	if reply := lastAssistantContent(updated); reply != "" {
+		appendLog("web chat: turn completed: %s", truncateName(reply, 200))
+	} else {
+		appendLog("web chat: turn ended with no reply text")
+	}
+	json.NewEncoder(w).Encode(webChatResponse{
+		Messages:     updated,
+		ContextUsed:  conversationTokenEstimate(updated),
+		ContextLimit: currentContextTokens(),
+	})
 }
 
 type webToolInfo struct {
@@ -4241,6 +5407,10 @@ type emailConfig struct {
 	FromAddress string `json:"from_address"`
 	AppPassword string `json:"app_password"`
 	DisplayName string `json:"display_name,omitempty"`
+	// MyEmail is the recipient used when the user asks to send something
+	// "to me" (or Hebrew "לי"/"אלי") without naming an actual address —
+	// resolved in code (resolveSelfEmail), not left to the model to infer.
+	MyEmail string `json:"my_email,omitempty"`
 }
 
 const (
@@ -4264,6 +5434,22 @@ func loadEmailConfig() emailConfig {
 	var cfg emailConfig
 	_ = json.Unmarshal(data, &cfg)
 	return cfg
+}
+
+// resolveSelfEmail substitutes the configured "my email" address when the
+// model passed a self-reference placeholder ("me", or Hebrew "לי"/"אלי")
+// instead of a real address — the model is told to pass one of these
+// literally rather than trying to guess/hallucinate the user's own
+// address, so the actual substitution happens here deterministically.
+func resolveSelfEmail(to, myEmail string) string {
+	if myEmail == "" {
+		return to
+	}
+	switch strings.ToLower(strings.TrimSpace(to)) {
+	case "me", "myself", "my email", "my own email", "self", "לי", "אלי", "אליי", "לעצמי":
+		return myEmail
+	}
+	return to
 }
 
 func saveEmailConfig(cfg emailConfig) error {
@@ -4622,6 +5808,53 @@ func (m *model) clampBackupBrowseScroll() {
 	}
 }
 
+func (m model) toolsSettingsVisibleRows() int {
+	reserved := 2 /* header */ + 1 /* footer */ + 2 /* box padding */ +
+		4 /* title + budget line + blank + column hint */ + 2 /* blank + hint line */
+	rows := m.height - reserved
+	if rows < 3 {
+		rows = 3
+	}
+	return rows
+}
+
+// clampToolsSettingsScroll mirrors clampBackupBrowseScroll's window-keeping
+// logic, applied to the flattened tool-row list instead of a directory
+// listing.
+func (m *model) clampToolsSettingsScroll() {
+	visible := m.toolsSettingsVisibleRows()
+	if m.toolsSettingsCursor < m.toolsSettingsScroll {
+		m.toolsSettingsScroll = m.toolsSettingsCursor
+	}
+	if m.toolsSettingsCursor >= m.toolsSettingsScroll+visible {
+		m.toolsSettingsScroll = m.toolsSettingsCursor - visible + 1
+	}
+	if m.toolsSettingsScroll < 0 {
+		m.toolsSettingsScroll = 0
+	}
+}
+
+// moveToolsSettingsCursor steps the cursor by delta rows, skipping header
+// rows (Tool == "") so Up/Down only ever lands on a toggleable tool.
+func moveToolsSettingsCursor(rows []toolSettingsRow, cursor, delta int) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	next := cursor
+	for {
+		next += delta
+		if next < 0 {
+			return cursor
+		}
+		if next >= len(rows) {
+			return cursor
+		}
+		if rows[next].Tool != "" {
+			return next
+		}
+	}
+}
+
 // enterBackupBrowser switches into the in-terminal directory browser,
 // starting in the same folder defaultBackupPath() suggests (the user's
 // home directory). mode is "export" or "import".
@@ -4818,6 +6051,49 @@ type telegramIncomingMsg struct {
 // and persists that binding, then rejects any other chat ID from then on
 // — otherwise anyone who discovers the bot's @username would get the same
 // full local tool access (files, commands, network) you have here.
+// telegramHistoryToolsReserve/telegramHistoryReplyReserve budget headroom
+// for the tool-schema JSON and the model's own reply, on top of the chat
+// history itself — the Telegram bot runs unattended for the app's entire
+// uptime with nothing ever trimming its history, so it silently outgrows
+// num_ctx eventually. When that happens llama.cpp truncates from the END
+// of an over-budget prompt, cutting off the newest user message first —
+// confirmed for real: a fresh question got silently dropped and the model
+// just echoed its answer to the PREVIOUS question instead, with a
+// suspiciously fast reply time proving no real inference happened on the
+// actual new input. The TUI/web chat has a visible token counter the user
+// can act on manually; Telegram has no such visibility, so it needs to
+// self-manage instead.
+const telegramHistoryToolsReserve = 2500
+const telegramHistoryReplyReserve = 1024
+
+// trimChatHistory keeps the system message plus as many of the most
+// recent messages as fit the available budget, dropping the oldest first.
+// Always keeps at least one non-system message even if it alone exceeds
+// budget, so a single very long message can't wedge history into an
+// unrecoverable empty state.
+func trimChatHistory(history []ollamaChatMsg) []ollamaChatMsg {
+	if len(history) == 0 {
+		return history
+	}
+	budget := currentContextTokens() - telegramHistoryToolsReserve - telegramHistoryReplyReserve
+	if budget < 512 {
+		budget = 512
+	}
+	sys := history[0]
+	rest := history[1:]
+	used := estimateTokens(sys.Content)
+	var kept []ollamaChatMsg
+	for i := len(rest) - 1; i >= 0; i-- {
+		t := estimateTokens(rest[i].Content)
+		if used+t > budget && len(kept) > 0 {
+			break
+		}
+		kept = append([]ollamaChatMsg{rest[i]}, kept...)
+		used += t
+	}
+	return append([]ollamaChatMsg{sys}, kept...)
+}
+
 func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string) {
 	history := []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(workDir)}}
 	var boundChatID atomic.Int64
@@ -4902,6 +6178,7 @@ func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string
 		}
 		busy.Store(true)
 		busyChatID.Store(chatID)
+		history = trimChatHistory(history)
 		history = append(history, ollamaChatMsg{Role: "user", Content: msg.text})
 		appendLog("telegram message: %s", truncateName(msg.text, 80))
 
@@ -4909,7 +6186,7 @@ func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string
 		// small model + tool calls can take anywhere from seconds to a
 		// couple minutes — plus Telegram's native "typing..." indicator,
 		// refreshed on a ticker since it only lasts ~5s per call.
-		_ = telegramSendMessage(cfg.Token, chatID, "⏳ Got it — working on it...")
+		_ = telegramSendMessage(cfg.Token, chatID, instantAckFor(msg.text))
 		turnStarted := time.Now()
 		typingDone := make(chan struct{})
 		go func() {
@@ -4946,7 +6223,7 @@ func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string
 			busy.Store(false)
 			continue
 		}
-		history = updated
+		history = trimChatHistory(updated)
 		var reply string
 		for _, m := range updated {
 			if m.Role == "assistant" && strings.TrimSpace(m.Content) != "" {
@@ -4956,11 +6233,521 @@ func runTelegramPollLoop(ctx context.Context, cfg telegramConfig, workDir string
 		if reply == "" {
 			reply = "(no reply)"
 		}
+		appendLog("telegram: turn completed after %s: %s", elapsed, truncateName(reply, 200))
 		reply = cleanMarkdownForDisplay(reply) + "\n\n⏱ " + elapsed
 		if err := telegramSendMessage(cfg.Token, chatID, reply); err != nil {
 			appendLog("telegram: sendMessage error: %s", err.Error())
 		}
 		busy.Store(false)
+	}
+}
+
+// whatsappConfig persists just the model choice and (once bound) which
+// chat this bot answers — the actual WhatsApp session/credentials live in
+// whatsmeow's own SQLite store (whatsappStorePath), not here, since that
+// store's format is whatsmeow's to own and evolve, not something to
+// duplicate into a second config file.
+type whatsappConfig struct {
+	Model    string `json:"model"`
+	BoundJID string `json:"bound_jid,omitempty"`
+}
+
+func whatsappConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "whatsapp_config.json")
+}
+
+func whatsappStorePath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "whatsapp_store.db")
+}
+
+func loadWhatsAppConfig() whatsappConfig {
+	data, err := os.ReadFile(whatsappConfigPath())
+	if err != nil {
+		return whatsappConfig{}
+	}
+	var cfg whatsappConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveWhatsAppConfig(cfg whatsappConfig) error {
+	path := whatsappConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// waState holds every piece of live WhatsApp status the settings screen
+// and message loop share — guarded by waMu since the pairing goroutine,
+// the event handler (called from whatsmeow's own goroutines), and the TUI
+// render/update loop all touch it concurrently.
+var (
+	waMu       sync.Mutex
+	waClient   *whatsmeow.Client
+	waCancel   context.CancelFunc
+	waRunning  bool
+	waLinked   bool
+	waPhone    string // the linked account's own number, once known
+	waQRText   string // current ASCII QR to scan, empty when none pending
+	waPairCode string // current phone-linking code to type in, empty when none pending
+	waStatus   string // short human-readable status/error for the settings screen
+)
+
+func isWhatsAppRunning() bool {
+	waMu.Lock()
+	defer waMu.Unlock()
+	return waRunning
+}
+
+// whatsappSnapshot is a plain-data copy of the live wa* state, taken under
+// the lock, for the render code to read without holding waMu itself (the
+// render path runs on the TUI's own goroutine and must never block on
+// whatsmeow's).
+type whatsappSnapshot struct {
+	running  bool
+	linked   bool
+	phone    string
+	qrText   string
+	pairCode string
+	status   string
+}
+
+func currentWhatsAppSnapshot() whatsappSnapshot {
+	waMu.Lock()
+	defer waMu.Unlock()
+	return whatsappSnapshot{running: waRunning, linked: waLinked, phone: waPhone, qrText: waQRText, pairCode: waPairCode, status: waStatus}
+}
+
+type whatsappIncomingMsg struct {
+	chatJID types.JID
+	text    string
+}
+
+var whatsappIncoming = make(chan whatsappIncomingMsg, 32)
+
+// whatsappQRLogger silences whatsmeow's own verbose internal logging —
+// it defaults to stdout, which would corrupt the TUI's alt-screen
+// rendering the same way any stray print statement would.
+type whatsappNopLogger struct{}
+
+func (whatsappNopLogger) Debugf(msg string, args ...interface{}) {}
+func (whatsappNopLogger) Infof(msg string, args ...interface{})  {}
+func (whatsappNopLogger) Warnf(msg string, args ...interface{})  {}
+func (whatsappNopLogger) Errorf(msg string, args ...interface{}) {}
+func (whatsappNopLogger) Sub(module string) waLog.Logger         { return whatsappNopLogger{} }
+
+// extractWhatsAppText pulls plain text out of the message types actually
+// worth answering — a bare text message (Conversation) or a text message
+// with link-preview metadata (ExtendedTextMessage). Media/system messages
+// return "", which the caller treats as nothing to respond to.
+func extractWhatsAppText(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if c := msg.GetConversation(); c != "" {
+		return c
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return ext.GetText()
+	}
+	return ""
+}
+
+// renderQRAscii encodes text as a QR code (via rsc.io/qr, the same
+// underlying encoder qrterminal itself used) and draws it directly —
+// full control over the exact escape sequences emitted, rather than
+// depending on a wrapper library's own rendering choices.
+//
+// Each terminal cell packs TWO QR module-rows using the upper-half-block
+// glyph '▀' with its foreground set to the top pixel's color and its
+// background set to the bottom pixel's — one character encodes a 1-wide
+// by 2-tall QR area, which (given a monospace cell is roughly twice as
+// tall as it is wide) comes out close to square while using a quarter of
+// the terminal area a naive 2-wide/1-tall-per-module block scheme needs,
+// shrinking the QR noticeably as asked. This DOES reuse a technique
+// (Unicode half-block glyphs) that was confirmed invisible on the
+// Proxmox noVNC console's font — but WhatsApp linking there now defaults
+// to phone-number pairing instead (plain text, no rendering pitfalls at
+// all), so this smaller/squarer QR optimizes for the normal-terminal
+// case where it actually matters.
+func renderQRAscii(text string) (string, error) {
+	code, err := qr.Encode(text, qr.L)
+	if err != nil {
+		return "", err
+	}
+	const quietZone = 2
+	size := code.Size
+	black := func(x, y int) bool {
+		if x < 0 || x >= size || y < 0 || y >= size {
+			return false
+		}
+		return code.Black(x, y)
+	}
+	var buf strings.Builder
+	for y := -quietZone; y < size+quietZone; y += 2 {
+		for x := -quietZone; x < size+quietZone; x++ {
+			top, bottom := black(x, y), black(x, y+1)
+			fg, bg := 37, 47 // both white (light/off) by default
+			if top {
+				fg = 30
+			}
+			if bottom {
+				bg = 40
+			}
+			fmt.Fprintf(&buf, "\x1b[%d;%dm▀\x1b[0m", fg, bg)
+		}
+		buf.WriteString("\n")
+	}
+	return buf.String(), nil
+}
+
+// startWhatsAppBot connects (or re-connects) the whatsmeow client — a
+// no-op if one is already running, mirroring startTelegramBot. If the
+// device store has no saved session yet, this also starts pairing: QR by
+// default (waQRText gets populated for the settings screen to render), or
+// phone-number pairing (waPairCode instead) when phone is non-empty —
+// phone pairing is the better default for a headless/SSH deployment like
+// CT 102, where nobody's looking at the terminal with a phone camera
+// anyway, and it sidesteps the QR's terminal-width requirement entirely.
+// If a session already exists, phone is ignored and this just reconnects
+// using the saved session, no pairing needed either way.
+func startWhatsAppBot(cfg whatsappConfig, workDir string, phone string) {
+	waMu.Lock()
+	if waRunning {
+		waMu.Unlock()
+		return
+	}
+	waRunning = true
+	waStatus = "connecting..."
+	waMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waMu.Lock()
+	waCancel = cancel
+	waMu.Unlock()
+
+	go func() {
+		container, err := sqlstore.New(ctx, "sqlite", "file:"+whatsappStorePath()+"?_pragma=foreign_keys(1)", whatsappNopLogger{})
+		if err != nil {
+			waMu.Lock()
+			waRunning = false
+			waStatus = "store error: " + err.Error()
+			waMu.Unlock()
+			appendLog("whatsapp: store open failed: %s", err.Error())
+			return
+		}
+		device, err := container.GetFirstDevice(ctx)
+		if err != nil {
+			waMu.Lock()
+			waRunning = false
+			waStatus = "store error: " + err.Error()
+			waMu.Unlock()
+			appendLog("whatsapp: device load failed: %s", err.Error())
+			return
+		}
+		client := whatsmeow.NewClient(device, whatsappNopLogger{})
+		waMu.Lock()
+		waClient = client
+		waMu.Unlock()
+		client.AddEventHandler(func(evt interface{}) { whatsappEventHandler(client, evt) })
+
+		if client.Store.ID == nil {
+			// No saved session — pair via QR (channel must be requested
+			// before Connect()) or, if a phone number was given, via a
+			// short pairing code instead. Either way the channel yields
+			// events until scanned/paired ("success") or the connection
+			// drops first ("timeout").
+			qrChan, err := client.GetQRChannel(ctx)
+			if err != nil {
+				waMu.Lock()
+				waRunning = false
+				waStatus = "QR channel error: " + err.Error()
+				waMu.Unlock()
+				appendLog("whatsapp: QR channel error: %s", err.Error())
+				return
+			}
+			if err := client.Connect(); err != nil {
+				waMu.Lock()
+				waRunning = false
+				waStatus = "connect error: " + err.Error()
+				waMu.Unlock()
+				appendLog("whatsapp: connect failed: %s", err.Error())
+				return
+			}
+			if phone != "" {
+				// PairPhone requires the connection to be fully
+				// established first — waiting for an actual "code" event
+				// (not just whatever the channel's first item happens to
+				// be, which could be an early error/timeout before the
+				// handshake settles) is the documented way to ensure
+				// that without a fixed sleep.
+				for evt := range qrChan {
+					if evt.Event == "code" {
+						break
+					}
+				}
+				// clientDisplayName MUST be "Browser (OS)" using a real,
+				// recognized browser name — WhatsApp's server validates
+				// this server-side and returns exactly the 400
+				// "bad-request" seen here if it doesn't match, which is
+				// what "llama-shell (Linux)" was actually hitting; had
+				// nothing to do with the phone number despite that being
+				// the more obvious suspect.
+				code, err := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+				if err != nil {
+					waMu.Lock()
+					waRunning = false
+					// Echo back exactly what was submitted (digits, as
+					// sent to WhatsApp's server) — a 400 here is almost
+					// always a formatting mistake (leading 0 after the
+					// country code, missing country code, stray +/spaces
+					// that already got stripped on input), and the fastest
+					// way to spot which is seeing the literal value that
+					// was rejected instead of guessing from memory.
+					waStatus = fmt.Sprintf("phone pairing error (number entered: %s): %s", phone, err.Error())
+					waMu.Unlock()
+					appendLog("whatsapp: phone pairing error (number: %s): %s", phone, err.Error())
+					return
+				}
+				waMu.Lock()
+				waPairCode = code
+				waStatus = "enter this code in WhatsApp -> Linked Devices -> Link with phone number"
+				waMu.Unlock()
+			}
+			for evt := range qrChan {
+				switch evt.Event {
+				case "code":
+					if phone != "" {
+						continue // phone-pairing mode: ignore QR codes, waPairCode is what's shown
+					}
+					qrText, err := renderQRAscii(evt.Code)
+					if err != nil {
+						waMu.Lock()
+						waStatus = "QR render error: " + err.Error()
+						waMu.Unlock()
+						appendLog("whatsapp: QR render error: %s", err.Error())
+						continue
+					}
+					waMu.Lock()
+					waQRText = qrText
+					waStatus = "scan this QR with WhatsApp -> Linked Devices -> Link a Device"
+					waMu.Unlock()
+				default:
+					if evt.Event == whatsmeow.QRChannelSuccess.Event {
+						waMu.Lock()
+						waLinked = true
+						waQRText = ""
+						waPairCode = ""
+						if client.Store.ID != nil {
+							waPhone = client.Store.ID.User
+						}
+						waStatus = "linked"
+						waMu.Unlock()
+						appendLog("whatsapp: paired successfully")
+					} else {
+						waMu.Lock()
+						waQRText = ""
+						waPairCode = ""
+						waStatus = "pairing " + evt.Event
+						waMu.Unlock()
+						appendLog("whatsapp: pairing ended: %s", evt.Event)
+					}
+				}
+			}
+		} else {
+			waMu.Lock()
+			waLinked = true
+			waPhone = client.Store.ID.User
+			waStatus = "linked"
+			waMu.Unlock()
+			if err := client.Connect(); err != nil {
+				waMu.Lock()
+				waRunning = false
+				waStatus = "connect error: " + err.Error()
+				waMu.Unlock()
+				appendLog("whatsapp: connect failed: %s", err.Error())
+				return
+			}
+		}
+		appendLog("whatsapp bot connected (model %s)", cfg.Model)
+		<-ctx.Done()
+	}()
+	go runWhatsAppMessageLoop(ctx, cfg, workDir)
+}
+
+func stopWhatsAppBot() {
+	waMu.Lock()
+	cancel := waCancel
+	client := waClient
+	waRunning = false
+	// Clear any in-progress pairing state too — otherwise switching
+	// pairing methods (QR -> phone number or vice versa) mid-attempt
+	// leaves the old QR/code lingering in the snapshot even though the
+	// client that was going to complete it just got torn down.
+	if !waLinked {
+		waQRText = ""
+		waPairCode = ""
+		waStatus = ""
+	}
+	waMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if client != nil {
+		client.Disconnect()
+	}
+	appendLog("whatsapp bot stopped")
+}
+
+// whatsappEventHandler is registered once per client and runs on
+// whatsmeow's own goroutines — it must never block, so incoming messages
+// are just handed off to the buffered whatsappIncoming channel for
+// runWhatsAppMessageLoop to actually process.
+func whatsappEventHandler(client *whatsmeow.Client, evtRaw interface{}) {
+	switch evt := evtRaw.(type) {
+	case *events.LoggedOut:
+		// Fires when the PHONE unpairs this device (removed from
+		// WhatsApp's own Linked Devices list) — distinct from this app
+		// calling Client.LogOut() itself, which never emits this. Without
+		// handling it, the app kept claiming "linked"/WA:ON indefinitely
+		// after the phone had already revoked the session, since nothing
+		// was listening for anything but incoming messages.
+		appendLog("whatsapp: logged out by phone (reason: %v)", evt.Reason)
+		stopWhatsAppBot()
+		_ = os.Remove(whatsappStorePath())
+		_ = saveWhatsAppConfig(whatsappConfig{})
+		waMu.Lock()
+		waLinked = false
+		waPhone = ""
+		waQRText = ""
+		waPairCode = ""
+		waStatus = "unlinked — removed from WhatsApp's Linked Devices on the phone"
+		waMu.Unlock()
+	case *events.Message:
+		if evt.Info.IsFromMe || evt.Info.IsGroup {
+			return
+		}
+		text := strings.TrimSpace(extractWhatsAppText(evt.Message))
+		if text == "" {
+			return
+		}
+		select {
+		case whatsappIncoming <- whatsappIncomingMsg{chatJID: evt.Info.Chat, text: text}:
+		default:
+			appendLog("whatsapp: incoming message dropped, queue full")
+		}
+	}
+}
+
+// runWhatsAppMessageLoop is the WhatsApp equivalent of
+// runTelegramPollLoop — event-driven instead of long-polling (whatsmeow's
+// own websocket connection delivers messages via whatsappEventHandler
+// above), but otherwise the same shape: bind to the first sender like
+// Telegram binds to the first chat, keep one running conversation history
+// (trimmed the same way, for the same reason), send a typing indicator
+// and periodic "still working" updates during long tool-calling turns.
+func runWhatsAppMessageLoop(ctx context.Context, cfg whatsappConfig, workDir string) {
+	history := []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(workDir)}}
+	var boundJID types.JID
+	if cfg.BoundJID != "" {
+		if parsed, err := types.ParseJID(cfg.BoundJID); err == nil {
+			boundJID = parsed
+		}
+	}
+	for {
+		var msg whatsappIncomingMsg
+		select {
+		case <-ctx.Done():
+			return
+		case msg = <-whatsappIncoming:
+		}
+		if boundJID.IsEmpty() {
+			boundJID = msg.chatJID
+			cfg.BoundJID = boundJID.String()
+			_ = saveWhatsAppConfig(cfg)
+			appendLog("whatsapp: bound to chat %s", boundJID.String())
+		} else if msg.chatJID != boundJID {
+			appendLog("whatsapp: rejected message from unbound chat %s", msg.chatJID.String())
+			continue
+		}
+
+		waMu.Lock()
+		client := waClient
+		waMu.Unlock()
+		if client == nil {
+			continue
+		}
+
+		history = trimChatHistory(history)
+		history = append(history, ollamaChatMsg{Role: "user", Content: msg.text})
+		appendLog("whatsapp message: %s", truncateName(msg.text, 80))
+
+		// Same instant ack as Telegram's — a small/CPU-bound model plus
+		// tool calls can take anywhere from seconds to a couple minutes,
+		// and with nothing sent immediately the chat looks like a dead
+		// end (no "typing..." equivalent shows reliably across WhatsApp
+		// clients the way Telegram's chat-action does).
+		_, _ = client.SendMessage(ctx, boundJID, &waProto.Message{
+			Conversation: proto.String(instantAckFor(msg.text)),
+		})
+
+		turnStarted := time.Now()
+		typingDone := make(chan struct{})
+		go func() {
+			_ = client.SendChatPresence(ctx, boundJID, types.ChatPresenceComposing, "")
+			presenceTicker := time.NewTicker(4 * time.Second)
+			defer presenceTicker.Stop()
+			statusTicker := time.NewTicker(1 * time.Minute)
+			defer statusTicker.Stop()
+			elapsedMin := 0
+			for {
+				select {
+				case <-typingDone:
+					return
+				case <-presenceTicker.C:
+					_ = client.SendChatPresence(ctx, boundJID, types.ChatPresenceComposing, "")
+				case <-statusTicker.C:
+					elapsedMin++
+					_, _ = client.SendMessage(ctx, boundJID, &waProto.Message{
+						Conversation: proto.String(fmt.Sprintf("⏳ Still working on it... (%dm)", elapsedMin)),
+					})
+				}
+			}
+		}()
+
+		updated, err := runAgentTurnSync(cfg.Model, history, workDir, true)
+		close(typingDone)
+		_ = client.SendChatPresence(ctx, boundJID, types.ChatPresencePaused, "")
+		elapsed := formatElapsedDuration(time.Since(turnStarted))
+		if err != nil {
+			_, _ = client.SendMessage(ctx, boundJID, &waProto.Message{
+				Conversation: proto.String("error: " + err.Error() + " (" + elapsed + ")"),
+			})
+			continue
+		}
+		history = trimChatHistory(updated)
+		reply := lastAssistantContent(updated)
+		if reply == "" {
+			reply = "(no reply)"
+		}
+		appendLog("whatsapp: turn completed after %s: %s", elapsed, truncateName(reply, 200))
+		reply = cleanMarkdownForDisplay(reply) + "\n\n⏱ " + elapsed
+		if _, err := client.SendMessage(ctx, boundJID, &waProto.Message{Conversation: proto.String(reply)}); err != nil {
+			appendLog("whatsapp: sendMessage error: %s", err.Error())
+		}
 	}
 }
 
@@ -5912,6 +7699,8 @@ func helpMenuLabelForView(v view) string {
 		return "tavily key"
 	case viewTelegramSettings:
 		return "telegram bot"
+	case viewWhatsAppSettings:
+		return "whatsapp bot"
 	case viewEmailSettings:
 		return "email"
 	default:
@@ -6440,8 +8229,11 @@ var helpMenuItems = []helpMenuItem{
 	{"t", "tavily API key (enables tavily_search/tavily_extract tools)", viewTavilySettings},
 	{"b", "web server (browser access to agentic chat)", viewWebServerSettings},
 	{"m", "telegram bot (chat with the agent from your phone)", viewTelegramSettings},
+	{"p", "whatsapp bot (chat with the agent via WhatsApp, QR-linked)", viewWhatsAppSettings},
 	{"e", "email (Gmail app password, sends a test email)", viewEmailSettings},
 	{"x", "backup / restore (encrypted export & import of all settings)", viewBackupSettings},
+	{"o", "tool list (choose which tools the model gets, by hardware budget)", viewToolsSettings},
+	{"c", "context size (how much conversation the model can hold before cutting off)", viewContextSettings},
 }
 
 type model struct {
@@ -6536,9 +8328,12 @@ type model struct {
 
 	telegramEditing bool
 
-	// emailFieldFocus: 0 = address, 1 = display name (optional), 2 = app password.
+	// emailFieldFocus: 0 = address, 1 = display name (optional), 2 = my
+	// email (optional — recipient for "send me"/"לי"/"אלי" requests), 3 =
+	// app password.
 	emailAddrInput        string
 	emailDisplayNameInput string
+	emailMyAddrInput      string
 	emailPassInput        string
 	emailFieldFocus       int
 	emailMsg              string
@@ -6572,6 +8367,24 @@ type model struct {
 	autoUpdateTimeInput   string
 	autoUpdateMsg         string
 
+	// toolsSettingsCursor indexes into the flattened tool-row list (skips
+	// category header rows) built fresh each render from
+	// agentToolCategories, so it always matches whatever's on screen.
+	toolsSettingsCursor int
+	toolsSettingsScroll int
+	toolsSettingsMsg    string
+	// toolsKeywordMode: "" (not adding), "category" (picking which
+	// category via a number key), "keyword" (typing the new keyword for
+	// the category picked in the previous step).
+	toolsKeywordMode     string
+	toolsKeywordCategory string
+	toolsKeywordInput    string
+
+	contextCursor  int // index into contextSizeOptions()'s rows — the last one is "Custom"
+	contextEditing bool
+	contextInput   string
+	contextMsg     string
+
 	// agentReturnView is where Esc from the agentic chat goes back to —
 	// viewShowTable normally (entered via "show model info"), but viewMenu
 	// when autopilot started the chat directly with nothing scanned.
@@ -6602,6 +8415,12 @@ type model struct {
 
 	telegramTokenInput string
 	telegramMsg        string
+
+	whatsappMsg             string
+	whatsappPhoneEditing    bool
+	whatsappPhoneInput      string
+	whatsappConfirmMaximize bool
+	whatsappLastShape       string // last tick's content "shape" (qr/paircode/idle/etc) — only ClearScreen when this changes
 
 	// wizardPendingSetups queues the optional setup screens (tavily,
 	// telegram, email) the wizard's "done" phase chains through in order —
@@ -6683,6 +8502,18 @@ func initialModel() model {
 			wd = "."
 		}
 		startTelegramBot(tgCfg, wd)
+	}
+	if waCfg := loadWhatsAppConfig(); waCfg.Model != "" {
+		// Only auto-start if a session already exists (whatsappStorePath
+		// present) — otherwise this would silently spin up a pairing
+		// goroutine with a QR nobody's watching on every launch.
+		if _, err := os.Stat(whatsappStorePath()); err == nil {
+			wd, err := os.Getwd()
+			if err != nil {
+				wd = "."
+			}
+			startWhatsAppBot(waCfg, wd, "")
+		}
 	}
 	// --autopilot reuses the exact same flow as pressing [a] in the main
 	// menu — but only once the disclaimer's actually been accepted; a
@@ -6824,7 +8655,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentViewport.Height = agentViewportHeight(m.height)
 			m.syncAgentViewport()
 		}
-		return m, nil
+		// Force a full repaint on a genuine resize instead of trusting
+		// bubbletea's incremental diff — if the terminal's real size
+		// changed but the previous frame was drawn at the old dimensions,
+		// incremental diffing only repaints the cells it believes changed,
+		// which can leave old content lingering in whatever area is now
+		// wider/taller than before it had ever painted (observed for
+		// real: stray leftover text at a screen's edge after a noVNC
+		// console resize).
+		return m, tea.ClearScreen
 
 	case cmdResultMsg:
 		m.loading = false
@@ -7294,6 +9133,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if lastMsg := lastAssistantContent(msg.messages); lastMsg != "" {
 			m.agentTurnTimes = append(m.agentTurnTimes, time.Since(m.agentStarted))
 		}
+		// Log the actual outcome of every turn — previously only tool
+		// calls were logged, so a turn that finished with a bad/empty
+		// reply (or errored) left no trace in activity.log at all, only
+		// in the live terminal — which turned out to be unreliable
+		// evidence itself (found for real: `screen`'s scrollback couldn't
+		// be trusted to still hold an old reply after enough busy-tick
+		// redraws). This makes activity.log the source of truth instead.
+		if msg.err != "" {
+			appendLog("turn failed after %s: %s", time.Since(m.agentStarted).Round(time.Second), msg.err)
+		} else if reply := lastAssistantContent(msg.messages); reply != "" {
+			appendLog("turn completed after %s: %s", time.Since(m.agentStarted).Round(time.Second), truncateName(reply, 200))
+		} else {
+			appendLog("turn ended after %s with no reply text (likely tool-call-only or empty)", time.Since(m.agentStarted).Round(time.Second))
+		}
 		if msg.err == "" {
 			m.agentWarmup = "ready"
 		}
@@ -7342,6 +9195,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, next
 		}
 		return m, tea.Batch(next, checkAndRewarmModel(m.agentModelName))
+
+	case whatsappTickMsg:
+		if m.view != viewWhatsAppSettings {
+			return m, nil
+		}
+		// Only force a full repaint when this screen's content actually
+		// changes SHAPE (idle text <-> a ~40-row QR <-> a short
+		// pairing-code screen) — clearing on every single tick (as a
+		// first attempt did) fixed a real stale-redraw bug on the Proxmox
+		// noVNC console (shrinking back down left fragments of the QR's
+		// now-unused rows on screen) but visibly flickered every second
+		// on a normal terminal where nothing was actually stale.
+		snap := currentWhatsAppSnapshot()
+		shape := "idle"
+		switch {
+		case snap.qrText != "":
+			shape = "qr"
+		case snap.pairCode != "":
+			shape = "paircode"
+		case snap.linked:
+			shape = "linked"
+		}
+		if shape != m.whatsappLastShape {
+			m.whatsappLastShape = shape
+			return m, tea.Batch(whatsappTickCmd(), tea.ClearScreen)
+		}
+		return m, whatsappTickCmd()
 
 	case agentRewarmCheckedMsg:
 		if !msg.wasLoaded {
@@ -7563,6 +9443,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.agentPasteNotice = "tool mode: " + m.agentToolMode
 				appendLog("tool mode set to %s", m.agentToolMode)
+				return m, nil
+			case "ctrl+l":
+				// A real clear, not just a terminal escape — "clear"/"cls"
+				// typed as a chat message does nothing useful here (the TUI
+				// redraws its own transcript from agentMessages every
+				// frame, so clearing the underlying terminal has no lasting
+				// effect); this actually resets the conversation, dropping
+				// everything except a fresh system prompt so the model
+				// isn't still carrying the old context either.
+				if m.agentBusy {
+					return m, nil
+				}
+				m.agentMessages = []ollamaChatMsg{{Role: "system", Content: agentSystemPrompt(m.agentWorkDir)}}
+				m.agentTurnTimes = nil
+				m.agentErr = ""
+				m.agentPasteNotice = "chat cleared"
+				appendLog("chat cleared (Ctrl+L)")
+				m.syncAgentViewport()
 				return m, nil
 			}
 			if m.agentBusy {
@@ -7890,6 +9788,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						appendLog("opened %s", it.label)
 						return m, checkForUpdate()
 					}
+					if it.dest == viewWhatsAppSettings {
+						appendLog("opened %s", it.label)
+						return m, whatsappTickCmd()
+					}
 				}
 				appendLog("opened %s", it.label)
 			default:
@@ -8109,6 +10011,162 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case viewWhatsAppSettings:
+			if m.whatsappPhoneEditing {
+				switch key {
+				case "ctrl+c":
+					appendLog("quit")
+					return m, tea.Quit
+				case "esc":
+					m.whatsappPhoneEditing = false
+					m.whatsappPhoneInput = ""
+					return m, nil
+				case "enter":
+					phone := strings.TrimSpace(m.whatsappPhoneInput)
+					if phone == "" {
+						m.whatsappMsg = "type a phone number with country code, digits only (e.g. 972501234567)"
+						return m, nil
+					}
+					names, err := listInstalledModelNames()
+					if err != nil || len(names) == 0 {
+						m.whatsappMsg = "no local model installed — run the setup wizard ([h] help/settings -> [w]) to download one first"
+						return m, nil
+					}
+					existing := loadWhatsAppConfig()
+					modelName := names[pickDefaultModelIndex(names, existing.Model)]
+					cfg := whatsappConfig{Model: modelName, BoundJID: existing.BoundJID}
+					if err := saveWhatsAppConfig(cfg); err != nil {
+						m.whatsappMsg = "error saving config: " + err.Error()
+						return m, nil
+					}
+					wd, err := os.Getwd()
+					if err != nil {
+						wd = "."
+					}
+					startWhatsAppBot(cfg, wd, phone)
+					m.whatsappMsg = ""
+					m.whatsappPhoneEditing = false
+					m.whatsappPhoneInput = ""
+					appendLog("whatsapp: starting phone pairing for +%s (model %s)", phone, modelName)
+					return m, whatsappTickCmd()
+				case "backspace":
+					if len(m.whatsappPhoneInput) > 0 {
+						m.whatsappPhoneInput = m.whatsappPhoneInput[:len(m.whatsappPhoneInput)-1]
+					}
+					return m, nil
+				default:
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsDigit(r) {
+						m.whatsappPhoneInput += key
+					}
+					return m, nil
+				}
+			}
+			if m.whatsappConfirmMaximize {
+				switch key {
+				case "ctrl+c":
+					appendLog("quit")
+					return m, tea.Quit
+				case "esc":
+					m.whatsappConfirmMaximize = false
+					return m, nil
+				case "enter":
+					m.whatsappConfirmMaximize = false
+					snap := currentWhatsAppSnapshot()
+					if snap.running {
+						stopWhatsAppBot()
+					}
+					names, err := listInstalledModelNames()
+					if err != nil || len(names) == 0 {
+						m.whatsappMsg = "no local model installed — run the setup wizard ([h] help/settings -> [w]) to download one first"
+						return m, nil
+					}
+					existing := loadWhatsAppConfig()
+					modelName := names[pickDefaultModelIndex(names, existing.Model)]
+					cfg := whatsappConfig{Model: modelName, BoundJID: existing.BoundJID}
+					if err := saveWhatsAppConfig(cfg); err != nil {
+						m.whatsappMsg = "error saving config: " + err.Error()
+						return m, nil
+					}
+					wd, err := os.Getwd()
+					if err != nil {
+						wd = "."
+					}
+					startWhatsAppBot(cfg, wd, "")
+					m.whatsappMsg = ""
+					appendLog("whatsapp: starting (model %s)", modelName)
+					return m, whatsappTickCmd()
+				}
+				return m, nil
+			}
+			switch key {
+			case "ctrl+c":
+				appendLog("quit")
+				return m, tea.Quit
+			case "esc":
+				m = m.advanceWizardChain()
+				m.whatsappMsg = ""
+				return m, nil
+			case "l":
+				snap := currentWhatsAppSnapshot()
+				if snap.running && snap.linked {
+					return m, nil // already connected — nothing to (re)start
+				}
+				// Don't start pairing yet — the QR needs a maximized
+				// terminal to render/scan correctly, confirmed for real
+				// (a default-size window cuts it off or wraps it), so
+				// ask first instead of generating a QR the user hasn't
+				// had a chance to prepare for.
+				m.whatsappConfirmMaximize = true
+				m.whatsappMsg = ""
+				return m, nil
+			case "n":
+				snap := currentWhatsAppSnapshot()
+				if snap.running && snap.linked {
+					return m, nil // already connected — nothing to (re)start
+				}
+				if snap.running {
+					// Same as [l] above — switching pairing method
+					// mid-attempt needs the old (QR) attempt stopped first.
+					stopWhatsAppBot()
+				}
+				m.whatsappPhoneEditing = true
+				m.whatsappPhoneInput = ""
+				m.whatsappMsg = ""
+				return m, nil
+			case "u":
+				snap := currentWhatsAppSnapshot()
+				if !snap.linked && !snap.running {
+					return m, nil
+				}
+				waMu.Lock()
+				client := waClient
+				waMu.Unlock()
+				if client != nil && client.IsConnected() {
+					client.Logout(context.Background())
+				}
+				stopWhatsAppBot()
+				_ = os.Remove(whatsappStorePath())
+				_ = saveWhatsAppConfig(whatsappConfig{})
+				waMu.Lock()
+				waLinked = false
+				waPhone = ""
+				waQRText = ""
+				waPairCode = ""
+				waStatus = ""
+				waMu.Unlock()
+				m.whatsappMsg = "unlinked — press [l] or [n] to link a (possibly different) account again"
+				appendLog("whatsapp: unlinked")
+				return m, nil
+			case "r":
+				// Manual force-redraw — the automatic one already fires
+				// on every real resize (tea.WindowSizeMsg forces
+				// tea.ClearScreen), but this gives an explicit escape
+				// hatch for whatever a resize's own font/cell-size
+				// recalculation does that a content-only redraw can't fix.
+				return m, tea.ClearScreen
+			}
+			return m, nil
+
 		case viewEmailSettings:
 			if m.emailSending {
 				return m, nil
@@ -8133,8 +10191,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// two so the user isn't forced to retype them.
 					m.emailAddrInput = cfg.FromAddress
 					m.emailDisplayNameInput = cfg.DisplayName
+					m.emailMyAddrInput = cfg.MyEmail
 					m.emailPassInput = ""
-					m.emailFieldFocus = 2
+					m.emailFieldFocus = 3
 					m.emailMsg = ""
 					appendLog("email: reconfiguring")
 				}
@@ -8148,33 +10207,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.advanceWizardChain()
 				m.emailAddrInput = ""
 				m.emailDisplayNameInput = ""
+				m.emailMyAddrInput = ""
 				m.emailPassInput = ""
 				m.emailMsg = ""
 				m.emailFieldFocus = 0
 				m.emailEditing = false
 				return m, nil
 			case "tab", "down":
-				m.emailFieldFocus = (m.emailFieldFocus + 1) % 3
+				m.emailFieldFocus = (m.emailFieldFocus + 1) % 4
 				return m, nil
 			case "up":
-				m.emailFieldFocus = (m.emailFieldFocus + 2) % 3
+				m.emailFieldFocus = (m.emailFieldFocus + 3) % 4
 				return m, nil
 			case "enter":
 				// Enter just advances through address -> display name ->
-				// password like Tab, rather than trying to submit from an
-				// earlier field — only the last field (password) submits.
-				if m.emailFieldFocus < 2 {
+				// my email -> password like Tab, rather than trying to
+				// submit from an earlier field — only the last field
+				// (password) submits.
+				if m.emailFieldFocus < 3 {
 					m.emailFieldFocus++
 					return m, nil
 				}
 				addr := strings.TrimSpace(m.emailAddrInput)
 				displayName := strings.TrimSpace(m.emailDisplayNameInput)
+				myEmail := strings.TrimSpace(m.emailMyAddrInput)
 				pass := strings.ReplaceAll(strings.TrimSpace(m.emailPassInput), " ", "")
 				if addr == "" || pass == "" {
 					m.emailMsg = "both the Gmail address and the app password are required"
 					return m, nil
 				}
-				cfg := emailConfig{FromAddress: addr, AppPassword: pass, DisplayName: displayName}
+				cfg := emailConfig{FromAddress: addr, AppPassword: pass, DisplayName: displayName, MyEmail: myEmail}
 				if err := saveEmailConfig(cfg); err != nil {
 					m.emailMsg = "error saving config: " + err.Error()
 					return m, nil
@@ -8193,6 +10255,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if len(m.emailDisplayNameInput) > 0 {
 						m.emailDisplayNameInput = m.emailDisplayNameInput[:len(m.emailDisplayNameInput)-1]
 					}
+				case 2:
+					if len(m.emailMyAddrInput) > 0 {
+						m.emailMyAddrInput = m.emailMyAddrInput[:len(m.emailMyAddrInput)-1]
+					}
 				default:
 					if len(m.emailPassInput) > 0 {
 						m.emailPassInput = m.emailPassInput[:len(m.emailPassInput)-1]
@@ -8206,6 +10272,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.emailAddrInput += key
 					case 1:
 						m.emailDisplayNameInput += key
+					case 2:
+						m.emailMyAddrInput += key
 					default:
 						m.emailPassInput += key
 					}
@@ -8311,6 +10379,285 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+
+		case viewToolsSettings:
+			if key == "ctrl+c" {
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			if m.toolsKeywordMode == "category" {
+				switch key {
+				case "esc":
+					m.toolsKeywordMode = ""
+					return m, nil
+				default:
+					if n, err := strconv.Atoi(key); err == nil && n >= 1 && n <= len(agentToolCategories) {
+						m.toolsKeywordCategory = agentToolCategories[n-1].name
+						m.toolsKeywordMode = "detail"
+						m.toolsSettingsMsg = ""
+					}
+					return m, nil
+				}
+			}
+			if m.toolsKeywordMode == "detail" {
+				switch key {
+				case "esc":
+					m.toolsKeywordMode = "category"
+					return m, nil
+				case "+":
+					m.toolsKeywordMode = "keyword"
+					m.toolsKeywordInput = ""
+					return m, nil
+				default:
+					// A number key removes that entry from THIS category's
+					// custom (user-added) list — built-in keywords are
+					// shown but not removable here, only the ones added
+					// via [+].
+					if n, err := strconv.Atoi(key); err == nil && n >= 1 {
+						custom := loadCustomKeywords().Keywords[m.toolsKeywordCategory]
+						if n <= len(custom) {
+							removed := custom[n-1]
+							if err := removeCustomKeyword(m.toolsKeywordCategory, n-1); err != nil {
+								m.toolsSettingsMsg = redStyle.Render("couldn't remove: " + err.Error())
+							} else {
+								m.toolsSettingsMsg = fmt.Sprintf("removed %q from %s", removed, m.toolsKeywordCategory)
+							}
+						}
+					}
+					return m, nil
+				}
+			}
+			if m.toolsKeywordMode == "keyword" {
+				switch key {
+				case "esc":
+					m.toolsKeywordMode = "detail"
+					m.toolsKeywordInput = ""
+					return m, nil
+				case "enter":
+					if strings.TrimSpace(m.toolsKeywordInput) == "" {
+						m.toolsSettingsMsg = "type a keyword first, or Esc to cancel"
+						return m, nil
+					}
+					if err := addCustomKeyword(m.toolsKeywordCategory, m.toolsKeywordInput); err != nil {
+						m.toolsSettingsMsg = redStyle.Render("couldn't save: " + err.Error())
+					} else {
+						m.toolsSettingsMsg = fmt.Sprintf("added %q to %s — messages containing it now pull in that category",
+							strings.TrimSpace(m.toolsKeywordInput), m.toolsKeywordCategory)
+					}
+					m.toolsKeywordMode = "detail"
+					m.toolsKeywordInput = ""
+					return m, nil
+				case "backspace":
+					if len(m.toolsKeywordInput) > 0 {
+						r := []rune(m.toolsKeywordInput)
+						m.toolsKeywordInput = string(r[:len(r)-1])
+					}
+					return m, nil
+				default:
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+						m.toolsKeywordInput += key
+					}
+					return m, nil
+				}
+			}
+			rows := buildToolSettingsRows()
+			switch key {
+			case "esc":
+				m.view = viewHelpMenu
+				m.toolsSettingsMsg = ""
+				return m, nil
+			case "+":
+				m.toolsKeywordMode = "category"
+				m.toolsSettingsMsg = ""
+				return m, nil
+			case "up", "k":
+				m.toolsSettingsCursor = moveToolsSettingsCursor(rows, m.toolsSettingsCursor, -1)
+				m.clampToolsSettingsScroll()
+				return m, nil
+			case "down", "j":
+				m.toolsSettingsCursor = moveToolsSettingsCursor(rows, m.toolsSettingsCursor, 1)
+				m.clampToolsSettingsScroll()
+				return m, nil
+			case "pgup":
+				for i := 0; i < m.toolsSettingsVisibleRows(); i++ {
+					m.toolsSettingsCursor = moveToolsSettingsCursor(rows, m.toolsSettingsCursor, -1)
+				}
+				m.clampToolsSettingsScroll()
+				return m, nil
+			case "pgdown":
+				for i := 0; i < m.toolsSettingsVisibleRows(); i++ {
+					m.toolsSettingsCursor = moveToolsSettingsCursor(rows, m.toolsSettingsCursor, 1)
+				}
+				m.clampToolsSettingsScroll()
+				return m, nil
+			case "home":
+				m.toolsSettingsCursor = moveToolsSettingsCursor(rows, -1, 1)
+				m.clampToolsSettingsScroll()
+				return m, nil
+			case "end":
+				m.toolsSettingsCursor = moveToolsSettingsCursor(rows, len(rows), -1)
+				m.clampToolsSettingsScroll()
+				return m, nil
+			case " ", "enter":
+				if m.toolsSettingsCursor < 0 || m.toolsSettingsCursor >= len(rows) {
+					return m, nil
+				}
+				name := rows[m.toolsSettingsCursor].Tool
+				if name == "" {
+					return m, nil
+				}
+				enabled := enabledToolSet()
+				cur := map[string]bool{}
+				for k, v := range enabled {
+					cur[k] = v
+				}
+				cur[name] = !cur[name]
+				if err := saveToolsConfig(toolsConfig{Enabled: cur}); err != nil {
+					m.toolsSettingsMsg = redStyle.Render("couldn't save: " + err.Error())
+				} else {
+					m.toolsSettingsMsg = ""
+				}
+				return m, nil
+			case "a":
+				cur := map[string]bool{}
+				for _, n := range flatToolNames() {
+					cur[n] = true
+				}
+				if err := saveToolsConfig(toolsConfig{Enabled: cur}); err != nil {
+					m.toolsSettingsMsg = redStyle.Render("couldn't save: " + err.Error())
+				} else {
+					m.toolsSettingsMsg = "all tools enabled"
+				}
+				return m, nil
+			case "n":
+				cur := map[string]bool{}
+				for _, n := range flatToolNames() {
+					cur[n] = false
+				}
+				if err := saveToolsConfig(toolsConfig{Enabled: cur}); err != nil {
+					m.toolsSettingsMsg = redStyle.Render("couldn't save: " + err.Error())
+				} else {
+					m.toolsSettingsMsg = "all tools disabled"
+				}
+				return m, nil
+			case "r":
+				cur := map[string]bool{}
+				for _, n := range flatToolNames() {
+					cur[n] = generalFallbackTools[n]
+				}
+				if err := saveToolsConfig(toolsConfig{Enabled: cur}); err != nil {
+					m.toolsSettingsMsg = redStyle.Render("couldn't save: " + err.Error())
+				} else {
+					m.toolsSettingsMsg = "pool restricted to the small general-purpose set"
+				}
+				return m, nil
+			}
+			return m, nil
+
+		case viewContextSettings:
+			if key == "ctrl+c" {
+				appendLog("quit")
+				return m, tea.Quit
+			}
+			if m.contextEditing {
+				switch key {
+				case "esc":
+					m.contextEditing = false
+					m.contextInput = ""
+					return m, nil
+				case "enter":
+					n, err := strconv.Atoi(strings.TrimSpace(m.contextInput))
+					if err != nil || n <= 0 {
+						m.contextMsg = "type a positive whole number, e.g. 8192"
+						return m, nil
+					}
+					if err := saveContextConfig(contextConfig{NumCtx: n}); err != nil {
+						m.contextMsg = "couldn't save: " + err.Error()
+					} else {
+						m.contextMsg = fmt.Sprintf("saved — %d tokens, takes effect on your next message", n)
+					}
+					m.contextEditing = false
+					m.contextInput = ""
+					return m, nil
+				case "backspace":
+					if len(m.contextInput) > 0 {
+						m.contextInput = m.contextInput[:len(m.contextInput)-1]
+					}
+					return m, nil
+				default:
+					if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsDigit(r) {
+						m.contextInput += key
+					}
+					return m, nil
+				}
+			}
+			// The list is contextSizeSteps plus one trailing "Custom" row —
+			// Up/Down jumps between them, Enter on a number settles that
+			// context size immediately, Enter on Custom opens the typed
+			// input (digits only, same as before).
+			customRow := len(contextSizeSteps)
+			switch key {
+			case "esc":
+				m.view = viewHelpMenu
+				m.contextMsg = ""
+				return m, nil
+			case "up", "k":
+				if m.contextCursor > 0 {
+					m.contextCursor--
+				}
+				return m, nil
+			case "down", "j":
+				if m.contextCursor < customRow {
+					m.contextCursor++
+				}
+				return m, nil
+			case "enter":
+				if m.contextCursor == customRow {
+					m.contextEditing = true
+					m.contextInput = strconv.Itoa(currentContextTokens())
+					m.contextMsg = ""
+					return m, nil
+				}
+				n := contextSizeSteps[m.contextCursor]
+				if err := saveContextConfig(contextConfig{NumCtx: n}); err != nil {
+					m.contextMsg = "couldn't save: " + err.Error()
+				} else {
+					m.contextMsg = fmt.Sprintf("saved — %d tokens, takes effect on your next message", n)
+				}
+				return m, nil
+			case "r":
+				if err := saveContextConfig(contextConfig{}); err != nil {
+					m.contextMsg = "couldn't reset: " + err.Error()
+				} else {
+					m.contextMsg = fmt.Sprintf("reset to the default (%d tokens)", agentContextTokens)
+				}
+				return m, nil
+			case "a":
+				// Auto-detect resets any saved override FIRST, so its own
+				// gradual-growth cap and shrink-floor (both keyed off
+				// currentContextTokens()) measure against the plain default
+				// instead of whatever was saved before — otherwise a
+				// previous choice quietly capped or floored every later
+				// auto-detect, which defeats the point of a "just detect it
+				// for me" button. Folds reset into auto-detect so there's
+				// no separate reset-then-detect step needed.
+				if err := saveContextConfig(contextConfig{}); err != nil {
+					m.contextMsg = "couldn't reset: " + err.Error()
+					return m, nil
+				}
+				recommended, ok := recommendContextTokens(m.agentModelName)
+				if !ok {
+					m.contextMsg = "couldn't read available RAM on this machine — left unchanged"
+					return m, nil
+				}
+				if err := saveContextConfig(contextConfig{NumCtx: recommended}); err != nil {
+					m.contextMsg = "couldn't save: " + err.Error()
+				} else {
+					m.contextMsg = fmt.Sprintf("auto-detected: %d tokens, based on RAM free right now", recommended)
+				}
+				return m, nil
+			}
+			return m, nil
 
 		case viewAutopilot:
 			if key == "ctrl+c" {
@@ -8842,15 +11189,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				row := filtered[m.catalogCursor]
-				if row.Installed {
-					m.downloadMsg = fmt.Sprintf("%s is already installed locally.", row.Name)
-					return m, nil
-				}
 				sizes := parseSizeList(row.Size)
+				// A multi-size ollama-library row (e.g. "llama3.2" listing
+				// both 1b and 3b) always goes to the size picker first,
+				// even when row.Installed is true — markInstalled marks
+				// the WHOLE row installed the moment ANY one size is
+				// present locally (e.g. just the 1b), which incorrectly
+				// blocked downloading a different, not-yet-installed size
+				// (3b) with a flat "already installed" before the picker
+				// ever got a chance to run.
 				if row.Source == "ollama-library" && len(sizes) > 1 {
 					m.sizeSelectRow = &row
 					m.sizeSelectOptions = sizes
 					m.sizeSelectCursor = 0
+					return m, nil
+				}
+				if row.Installed {
+					m.downloadMsg = fmt.Sprintf("%s is already installed locally.", row.Name)
 					return m, nil
 				}
 				if row.Source == "ollama-library" && len(sizes) == 1 {
@@ -8865,7 +11220,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			default:
-				if len(key) == 1 {
+				if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
 					m.catalogSearch += key
 					m.catalogCursor = 0
 				}
@@ -9044,6 +11399,8 @@ func (m *model) clampHelpScroll() {
 		content = m.renderTavilySettings()
 	case viewTelegramSettings:
 		content = m.renderTelegramSettings()
+	case viewWhatsAppSettings:
+		content = m.renderWhatsAppSettings()
 	case viewEmailSettings:
 		content = m.renderEmailSettings()
 	case viewBackupSettings:
@@ -9140,10 +11497,15 @@ func (m model) renderHeader() string {
 		seg := func(fg, text string) string {
 			return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("#3A3A66")).Foreground(lipgloss.Color(fg)).Render(text)
 		}
-		title := seg("#FFFFFF", "llama-shell — ") +
+		row1 := seg("#FFFFFF", "llama-shell — ") +
 			seg("#FFD700", fmt.Sprintf("agentic chat: %s", m.agentModelName)) +
 			seg("#00FFFF", fmt.Sprintf("   cwd: %s", m.agentWorkDir))
-		return lipgloss.NewStyle().Background(lipgloss.Color("#3A3A66")).Width(m.width).Padding(0, 1).Render(title)
+		// Context usage is pinned here (not in the scrollable chat body) so
+		// it stays visible no matter how far the transcript is scrolled —
+		// user asked for the token indicator to always be on-screen.
+		row2 := renderContextUsage(m.agentMessages)
+		rowStyle := lipgloss.NewStyle().Background(lipgloss.Color("#3A3A66")).Width(m.width).Padding(0, 1)
+		return rowStyle.Render(row1) + "\n" + rowStyle.Render(row2)
 	}
 	return style.Render("llama-shell — Ollama TUI")
 }
@@ -9236,6 +11598,30 @@ func (m model) renderFooter() string {
 	}
 	status = tgFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
 
+	// Same pattern as Telegram's flag: bound (actually reachable) vs.
+	// linked-but-not-bound vs. saved-but-not-running vs. never set up.
+	// Always bold + a bright color (never the dim #888888 "off" gray the
+	// other flags use) and plain ASCII, no ✓ — found for real that this
+	// flag was effectively invisible on the Proxmox noVNC console (font
+	// glyph support / low contrast rendering issue there), so it gets the
+	// highest-contrast treatment of any footer flag rather than trying to
+	// match the others' subtlety.
+	var waFlag string
+	waSnap := currentWhatsAppSnapshot()
+	switch {
+	case waSnap.running && waSnap.linked:
+		if loadWhatsAppConfig().BoundJID != "" {
+			waFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(footerBG)).Render("WA:ON")
+		} else {
+			waFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFD700")).Background(lipgloss.Color(footerBG)).Render("WA:UNBOUND")
+		}
+	case waSnap.linked:
+		waFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F5F")).Background(lipgloss.Color(footerBG)).Render("WA:DOWN")
+	default:
+		waFlag = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFA500")).Background(lipgloss.Color(footerBG)).Render("WA:OFF")
+	}
+	status = waFlag + lipgloss.NewStyle().Background(lipgloss.Color(footerBG)).Render("  ") + status
+
 	var tavilyFlag string
 	if os.Getenv("TAVILY_API_KEY") != "" {
 		tavilyFlag = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF")).Background(lipgloss.Color(footerBG)).Render("tavily✓")
@@ -9272,7 +11658,7 @@ func (m model) renderFooter() string {
 	// them being the first thing clipped off-screen.
 	buildLabel := fmt.Sprintf("build %s", buildTime)
 	if appVersion != "" && appVersion != "dev" {
-		buildLabel = "llama-shell " + appVersion
+		buildLabel = appVersion
 	}
 	left := plain.Render(buildLabel) + plain.Render("  ") + status
 
@@ -10081,6 +12467,8 @@ func (m model) renderBody() string {
 		return box.Render(m.scrollHelpBody(m.renderTavilySettings()))
 	case viewTelegramSettings:
 		return box.Render(m.scrollHelpBody(m.renderTelegramSettings()))
+	case viewWhatsAppSettings:
+		return box.Render(m.scrollHelpBody(m.renderWhatsAppSettings()))
 	case viewAutopilot:
 		return box.Render(m.renderAutopilot())
 	case viewEmailSettings:
@@ -10089,6 +12477,10 @@ func (m model) renderBody() string {
 		return box.Render(m.scrollHelpBody(m.renderBackupSettings()))
 	case viewBackupBrowser:
 		return box.Render(m.scrollHelpBody(m.renderBackupBrowser()))
+	case viewToolsSettings:
+		return box.Render(m.renderToolsSettings())
+	case viewContextSettings:
+		return box.Render(m.renderContextSettings())
 	case viewWebServerSettings:
 		return box.Render(m.renderWebServerSettings())
 	case viewWebServerModelSelect:
@@ -10280,6 +12672,122 @@ func (m model) renderTavilySettings() string {
 	return b.String()
 }
 
+func (m model) renderWhatsAppSettings() string {
+	snap := currentWhatsAppSnapshot()
+	cfg := loadWhatsAppConfig()
+
+	if snap.qrText != "" {
+		// The QR alone can run 40+ rows tall — the header/note/legend
+		// text that every other branch prints up top was pushing it (and
+		// itself) off-screen in anything less than a maximized/tall
+		// window, confirmed for real: the QR was getting cut off with
+		// only a fraction visible. Moving all of that INTO the right
+		// column instead of stacking it above lets the QR use the full
+		// available height starting at row 0.
+		var info strings.Builder
+		info.WriteString("whatsapp bot — unofficial protocol,\nsame as Baileys/whatsapp-web.js.\n")
+		info.WriteString(agentToolStyle.Render("Small ban risk WhatsApp doesn't\nofficially endorse.") + "\n\n")
+		// Kept short and split across lines deliberately — this is the
+		// column's own natural max width, and one wide line here becomes
+		// the widest line in the whole column; confirmed for real that
+		// letting it run past the terminal's actual columns makes the
+		// TERMINAL wrap it back to column 0, landing visually inside the
+		// QR block instead of staying in this column.
+		info.WriteString("[l] QR   [n] phone   [r] refresh\n")
+		info.WriteString("Esc: back\n\n")
+		info.WriteString("Scan with WhatsApp: Settings ->\n")
+		info.WriteString("Linked Devices -> Link a Device\n\n")
+		// Each Render() call here is deliberately its own line (or
+		// group), never a multi-line string handed to a single Render()
+		// call — lipgloss.Style.Render() trims trailing newlines from
+		// the string it's given, so embedding "\n\n" INSIDE one Render()
+		// call silently collapsed here before, gluing the next line onto
+		// the same row instead of starting a fresh one.
+		info.WriteString(agentToolStyle.Render("Refreshes automatically until scanned.") + "\n\n")
+		info.WriteString(agentToolStyle.Render("[n] instead for phone-number pairing —") + "\n")
+		info.WriteString(agentToolStyle.Render("no camera needed, better for a headless box.") + "\n")
+		if m.whatsappMsg != "" {
+			info.WriteString("\n" + m.whatsappMsg + "\n")
+		}
+		wide := redStyle.Render("Maximize the terminal window if the QR looks cut off (needs width).") + "\n\n"
+		gap := lipgloss.NewStyle().Width(3).Render("")
+		// Explicit width cap as a safety net, not just careful line
+		// lengths above — if any future edit makes a line here too wide,
+		// this wraps it WITHIN the column instead of repeating the bug
+		// where the terminal's own line-wrap (not lipgloss's) kicked in
+		// and dropped the overflow at column 0, inside the QR block.
+		infoBoxed := lipgloss.NewStyle().Width(46).Render(info.String())
+		return wide + lipgloss.JoinHorizontal(lipgloss.Top, snap.qrText, gap, infoBoxed)
+	}
+
+	var b strings.Builder
+	b.WriteString("whatsapp bot (via whatsmeow — unofficial WhatsApp Web protocol)\n\n")
+	b.WriteString(agentToolStyle.Render("Note: this uses an unofficial protocol, same as Baileys/whatsapp-web.js —") + "\n")
+	b.WriteString(agentToolStyle.Render("there is a small ban risk WhatsApp doesn't officially endorse for a") + "\n")
+	b.WriteString(agentToolStyle.Render("personal/automation account. Use a number you're comfortable risking.") + "\n\n")
+
+	// Printed up top, not just at the bottom — keeping the keybinds
+	// visible doesn't depend on scrolling past whatever's below.
+	if snap.linked {
+		b.WriteString("[u] unlink    Esc: back\n\n")
+	} else {
+		b.WriteString("[l] link via QR    [n] link via phone number    Esc: back\n\n")
+	}
+
+	if snap.linked {
+		greyed := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+		b.WriteString(helpKeyStyle.Render("● linked") + fmt.Sprintf("  —  +%s\n\n", snap.phone))
+		if snap.running {
+			b.WriteString(greyed.Render(fmt.Sprintf("Running — model: %s", cfg.Model)))
+			if cfg.BoundJID != "" {
+				b.WriteString(greyed.Render(fmt.Sprintf("  —  bound to %s", cfg.BoundJID)) + "\n")
+			} else {
+				b.WriteString("\n" + agentToolStyle.Render("Not bound yet — message this account on WhatsApp to bind it.") + "\n")
+			}
+		} else {
+			b.WriteString(redStyle.Render("Linked but not running — press [l] to reconnect.") + "\n")
+		}
+		if m.whatsappMsg != "" {
+			b.WriteString("\n" + m.whatsappMsg + "\n")
+		}
+		return b.String()
+	}
+
+	if m.whatsappPhoneEditing {
+		b.WriteString("Phone-number pairing — no QR, no camera needed. Enter your WhatsApp\n")
+		b.WriteString("number WITH country code, digits only (e.g. 972501234567 — no + or\n")
+		b.WriteString("leading 0 after the country code):\n\n")
+		b.WriteString(fmt.Sprintf("phone: %s_\n", m.whatsappPhoneInput))
+		if m.whatsappMsg != "" {
+			b.WriteString("\n" + m.whatsappMsg + "\n")
+		}
+		b.WriteString("\nEnter: request pairing code   Esc: cancel\n")
+		return b.String()
+	}
+
+	if snap.pairCode != "" {
+		b.WriteString("On your phone: WhatsApp -> Settings -> Linked Devices -> Link a Device\n")
+		b.WriteString("-> Link with phone number instead -> enter this code:\n\n")
+		b.WriteString(helpKeyStyle.Bold(true).Render("  "+snap.pairCode+"  ") + "\n\n")
+		b.WriteString(agentToolStyle.Render("(expires in a couple minutes — press [n] again for a fresh one if it does)") + "\n")
+	} else if snap.running {
+		b.WriteString("Connecting" + strings.Repeat(".", (int(time.Now().Unix())%3)+1) + "\n\n")
+		if snap.status != "" {
+			b.WriteString(agentToolStyle.Render(snap.status) + "\n")
+		}
+	} else {
+		b.WriteString(agentToolStyle.Render("(needs a local model already installed — [w] setup wizard if you don't have one)") + "\n\n")
+		b.WriteString(agentToolStyle.Render("[n] (phone number) needs no camera — recommended for a headless box like this one.") + "\n")
+	}
+	if snap.status != "" && snap.qrText == "" && snap.pairCode == "" && !snap.running {
+		b.WriteString("\n" + redStyle.Render(snap.status) + "\n")
+	}
+	if m.whatsappMsg != "" {
+		b.WriteString("\n" + m.whatsappMsg + "\n")
+	}
+	return b.String()
+}
+
 func (m model) renderTelegramSettings() string {
 	var b strings.Builder
 	b.WriteString("telegram bot\n\n")
@@ -10371,6 +12879,11 @@ func (m model) renderEmailSettings() string {
 			displayName = "(none)"
 		}
 		b.WriteString(greyed.Render(fmt.Sprintf("Display name:  %s", displayName)) + "\n")
+		myEmail := cfg.MyEmail
+		if myEmail == "" {
+			myEmail = "(none — \"send me\"/\"לי\" requests need a real address instead)"
+		}
+		b.WriteString(greyed.Render(fmt.Sprintf("My email:      %s", myEmail)) + "\n")
 		b.WriteString(greyed.Render("App password:  XXXXXXX") + "\n")
 		if m.emailMsg != "" {
 			b.WriteString("\n" + m.emailMsg + "\n")
@@ -10403,7 +12916,8 @@ func (m model) renderEmailSettings() string {
 	}
 	b.WriteString(styleFor(0).Render(fmt.Sprintf("Gmail address: %s%s", m.emailAddrInput, cursorFor(0))) + "\n")
 	b.WriteString(styleFor(1).Render(fmt.Sprintf("Display name:  %s%s", m.emailDisplayNameInput, cursorFor(1))) + agentToolStyle.Render(" (optional)") + "\n")
-	b.WriteString(styleFor(2).Render(fmt.Sprintf("App password:  %s%s", maskAppPassword(m.emailPassInput), cursorFor(2))) + "\n")
+	b.WriteString(styleFor(2).Render(fmt.Sprintf("My email:      %s%s", m.emailMyAddrInput, cursorFor(2))) + agentToolStyle.Render(" (optional — used for \"send me\"/\"לי\"/\"אלי\" requests)") + "\n")
+	b.WriteString(styleFor(3).Render(fmt.Sprintf("App password:  %s%s", maskAppPassword(m.emailPassInput), cursorFor(3))) + "\n")
 
 	if m.emailSending {
 		b.WriteString("\nSending a test email to confirm it works...\n")
@@ -10434,6 +12948,245 @@ func (m model) renderBackupSettings() string {
 		b.WriteString("\n" + m.backupMsg + "\n")
 	}
 	b.WriteString("\nEsc: back\n")
+	return b.String()
+}
+
+// renderToolsSettings lets the user choose which tools actually get sent
+// to the model, category by category, with a live estimated token cost —
+// built after finding that sending all 63 tools silently truncated the
+// system prompt's own instructions off a real 4GB deployment (Ollama's
+// truncation ceiling there measured ~2051 tokens; the full tool set alone
+// measured ~5400). estimateTokens is a rough approximation, not a real
+// tokenizer, but it's calibrated against that real measurement.
+func (m model) renderContextSettings() string {
+	var b strings.Builder
+	b.WriteString(helpKeyStyle.Render("context size") + "\n\n")
+	b.WriteString("How much conversation the model can hold at once (system prompt +\n")
+	b.WriteString("tools + every message + every tool result) before the oldest content\n")
+	b.WriteString("gets silently cut off. Too small and real answers get truncated\n")
+	b.WriteString("mid-reply. Too big on a RAM-tight machine can make the model fail to\n")
+	b.WriteString("load entirely instead of just being tight on space — raise it in\n")
+	b.WriteString("small steps (double it, not 10x it) and confirm it still works.\n\n")
+
+	if m.contextEditing {
+		b.WriteString("New size in tokens (e.g. 8192, 16384):\n\n")
+		b.WriteString("> " + m.contextInput + "█\n\n")
+		if m.contextMsg != "" {
+			b.WriteString(m.contextMsg + "\n\n")
+		}
+		b.WriteString("Enter: save    Esc: cancel\n")
+		return b.String()
+	}
+
+	current := currentContextTokens()
+	saved := loadContextConfig().NumCtx > 0
+	if saved {
+		b.WriteString(fmt.Sprintf("Current: %d tokens (saved override)\n\n", current))
+	} else {
+		b.WriteString(fmt.Sprintf("Current: %d tokens (built-in default — nothing saved yet)\n\n", current))
+	}
+
+	weights, known := modelWeightsGB[m.agentModelName]
+	if !known {
+		weights = 5.0
+	}
+	free := availableRAMGB()
+	recommended, recOK := recommendContextTokens(m.agentModelName)
+	customRow := len(contextSizeSteps)
+	cursor := m.contextCursor
+	if cursor < 0 || cursor > customRow {
+		cursor = 0
+	}
+
+	b.WriteString(fmt.Sprintf("Size      Extra RAM   Est. total RAM (%.1fGB weights + this)\n", weights))
+	for i, step := range contextSizeSteps {
+		extraMB := estimatedContextCostMB(step)
+		totalGB := weights + extraMB/1024
+		cursorMark := "  "
+		if i == cursor {
+			cursorMark = "> "
+		}
+		line := fmt.Sprintf("%s%-9d %6.0f MB    ~%.2f GB", cursorMark, step, extraMB, totalGB)
+		if step == current {
+			line += " (current)"
+		}
+		if recOK && step == recommended {
+			line += " (auto-detect would pick this)"
+		}
+		if i == cursor {
+			line = helpKeyStyle.Render(line)
+		}
+		b.WriteString(line + "\n")
+	}
+	customLine := "  Custom — type any value"
+	if cursor == customRow {
+		customLine = helpKeyStyle.Render("> Custom — type any value")
+	}
+	b.WriteString(customLine + "\n\n")
+	if total := totalRAMGB(); total > 0 && free > 0 {
+		used := total - free
+		b.WriteString(agentToolStyle.Render(fmt.Sprintf("RAM right now: %.1f GB used / %.1f GB free / %.1f GB total", used, free, total)) + "\n\n")
+	} else if free > 0 {
+		b.WriteString(agentToolStyle.Render(fmt.Sprintf("%.1f GB RAM free right now", free)) + "\n\n")
+	}
+	if m.contextMsg != "" {
+		b.WriteString(m.contextMsg + "\n\n")
+	}
+	b.WriteString("Up/Down: move   Enter: select   [a] auto-detect   [r] reset   Esc: back\n")
+	return b.String()
+}
+
+func (m model) renderToolsSettings() string {
+	if m.toolsKeywordMode == "category" {
+		var b strings.Builder
+		b.WriteString(helpKeyStyle.Render("keywords — pick a category to view/manage") + "\n\n")
+		custom := loadCustomKeywords()
+		for i, cat := range agentToolCategories {
+			b.WriteString(fmt.Sprintf("  [%d] %-20s %d built-in, %d added\n", i+1, cat.name,
+				len(toolCategoryKeywords[cat.name]), len(custom.Keywords[cat.name])))
+		}
+		b.WriteString("\nPress the number, or Esc to cancel.\n")
+		return b.String()
+	}
+	if m.toolsKeywordMode == "detail" {
+		var b strings.Builder
+		b.WriteString(helpKeyStyle.Render("keywords — "+m.toolsKeywordCategory) + "\n\n")
+		builtin := toolCategoryKeywords[m.toolsKeywordCategory]
+		custom := loadCustomKeywords().Keywords[m.toolsKeywordCategory]
+		b.WriteString(agentToolStyle.Render("built-in (fixed): "+strings.Join(builtin, ", ")) + "\n\n")
+		if len(custom) == 0 {
+			b.WriteString(agentToolStyle.Render("your added: (none yet — press [+] to add one)") + "\n")
+		} else {
+			b.WriteString("your added — press the number to remove:\n")
+			for i, kw := range custom {
+				b.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, kw))
+			}
+		}
+		if m.toolsSettingsMsg != "" {
+			b.WriteString("\n" + m.toolsSettingsMsg + "\n")
+		}
+		b.WriteString("\n[+] add a new keyword    Esc: back to categories\n")
+		return b.String()
+	}
+	if m.toolsKeywordMode == "keyword" {
+		var b strings.Builder
+		b.WriteString(helpKeyStyle.Render("add keyword — "+m.toolsKeywordCategory) + "\n\n")
+		b.WriteString("Type a word or short phrase — any message containing it will pull in\n")
+		b.WriteString("every tool in this category.\n\n")
+		b.WriteString("> " + m.toolsKeywordInput + "█\n\n")
+		if m.toolsSettingsMsg != "" {
+			b.WriteString(m.toolsSettingsMsg + "\n\n")
+		}
+		b.WriteString("Enter: save    Esc: cancel\n")
+		return b.String()
+	}
+	var b strings.Builder
+	b.WriteString(helpKeyStyle.Render("tool list") + "\n\n")
+	b.WriteString("Every tool below is checked or unchecked to control the POOL — which\n")
+	b.WriteString("ones are ever allowed to be used. Which ones actually get SENT on a\n")
+	b.WriteString("given message is chosen dynamically, by matching your message against\n")
+	b.WriteString("categories (e.g. a question with \"news\"/\"url\"/\"stock\" pulls in\n")
+	b.WriteString("Networking & Web; a plain message with no match falls back to a\n")
+	b.WriteString("small general set). Uncheck a tool here to exclude it entirely, even\n")
+	b.WriteString("from a matching category. If a real question misses every category\n")
+	b.WriteString("(the model just searches and gives up with links, never fetches a\n")
+	b.WriteString("page), press [+] to teach it a new keyword — no update needed.\n\n")
+
+	wd, err := os.Getwd()
+	if err != nil {
+		wd = "."
+	}
+	sysTokens := estimateTokens(agentSystemPrompt(wd))
+
+	pool := enabledToolSet()
+	fallback := map[string]bool{}
+	for n := range generalFallbackTools {
+		if pool[n] {
+			fallback[n] = true
+		}
+	}
+	var fallbackTools []ollamaTool
+	for _, t := range agentTools() {
+		if fallback[t.Function.Name] {
+			fallbackTools = append(fallbackTools, t)
+		}
+	}
+	fallbackJSON, _ := json.Marshal(fallbackTools)
+	fallbackTotal := sysTokens + estimateTokens(string(fallbackJSON))
+
+	var poolTools []ollamaTool
+	for _, t := range agentTools() {
+		if pool[t.Function.Name] {
+			poolTools = append(poolTools, t)
+		}
+	}
+	poolJSON, _ := json.Marshal(poolTools)
+	poolTotal := sysTokens + estimateTokens(string(poolJSON))
+
+	ctxTokens := currentContextTokens()
+	budgetLine := func(total int, label string) string {
+		var style lipgloss.Style
+		switch {
+		case total < ctxTokens*6/10:
+			style = helpKeyStyle
+		case total < ctxTokens*9/10:
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("#F5C518"))
+		default:
+			style = redStyle
+		}
+		return style.Render(fmt.Sprintf("~%d tokens — %s", total, label))
+	}
+	b.WriteString(budgetLine(fallbackTotal, "plain/unmatched message (system prompt + general fallback set)") + "\n")
+	b.WriteString(budgetLine(poolTotal, "worst case if every category matched at once (full pool)") + "\n")
+	b.WriteString(agentToolStyle.Render(fmt.Sprintf("(current context size: %d tokens — see [h] help/settings -> [c] to change it)", ctxTokens)) + "\n\n")
+
+	enabledSet := enabledToolSet()
+	rows := buildToolSettingsRows()
+	visible := m.toolsSettingsVisibleRows()
+	start := m.toolsSettingsScroll
+	end := start + visible
+	if end > len(rows) {
+		end = len(rows)
+	}
+	for i := start; i < end; i++ {
+		row := rows[i]
+		if row.Tool == "" {
+			onCount := 0
+			total := 0
+			for _, cat := range agentToolCategories {
+				if cat.name != row.Category {
+					continue
+				}
+				total = len(cat.tools)
+				for _, t := range cat.tools {
+					if enabledSet[t] {
+						onCount++
+					}
+				}
+			}
+			b.WriteString(fmt.Sprintf("%s (%d/%d)\n", headerRowStyle.Render(row.Category), onCount, total))
+			continue
+		}
+		box := "[ ]"
+		if enabledSet[row.Tool] {
+			box = helpKeyStyle.Render("[x]")
+		}
+		line := fmt.Sprintf("  %s %s", box, row.Tool)
+		if i == m.toolsSettingsCursor {
+			line = "> " + line[2:]
+			b.WriteString(agentUserStyle.Render(line) + "\n")
+		} else {
+			b.WriteString(line + "\n")
+		}
+	}
+	if len(rows) > visible {
+		b.WriteString(agentToolStyle.Render(fmt.Sprintf("\n(%d/%d rows — scroll with Up/Down/PgUp/PgDn)", end, len(rows))) + "\n")
+	}
+
+	if m.toolsSettingsMsg != "" {
+		b.WriteString("\n" + m.toolsSettingsMsg + "\n")
+	}
+	b.WriteString("\nSpace/Enter: toggle  [+] keywords  [a] all  [n] none  [r] reset  Esc: back\n")
 	return b.String()
 }
 
@@ -11597,6 +14350,35 @@ func renderCapabilityBadges(caps string) string {
 	return "capabilities: " + strings.Join(parts, "  ")
 }
 
+// renderContextUsage shows a live, running estimate of how much of the
+// context budget this conversation has used — added after several rounds
+// of chasing silent truncation bugs blind; a visible counter means
+// "answers are getting cut off" can be diagnosed from this line alone
+// instead of needing to SSH in and read Ollama's own server log. Sums
+// every message's content (system, user, assistant, tool results all
+// count toward the same shared budget) via estimateTokens, the same
+// approximation the settings screens uses, so the two stay consistent
+// with each other even though neither is Ollama's real tokenizer.
+func renderContextUsage(messages []ollamaChatMsg) string {
+	total := 0
+	for _, m := range messages {
+		total += estimateTokens(m.Content)
+	}
+	limit := currentContextTokens()
+	pct := float64(total) / float64(limit)
+	const headerBG = "#3A3A66"
+	var style lipgloss.Style
+	switch {
+	case pct < 0.6:
+		style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FFF5F")).Background(lipgloss.Color(headerBG))
+	case pct < 0.85:
+		style = lipgloss.NewStyle().Foreground(lipgloss.Color("#F5C518")).Background(lipgloss.Color(headerBG))
+	default:
+		style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF0000")).Background(lipgloss.Color(headerBG))
+	}
+	return style.Render(fmt.Sprintf("context: ~%d / %d tokens (%.0f%%)", total, limit, pct*100))
+}
+
 // renderWarmupStatus shows whether the model has actually answered a
 // request yet — cold-loading a large model can take a minute or more with
 // zero other feedback, which reads as the app being frozen even though
@@ -11642,6 +14424,20 @@ func isRTLRune(r rune) bool {
 		(r >= 0xFB1D && r <= 0xFB4F) || // Hebrew presentation forms
 		(r >= 0xFB50 && r <= 0xFDFF) || // Arabic presentation forms A
 		(r >= 0xFE70 && r <= 0xFEFF) // Arabic presentation forms B
+}
+
+// instantAckFor picks the bots' "got it, working on it" acknowledgment in
+// the same language as the user's own message — checked via containsRTL
+// since Hebrew is the only non-English language either bot's users
+// actually write in; matching the reply language for at least this one
+// fixed string avoids the jarring "user writes Hebrew, bot answers in
+// English" mismatch for the one line sent before the model has even seen
+// the message (so it can't yet match the language itself).
+func instantAckFor(userText string) string {
+	if containsRTL(userText) {
+		return "⏳ קיבלתי — עובד על זה..."
+	}
+	return "⏳ Got it — working on it..."
 }
 
 func containsRTL(s string) bool {
@@ -11878,13 +14674,23 @@ func lastAssistantContent(msgs []ollamaChatMsg) string {
 	return ""
 }
 
-func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string, spinnerFrame int, warmupElapsed time.Duration, turnTimes []time.Duration) []string {
+func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, capabilities string, warmup string, spinnerFrame int, warmupElapsed time.Duration, turnTimes []time.Duration, busy bool) []string {
 	var lines []string
 	toolNames := flatToolNames()
 	lines = append(lines, agentHeadStyle.Render(fmt.Sprintf("%d tools available — Alt+T to browse by category", len(toolNames))))
 	lines = append(lines, renderCapabilityBadges(capabilities))
-	if s := renderWarmupStatus(warmup, spinnerFrame, warmupElapsed); s != "" {
-		lines = append(lines, s)
+	// Suppress the "loading model into memory... (Xm Ys)" line once a
+	// real request is in flight — its own clock is independent of the
+	// busy indicator's (found and confirmed for real: both were visible
+	// at once showing unrelated numbers, e.g. "9m22s" loading alongside
+	// "13s" working, which reads as contradictory/broken even though
+	// each was individually correct to its own definition). A message
+	// actually being sent is itself proof the model is engaged; the busy
+	// indicator below takes over as the single source of truth from here.
+	if !(busy && warmup == "pending") {
+		if s := renderWarmupStatus(warmup, spinnerFrame, warmupElapsed); s != "" {
+			lines = append(lines, s)
+		}
 	}
 	lines = append(lines, "")
 	replyIdx := 0
@@ -11931,7 +14737,7 @@ func (m *model) syncAgentViewport() {
 	if !m.agentVPReady {
 		return
 	}
-	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup, m.agentSpinner, time.Since(m.agentWarmupStarted), m.agentTurnTimes)
+	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup, m.agentSpinner, time.Since(m.agentWarmupStarted), m.agentTurnTimes, m.agentBusy)
 	m.agentViewport.SetContent(strings.Join(lines, "\n"))
 	m.agentViewport.GotoBottom()
 }
@@ -12114,16 +14920,19 @@ func renderAgentHelp() string {
 	b.WriteString("               vision-capable models, otherwise pastes clipboard text\n")
 	b.WriteString("  Alt+T        browse all tools by category\n")
 	b.WriteString("  Alt+H        this help screen\n")
-	b.WriteString("  Alt+M        cycle tool mode: auto -> on -> off -> auto\n")
+	b.WriteString("  Alt+M        cycle tool mode: on -> off -> auto -> on\n")
+	b.WriteString("  Ctrl+L       clear this chat and start fresh (typing \"clear\"/\"cls\" as a\n")
+	b.WriteString("               message does nothing — the transcript redraws itself from\n")
+	b.WriteString("               history every frame, so only this actually resets it)\n")
 	b.WriteString("  Esc          back to model actions menu\n")
 	b.WriteString("  Ctrl+C       quit llama-shell\n\n")
 	b.WriteString("A path to an existing image file typed/pasted into your message also\n")
 	b.WriteString("attaches it, same as Alt+V.\n\n")
-	b.WriteString("Tool mode (Alt+M): auto (default) turns tools off just for a message\n")
-	b.WriteString("that attaches an image, since at least gemma4:e2b garbles the image\n")
-	b.WriteString("entirely when tools are also in the request - then goes back to tools\n")
-	b.WriteString("on for the next image-free message. on = always try tools even with an\n")
-	b.WriteString("image attached. off = never send tools this chat.\n\n")
+	b.WriteString("Tool mode (Alt+M): on (default) always tries tools, even relevant ones\n")
+	b.WriteString("chosen automatically per message. auto turns tools off just for a\n")
+	b.WriteString("message that attaches an image, since at least gemma4:e2b garbles the\n")
+	b.WriteString("image entirely when tools are also in the request. off = never send\n")
+	b.WriteString("tools this chat.\n\n")
 	b.WriteString("Looking for the CAPABILITIES column codes (com/too/ins/vis/emb/thi/aud)?\n")
 	b.WriteString("Those are on \"list models\" / \"show model info\" screens, not here — back\n")
 	b.WriteString("out to one of those and press Alt+H there instead.\n\n")
@@ -12146,14 +14955,26 @@ var agentToolCategories = []toolCategory{
 		"run_command", "run_powershell", "run_python", "list_processes", "kill_process",
 		"list_window_titles",
 	}},
-	{"Networking & Web", []string{
-		"web_search", "read_webpage", "rss_feed", "find_rss_feed", "tavily_search", "tavily_extract", "http_get", "http_post", "download_file", "ping_host",
-		"get_public_ip", "get_web_ui_url", "ssh_run", "list_network_interfaces", "send_email",
+	// Split from one "Networking & Web" catch-all after finding a real
+	// request truncate: matching "weather" pulled in all 16 tools in that
+	// combined category — including ssh_run, http_post, download_file,
+	// ping_host, list_network_interfaces — none relevant to a weather
+	// question, wasting the entire token budget (measured: 4071 input
+	// tokens, cut off after 25 generated, truncated=1) on tools that were
+	// never going to be called. Splitting so a content/live-data question
+	// only pulls in content/live-data tools, not network diagnostics too.
+	{"Web Search & Live Data", []string{
+		"web_search", "read_webpage", "rss_feed", "find_rss_feed", "tavily_search", "tavily_extract",
+		"get_stock_quote", "get_weather", "get_web_ui_url",
+	}},
+	{"Network Diagnostics", []string{
+		"http_get", "http_post", "download_file", "ping_host", "get_public_ip",
+		"ssh_run", "list_network_interfaces", "send_email",
 	}},
 	{"System & Environment", []string{
 		"system_info", "list_env_vars", "get_env", "get_clipboard", "set_clipboard",
 		"get_datetime", "disk_usage", "list_installed_programs", "send_notification",
-		"read_registry",
+		"read_registry", "list_tool_categories", "add_tool_keyword", "set_context_size",
 	}},
 	{"Git & Ollama", []string{
 		"git_status", "git_diff", "git_log", "git_commit", "git_branch",
@@ -12162,6 +14983,26 @@ var agentToolCategories = []toolCategory{
 	{"Vision & Media", []string{"take_screenshot", "view_image", "read_pdf", "read_document"}},
 	{"Data", []string{"run_sql", "read_csv", "read_json"}},
 	{"Open / Launch", []string{"open_url", "open_path"}},
+}
+
+// toolSettingsRow is one line of the tools-settings screen: either a
+// category header (Tool == "") or a toggleable tool row. Built fresh each
+// time from agentToolCategories so the cursor/scroll math and the render
+// always agree on exactly the same list.
+type toolSettingsRow struct {
+	Category string
+	Tool     string // "" for a header row
+}
+
+func buildToolSettingsRows() []toolSettingsRow {
+	var rows []toolSettingsRow
+	for _, cat := range agentToolCategories {
+		rows = append(rows, toolSettingsRow{Category: cat.name})
+		for _, t := range cat.tools {
+			rows = append(rows, toolSettingsRow{Category: cat.name, Tool: t})
+		}
+	}
+	return rows
 }
 
 // flatToolNames lists every tool in the same order they're displayed in,
@@ -12219,9 +15060,13 @@ var toolExamples = map[string][2]string{
 	"download_file":              {"Download this ZIP to the downloads folder", "Save this image to disk"},
 	"ping_host":                  {"Is 8.8.8.8 reachable?", "Ping github.com to check connectivity"},
 	"get_stock_quote":            {"What is the NASDAQ-100 index value right now?", "What's Apple's stock price?"},
+	"get_weather":                {"What's the weather forecast for Beer Sheva for the next 5 days?", "What's the current temperature in Tokyo?"},
 	"send_email":                 {"Email test@example.com with subject 'Hi' and body 'Just testing'", "Send an email summarizing this conversation to my boss"},
 	"get_public_ip":              {"What's my public IP address?", "Check what IP this machine shows on the internet"},
 	"get_web_ui_url":             {"What's the URL to browse to the web UI?", "Give me the link to open llama-shell in a browser"},
+	"list_tool_categories":       {"What tool categories exist and what keywords trigger them?", "What keyword would get you to use the git tools?"},
+	"add_tool_keyword":           {"Add 'flight status' as a trigger for the networking tools", "Whenever I mention payroll, use the SQL/data tools"},
+	"set_context_size":           {"Raise the context size to 8192", "My replies keep getting cut off, can you increase the context window?"},
 	"ssh_run":                    {"Run \"uptime\" on my home server", "SSH into the pi and check disk usage"},
 	"list_network_interfaces":    {"What's my local IP address?", "Show all network adapters and their config"},
 	"system_info":                {"What OS and CPU does this machine have?", "How many cores does this computer have?"},
@@ -12496,8 +15341,78 @@ func handleCLIArgs() {
 			}
 			fmt.Println("imported settings from " + path)
 			os.Exit(0)
+		case "--test-chat":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "usage: llama-shell --test-chat \"<message>\" [--model <name>]")
+				os.Exit(1)
+			}
+			msg := args[i+1]
+			i++
+			model := autopilotModel
+			if i+2 < len(args) && args[i+1] == "--model" {
+				model = args[i+2]
+				i += 2
+			}
+			runTestChat(model, msg)
+			os.Exit(0)
 		}
 	}
+}
+
+// runTestChat drives one real turn through the exact same tool-calling loop
+// as the TUI/web/Telegram (runAgentTurnSync) — for debugging why the model
+// does or doesn't call a tool, without needing to drive the interactive
+// TUI at all (useful over a plain SSH session, or piped/scripted). Prints
+// the system prompt size, tool count, every tool call made, the final
+// reply, and elapsed time, then exits.
+func runTestChat(model, userMsg string) {
+	wd, err := os.Getwd()
+	if err != nil {
+		wd = "."
+	}
+	sys := agentSystemPrompt(wd)
+	history := []ollamaChatMsg{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: userMsg},
+	}
+	relevant := agentRelevantTools(history)
+	relevantJSON, _ := json.Marshal(relevant)
+	fmt.Printf("model: %s\n", model)
+	fmt.Printf("system prompt: %d chars (~%d est. tokens)\n", len(sys), estimateTokens(sys))
+	fmt.Printf("catalog tools: %d, RELEVANT this turn (actually sent): %d\n", len(agentTools()), len(relevant))
+	for _, t := range relevant {
+		fmt.Printf("  - %s\n", t.Function.Name)
+	}
+	fmt.Printf("relevant tools JSON: %d chars (~%d est. tokens)\n", len(relevantJSON), estimateTokens(string(relevantJSON)))
+	fmt.Printf("estimated total (system+tools): ~%d tokens\n", estimateTokens(sys)+estimateTokens(string(relevantJSON)))
+	fmt.Printf("user message: %s\n\n", userMsg)
+	start := time.Now()
+	result, err := runAgentTurnSync(model, history, wd, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		fmt.Printf("ERROR after %s: %s\n", elapsed.Round(time.Second), err.Error())
+		return
+	}
+	toolCalls := 0
+	for _, m := range result {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				toolCalls++
+				fmt.Printf("[tool call] %s(%v)\n", tc.Function.Name, tc.Function.Arguments)
+			}
+		}
+		if m.Role == "tool" {
+			preview := m.Content
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			fmt.Printf("[tool result] %s\n", preview)
+		}
+	}
+	fmt.Printf("\ntool calls made: %d\n", toolCalls)
+	fmt.Printf("elapsed: %s\n\n", elapsed.Round(time.Second))
+	fmt.Println("--- final reply ---")
+	fmt.Println(lastAssistantContent(result))
 }
 
 func printCLIHelp() {
