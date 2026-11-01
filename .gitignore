@@ -2,3 +2,5 @@
 *.exe~
 CREDENTIALS.md
 /testing/
+
+dist/
