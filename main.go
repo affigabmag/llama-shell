@@ -41,6 +41,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -4142,7 +4143,7 @@ func enabledToolSet() map[string]bool {
 var toolCategoryKeywords = map[string][]string{
 	"Files & Archives":       {"file", "folder", "directory", "dir ", "zip", "archive", "read the", "write a", "save", "delete", "copy", "move", "rename", "hash", "unzip", "extract", "קובץ", "תיקייה", "תיקיה"},
 	"Shell & Processes":      {"run ", "command", "script", "process", "kill", "python", "powershell", "shell", "cmd", "terminal", "window title", "פקודה", "תהליך"},
-	"Web Search & Live Data": {"web", "news", "url", "site", "website", "search", "stock", "price", "index", "nasdaq", "rss", "feed", "browse", "internet", "link", "http://", "https://", "weather", "forecast", "forcast", "temperature", "rain", "score", "game result", "חדשות", "חפש", "חיפוש", "מזג אוויר", "מזג אויר", "תחזית", "מניה", "מניות", "מחיר", "אתר", "קישור"},
+	"Web Search & Live Data": {"web", "news", "url", "site", "website", "search", "stock", "price", "index", "nasdaq", "rss", "feed", "browse", "internet", "link", "http://", "https://", "weather", "forecast", "forcast", "temperature", "rain", "score", "game result", "חדשות", "ידיעות", "כתבות", "חפש", "חיפוש", "מזג אוויר", "מזג אויר", "תחזית", "מניה", "מניות", "מחיר", "אתר", "קישור"},
 	"Network Diagnostics":    {"download", "ping", "email", "mail", "ssh", "ip address", "public ip", "http request", "http get", "http post", "מייל", "אימייל", "דואר", "הורד"},
 	"System & Environment":   {"env var", "environment variable", "clipboard", "time", "date", "today", "disk space", "disk usage", "registry", "notification", "notify", "installed program", "hostname", "os ", "cpu", "ram", "שעה", "תאריך", "היום", "מחר", "מחרתיים"},
 	"Git & Ollama":           {"git ", "commit", "branch", "repo", "ollama", "pull model", "model list"},
@@ -7772,6 +7773,29 @@ func markInstalled(rows []catalogRow) {
 	}
 }
 
+// refreshLocalInstalledStatus re-runs `ollama list` and recomputes every
+// row's Installed flag against it — markInstalled() only ever ran once,
+// right after the initial three-stage catalog scan, so a model
+// downloaded afterward kept showing LOCAL: no until the whole catalog
+// was rescanned from scratch. This just refreshes the one thing that
+// actually changed (what's locally installed) without re-fetching the
+// library/HuggingFace catalogs again.
+func refreshLocalInstalledStatus(rows []catalogRow) []catalogRow {
+	msg, ok := fetchOllamaCatalog().(catalogStageMsg)
+	if !ok || msg.err != "" {
+		return rows
+	}
+	kept := make([]catalogRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Source != "ollama" {
+			kept = append(kept, r)
+		}
+	}
+	kept = append(kept, msg.rows...)
+	markInstalled(kept)
+	return kept
+}
+
 // filteredCatalog returns catalogRows narrowed by catalogSearch (case
 // insensitive substring match on name or source).
 func (m model) filteredCatalog() []catalogRow {
@@ -7782,6 +7806,23 @@ func (m model) filteredCatalog() []catalogRow {
 	var out []catalogRow
 	for _, r := range m.catalogRows {
 		if strings.Contains(strings.ToLower(r.Name), q) || strings.Contains(strings.ToLower(r.Source), q) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// filteredScanRows narrows "show model info"'s scanRows by scanSearch
+// (case-insensitive substring match on name) — same pattern as
+// filteredCatalog above for "list models".
+func (m model) filteredScanRows() []modelRow {
+	if m.scanSearch == "" {
+		return m.scanRows
+	}
+	q := strings.ToLower(m.scanSearch)
+	var out []modelRow
+	for _, r := range m.scanRows {
+		if strings.Contains(strings.ToLower(r.Name), q) {
 			out = append(out, r)
 		}
 	}
@@ -8309,6 +8350,7 @@ type model struct {
 	scanErr    string
 	fromCache  bool
 	scanCursor int
+	scanSearch string
 
 	scanAction    bool
 	scanActionSel int
@@ -8481,6 +8523,10 @@ type model struct {
 
 func initialModel() model {
 	loadTavilyKey()
+	if cfg := loadDefaultModelConfig(); cfg.Model != "" {
+		autopilotModel = cfg.Model
+		menuItems[0].label = fmt.Sprintf("autopilot        (auto: install ollama + %s + enable web server)", cfg.Model)
+	}
 	m := model{
 		ollama: checkOllama(),
 	}
@@ -8534,7 +8580,54 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-const autopilotModel = "gemma4:e2b"
+// autopilotModel is the default model autopilot installs/uses and the
+// one shown in the main menu's [a] label — a var (not the original
+// const) so it can be changed at runtime via "show model info" -> set as
+// default, and persisted so that choice survives a restart.
+var autopilotModel = "gemma4:e2b"
+
+func defaultModelConfigPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "llama-shell", "default_model.json")
+}
+
+type defaultModelConfig struct {
+	Model string `json:"model"`
+}
+
+func loadDefaultModelConfig() defaultModelConfig {
+	data, err := os.ReadFile(defaultModelConfigPath())
+	if err != nil {
+		return defaultModelConfig{}
+	}
+	var cfg defaultModelConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+// applyAutopilotModel sets the in-memory default model AND persists it,
+// updating the main menu's [a] label in place so it reflects the new
+// choice immediately, not just after a restart.
+func applyAutopilotModel(name string) error {
+	autopilotModel = name
+	menuItems[0].label = fmt.Sprintf("autopilot        (auto: install ollama + %s + enable web server)", name)
+	return saveDefaultModelConfig(defaultModelConfig{Model: name})
+}
+
+func saveDefaultModelConfig(cfg defaultModelConfig) error {
+	path := defaultModelConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
 
 func (m model) enterMenu(sel string) (tea.Model, tea.Cmd) {
 	switch sel {
@@ -8575,17 +8668,15 @@ func (m model) enterMenu(sel string) (tea.Model, tea.Cmd) {
 	case "s":
 		appendLog("opened show model info")
 		m.scanCursor = 0
+		m.scanSearch = ""
 		m.scanAction = false
 		m.scanBusy = false
 		m.scanActionMsg = ""
-		if !m.installedDirty {
-			if rows, ok := loadCache(); ok && len(rows) > 0 {
-				m.view = viewShowTable
-				m.scanRows = rows
-				m.fromCache = true
-				return m, nil
-			}
-		}
+		// Always a fresh scan, never the cache — a stale cache was
+		// hiding a just-downloaded model until a manual rescan, which
+		// most people wouldn't think to press. This screen is opened
+		// rarely enough that the scan cost every time is worth never
+		// showing stale data again.
 		m.installedDirty = false
 		m.view = viewShowScan
 		m.loading = true
@@ -8752,7 +8843,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.syncAgentViewport()
 			m.view = viewAgentChat
 			appendLog("autopilot: started agentic chat with %s", autopilotModel)
-			return m, tea.Batch(warmupPollTick(m.agentModelName), agentTickCmd(), agentKeepWarmTickCmd())
+			return m, tea.Batch(warmupPollTick(m.agentModelName), agentTickCmd(), agentKeepWarmTickCmd(), tea.ClearScreen)
 		}
 		if msg.err != "" {
 			m.webServerMsg = "download failed: " + msg.err
@@ -9106,13 +9197,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// model is loaded and answering — overrides a stale "pending" from
 		// the ollama-ps poll (e.g. a name-format mismatch that never
 		// matches) so the status line can't say "loading" forever while
-		// answers are visibly arriving. Only resync the viewport on the
-		// transition into "ready", not on every single token.
-		if m.agentWarmup != "ready" {
-			m.agentWarmup = "ready"
-			m.syncAgentViewport()
-		}
+		// answers are visibly arriving.
+		m.agentWarmup = "ready"
 		m.agentStreamBuf += msg.delta
+		// Resynced on every token now, not just the ready transition —
+		// the growing reply lives in the same scrollable viewport as the
+		// rest of the transcript (see syncAgentViewportLive), so the
+		// whole screen scrolls together as it streams instead of only a
+		// separate small fixed preview area updating while everything
+		// else stayed frozen.
+		m.syncAgentViewportLive()
 		return m, waitForAgentStream(msg.ch)
 
 	case agentStepMsg:
@@ -9284,7 +9378,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.scanAction {
-				name := m.scanRows[m.scanCursor].Name
+				actionRows := m.filteredScanRows()
+				name := actionRows[m.scanCursor].Name
 				choose := func(idx int) (tea.Model, tea.Cmd) {
 					m.scanAction = false
 					switch idx {
@@ -9296,7 +9391,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.agentModelName = name
 						m.agentWorkDir = wd
 						m.agentReturnView = viewShowTable
-						m.agentCapabilities = m.scanRows[m.scanCursor].Capabilities
+						m.agentCapabilities = actionRows[m.scanCursor].Capabilities
 						// Known-unsupported skips the doomed first request
 						// entirely; unknown ("-", stale/no cache) stays
 						// optimistic and relies on the runtime fallback in
@@ -9319,7 +9414,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.syncAgentViewport()
 						m.view = viewAgentChat
 						appendLog("started agentic chat with %s", name)
-						return m, tea.Batch(warmupPollOllama(name), agentTickCmd(), agentKeepWarmTickCmd())
+						// Forces a full repaint on this transition —
+						// switching from the show-model-info table (a very
+						// differently-shaped screen) into a fresh chat
+						// otherwise left stale rows from whatever was
+						// on-screen before, confirmed for real: an old
+						// reply and tool-result text appeared above the
+						// actually-new "you>" prompt in a chat that had
+						// only just started with an empty message history.
+						return m, tea.Batch(warmupPollOllama(name), agentTickCmd(), agentKeepWarmTickCmd(), tea.ClearScreen)
 					case 1:
 						m.scanBusy = true
 						m.scanBusyLabel = fmt.Sprintf("running %s...", name)
@@ -9335,6 +9438,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.scanBusyLabel = fmt.Sprintf("stopping %s...", name)
 						appendLog("stopping %s (from show model info)", name)
 						return m, stopModel(name)
+					case 4:
+						if err := applyAutopilotModel(name); err != nil {
+							m.scanActionMsg = "error saving default model: " + err.Error()
+						} else {
+							m.scanActionMsg = fmt.Sprintf("%s is now autopilot's default model", name)
+						}
+						appendLog("set %s as autopilot's default model", name)
+						return m, nil
 					}
 					return m, nil
 				}
@@ -9342,11 +9453,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "up":
 					m.scanActionSel--
 					if m.scanActionSel < 0 {
-						m.scanActionSel = 3
+						m.scanActionSel = 4
 					}
 				case "down":
 					m.scanActionSel++
-					if m.scanActionSel > 3 {
+					if m.scanActionSel > 4 {
 						m.scanActionSel = 0
 					}
 				case "esc", "n":
@@ -9365,11 +9476,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// Bare letter keys ('q', 'r') can't double as quit/rescan here
+			// the way an earlier version had them — model names routinely
+			// start with those letters (qwen*, most others), which would
+			// make searching for them impossible. Matches the same
+			// convention "list models" already uses: ctrl+c only for
+			// quit, alt+r for rescan, everything else typeable goes into
+			// the search box.
+			filtered := m.filteredScanRows()
 			switch key {
-			case "q":
-				appendLog("quit")
-				return m, tea.Quit
 			case "esc":
+				if m.scanSearch != "" {
+					m.scanSearch = ""
+					m.scanCursor = 0
+					return m, nil
+				}
 				appendLog("back to main menu")
 				m.view = viewMenu
 				return m, nil
@@ -9378,33 +9499,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewHelpText
 				m.helpScroll = 0
 				return m, nil
+			case "alt+r":
+				return m.rescan()
 			case "up":
-				if len(m.scanRows) > 0 {
+				if len(filtered) > 0 {
 					m.scanCursor--
 					if m.scanCursor < 0 {
-						m.scanCursor = len(m.scanRows) - 1
+						m.scanCursor = len(filtered) - 1
 					}
 				}
 				return m, nil
 			case "down":
-				if len(m.scanRows) > 0 {
+				if len(filtered) > 0 {
 					m.scanCursor++
-					if m.scanCursor >= len(m.scanRows) {
+					if m.scanCursor >= len(filtered) {
 						m.scanCursor = 0
 					}
 				}
 				return m, nil
-			case "r":
-				return m.rescan()
 			case "enter":
-				if len(m.scanRows) == 0 {
+				if len(filtered) == 0 {
 					return m, nil
 				}
 				m.scanAction = true
 				m.scanActionSel = 0
 				return m, nil
+			case "backspace":
+				if len(m.scanSearch) > 0 {
+					m.scanSearch = m.scanSearch[:len(m.scanSearch)-1]
+					m.scanCursor = 0
+				}
+				return m, nil
+			default:
+				if r, size := utf8.DecodeRuneInString(key); size == len(key) && size > 0 && unicode.IsPrint(r) {
+					m.scanSearch += key
+					m.scanCursor = 0
+				}
+				return m, nil
 			}
-			return m, nil
 
 		case viewAgentChat:
 			if key == "ctrl+c" {
@@ -11092,6 +11224,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// dismiss a completed download result message with any key
 			if m.downloadMsg != "" {
 				m.downloadMsg = ""
+				// Re-check what's actually installed now — the LOCAL
+				// column otherwise still showed "no" for a model just
+				// downloaded, since markInstalled() only ran once at the
+				// initial catalog scan and had no idea a download
+				// happened afterward.
+				m.catalogRows = refreshLocalInstalledStatus(m.catalogRows)
 				return m, nil
 			}
 
@@ -11347,6 +11485,10 @@ func (m model) View() string {
 	// header vanished forever".
 	body = clampToLastLines(body, bodyHeight)
 
+	// Footer always pinned to the terminal's actual last row — standard
+	// full-screen TUI behavior (htop, vim, less all work this way).
+	// Blank space in the content area on short input is normal, expected
+	// behavior for this kind of app, not a defect to eliminate.
 	bodyBox := lipgloss.NewStyle().
 		Width(m.width).
 		Height(bodyHeight).
@@ -12990,6 +13132,15 @@ func (m model) renderContextSettings() string {
 	if !known {
 		weights = 5.0
 	}
+	modelLabel := m.agentModelName
+	if modelLabel == "" {
+		modelLabel = "(none — no chat started yet)"
+	}
+	b.WriteString(fmt.Sprintf("Model: %s\n", modelLabel))
+	if !known {
+		b.WriteString(agentToolStyle.Render(fmt.Sprintf("(no real weight on file — using a %.1fGB guess)", weights)) + "\n")
+	}
+	b.WriteString(agentToolStyle.Render("To use a different model: quit to the main menu -> [s] Select Model") + "\n\n")
 	free := availableRAMGB()
 	recommended, recOK := recommendContextTokens(m.agentModelName)
 	customRow := len(contextSizeSteps)
@@ -13142,6 +13293,20 @@ func (m model) renderToolsSettings() string {
 
 	enabledSet := enabledToolSet()
 	rows := buildToolSettingsRows()
+	// Numbered independently of the row's own index — that index also
+	// counts category-header rows, which shouldn't consume a number —
+	// and computed over the FULL list (not just the visible slice below)
+	// so a tool's number stays stable as you scroll, rather than
+	// restarting from 1 on every page.
+	toolNumber := make([]int, len(rows))
+	n := 0
+	for i, row := range rows {
+		if row.Tool == "" {
+			continue
+		}
+		n++
+		toolNumber[i] = n
+	}
 	visible := m.toolsSettingsVisibleRows()
 	start := m.toolsSettingsScroll
 	end := start + visible
@@ -13171,7 +13336,7 @@ func (m model) renderToolsSettings() string {
 		if enabledSet[row.Tool] {
 			box = helpKeyStyle.Render("[x]")
 		}
-		line := fmt.Sprintf("  %s %s", box, row.Tool)
+		line := fmt.Sprintf("  %2d. %s %s", toolNumber[i], box, row.Tool)
 		if i == m.toolsSettingsCursor {
 			line = "> " + line[2:]
 			b.WriteString(agentUserStyle.Render(line) + "\n")
@@ -14184,15 +14349,20 @@ func (m model) renderTable() string {
 	}
 
 	if len(m.scanRows) == 0 {
-		return "show model info\n\nno models found.\n\nEsc: back  r: rescan"
+		return "show model info\n\nno models found.\n\nEsc: back  alt+r: rescan"
 	}
 
+	filtered := m.filteredScanRows()
+
 	if m.scanAction {
-		name := m.scanRows[m.scanCursor].Name
-		opts := []string{"run own agentic chat (chat + file read/write tools)", "run interactively (ollama run)", "remove (ollama rm)", "kill / stop (ollama stop)"}
+		name := filtered[m.scanCursor].Name
+		opts := []string{"run own agentic chat (chat + file read/write tools)", "run interactively (ollama run)", "remove (ollama rm)", "kill / stop (ollama stop)", "set as autopilot's default model"}
+		if name == autopilotModel {
+			opts[4] = "set as autopilot's default model (currently the default)"
+		}
 		var b strings.Builder
 		b.WriteString(fmt.Sprintf("show model info\n\n%s — choose an action\n\n", name))
-		letters := []string{"a", "x", "r", "k"}
+		letters := []string{"a", "x", "r", "k", "m"}
 		for i, o := range opts {
 			line := fmt.Sprintf("[%s] %s", letters[i], o)
 			if i == m.scanActionSel {
@@ -14211,8 +14381,8 @@ func (m model) renderTable() string {
 	for i, c := range cols {
 		widths[i] = len(c)
 	}
-	rowsData := make([][]string, len(m.scanRows))
-	for i, r := range m.scanRows {
+	rowsData := make([][]string, len(filtered))
+	for i, r := range filtered {
 		cpuGpu := "-"
 		match := "-"
 		if r.Benchmarked {
@@ -14265,7 +14435,12 @@ func (m model) renderTable() string {
 	if m.fromCache {
 		source = "loaded from cache"
 	}
-	b.WriteString(fmt.Sprintf("show model info — %d model(s), %s\n\n", total, source))
+	if m.scanSearch != "" {
+		b.WriteString(fmt.Sprintf("show model info — %d of %d model(s), %s\n", total, len(m.scanRows), source))
+	} else {
+		b.WriteString(fmt.Sprintf("show model info — %d model(s), %s\n", total, source))
+	}
+	b.WriteString(fmt.Sprintf("Search: %s_\n\n", m.scanSearch))
 
 	var headerLine strings.Builder
 	for i, c := range cols {
@@ -14290,6 +14465,7 @@ func (m model) renderTable() string {
 	}
 
 	b.WriteString("\nCPU/GPU + MATCH% come from the benchmark in Device Info ([d] from the main menu).\n")
+	b.WriteString("Esc: back to main menu (or clear search)   alt+r: rescan\n")
 	return b.String()
 }
 
@@ -14708,6 +14884,20 @@ func buildAgentChatLines(width int, messages []ollamaChatMsg, modelName string, 
 			// shows the user's messages and the model's actual replies.
 			continue
 		case "assistant":
+			// A message carrying ToolCalls is an intermediate reasoning step,
+			// not a real answer — some models (qwen2.5:3b observed) attach
+			// commentary text alongside the tool call it's about to make
+			// (confirmed for real: user sent one message, "hi thee"; the log
+			// showed one tool call and one completed turn, yet the transcript
+			// rendered TWO separate reply bubbles — the model's own "let me
+			// check that" aside plus its real final answer — reading as two
+			// unrelated answers to two different questions instead of one
+			// turn's reasoning trail). Only the final, tool-call-free message
+			// is the actual reply; skip rendering the rest, same as tool-role
+			// messages above.
+			if len(msg.ToolCalls) > 0 {
+				continue
+			}
 			if strings.TrimSpace(msg.Content) != "" {
 				lines = append(lines, renderPrefixedChatLines(modelName+"> ", cleanMarkdownForDisplay(msg.Content), width, agentReplyStyle)...)
 				// Elapsed time for this turn, display-only (never fed back
@@ -14742,6 +14932,30 @@ func (m *model) syncAgentViewport() {
 	m.agentViewport.GotoBottom()
 }
 
+// syncAgentViewportLive is syncAgentViewport, but also appends the
+// in-progress streaming reply (agentStreamBuf) as part of the same
+// scrollable content, uncapped — called on every streamed token so the
+// whole transcript scrolls together as the reply grows, instead of the
+// growing text being confined to a separate small fixed-height preview
+// area (capped at a few lines) while the real transcript above it sat
+// frozen. That split was the actual cause of "part of the screen stays
+// still while only a small area updates" — this unifies them into one
+// scrollable region.
+func (m *model) syncAgentViewportLive() {
+	if !m.agentVPReady {
+		return
+	}
+	lines := buildAgentChatLines(agentViewportWidth(m.width), m.agentMessages, m.agentModelName, m.agentCapabilities, m.agentWarmup, m.agentSpinner, time.Since(m.agentWarmupStarted), m.agentTurnTimes, m.agentBusy)
+	if strings.TrimSpace(m.agentStreamBuf) != "" {
+		streamLines := wrapLines(m.agentModelName+"> "+cleanMarkdownForDisplay(m.agentStreamBuf)+"▌", agentViewportWidth(m.width))
+		for _, l := range streamLines {
+			lines = append(lines, agentReplyStyle.Render(fixRTLDisplay(l)))
+		}
+	}
+	m.agentViewport.SetContent(strings.Join(lines, "\n"))
+	m.agentViewport.GotoBottom()
+}
+
 func (m model) renderAgentChat() string {
 	var b strings.Builder
 
@@ -14755,31 +14969,17 @@ func (m model) renderAgentChat() string {
 		bottom.WriteString(helpKeyStyle.Render(m.agentPasteNotice) + "\n")
 	}
 	if m.agentBusy {
+		// The growing reply itself now lives in the scrollable viewport
+		// (see syncAgentViewportLive) — this fixed bottom block is just a
+		// one-line status indicator, not a second copy of the streaming
+		// text, so there's no separate small area updating while the
+		// real transcript above it stays still.
 		frame := agentSpinnerFrames[m.agentSpinner%len(agentSpinnerFrames)]
 		elapsed := time.Since(m.agentStarted).Round(time.Second)
 		if strings.TrimSpace(m.agentStreamBuf) == "" {
 			bottom.WriteString(fmt.Sprintf("%s %s %s (%s)\n", frame, m.agentModelName, agentThinkingPhrase(elapsed), elapsed))
 		} else {
-			// Cap the live preview: an unbounded growing reply (the model
-			// can stream thousands of characters before it's done) must
-			// never be allowed to make this block taller than its
-			// reserved budget (agentBottomReserve), or the layout
-			// overflows and the header scrolls off the top.
-			const maxPreviewLines = 6
-			streamLines := wrapLines(m.agentModelName+"> "+cleanMarkdownForDisplay(m.agentStreamBuf)+"▌", agentViewportWidth(m.width))
-			shown := streamLines
-			truncatedAbove := 0
-			if len(shown) > maxPreviewLines {
-				truncatedAbove = len(shown) - maxPreviewLines
-				shown = shown[truncatedAbove:]
-			}
-			if truncatedAbove > 0 {
-				bottom.WriteString(agentToolStyle.Render(fmt.Sprintf("  ... (%d more line(s) so far)", truncatedAbove)) + "\n")
-			}
-			for _, l := range shown {
-				bottom.WriteString(agentReplyStyle.Render(fixRTLDisplay(l)) + "\n")
-			}
-			bottom.WriteString(fmt.Sprintf("%s (%s)\n", frame, elapsed))
+			bottom.WriteString(fmt.Sprintf("%s %s (%s)\n", frame, m.agentModelName, elapsed))
 		}
 	} else {
 		// Reordered live, same as a sent message — a Hebrew/Arabic typist
@@ -14802,36 +15002,63 @@ func (m model) renderAgentChat() string {
 		// bottom block (error/busy/you> lines, 1 line idle, up to ~8 while
 		// streaming) and the scroll-position notice row — computed fresh
 		// every frame from the bottom block's actual size, not a fixed
-		// reserve. A fixed reserve either leaves a dead gap of blank rows
-		// above "you>" when idle (the block is much smaller than the
-		// reserve) or, if too small, forces the outer lipgloss .Height()
-		// call in View() to pad the shortfall onto the very bottom of the
-		// WHOLE frame instead (after the input line) — which is what made
-		// "you>" float near the top with a gap below it.
-		bodyHeight := m.height - 2 // header + footer, matches View()'s math
+		// reserve. Letting bubbles/viewport's own View() pad any
+		// shortfall itself (its normal behavior) keeps this in sync with
+		// View()'s own full-height Height(bodyHeight) wrapping — no
+		// separate trimming here fighting that outer padding, which
+		// previously produced a doubled-up gap (padding stripped here,
+		// then re-added outside, in the wrong place).
+		// Header height computed for real, not assumed — this view's own
+		// header is genuinely 2 rows (title/model/cwd line, then the
+		// pinned token-usage line), but this constant used to just
+		// assume 1 like every other screen. That understated how much
+		// space the header actually took, which meant this function
+		// built content 1 row TALLER than what would truly fit — the
+		// real symptom wasn't a visible gap directly, but it fed into
+		// the same layout math the actual gap comes from, and was worth
+		// fixing outright rather than leaving a second known-wrong
+		// constant sitting next to the one already fixed above.
+		bodyHeight := m.height - lipgloss.Height(m.renderHeader()) - 1 // header + footer
 		bottomLines := strings.Count(bottom.String(), "\n")
 		contentHeight := bodyHeight - bottomLines - 1 // -1 for the scroll-notice/blank row
 		if contentHeight < 1 {
 			contentHeight = 1
 		}
+		// Real bug, not just cosmetic: m.agentViewport.Height is set
+		// elsewhere (WindowSizeMsg, via agentViewportHeight — a fixed,
+		// generously-conservative reserve) and only ever GotoBottom()'d
+		// against THAT height. contentHeight computed here is dynamic
+		// and often larger (the bottom block is usually much smaller
+		// than the fixed reserve), so rendering at contentHeight from a
+		// YOffset computed for a smaller height showed extra blank rows
+		// PAST the real scrolled-to-bottom content — confirmed for real:
+		// a file listing got cut short with blank/tip-filled space below
+		// it, even though more of that same real listing could have
+		// been shown by scrolling further. Recomputing GotoBottom() here
+		// with the actual render-time height (only when the user hasn't
+		// manually scrolled up, so this never fights real scrolling)
+		// fixes that at the source.
 		vpCopy := m.agentViewport
+		wasAtBottom := m.agentViewport.AtBottom()
 		vpCopy.Height = contentHeight
-		vp := vpCopy.View()
-		if got := strings.Count(vp, "\n") + 1; got < contentHeight {
-			vp += strings.Repeat("\n", contentHeight-got)
+		if wasAtBottom {
+			vpCopy.GotoBottom()
 		}
+		vp := vpCopy.View()
 		b.WriteString(vp)
-		b.WriteString("\n")
 		if !m.agentViewport.AtBottom() {
-			b.WriteString(agentHeadStyle.Render("-- scrolled up; End or PgDn repeatedly to catch up --") + "\n")
+			b.WriteString("\n" + agentHeadStyle.Render("-- scrolled up; End or PgDn repeatedly to catch up --") + "\n")
 		} else {
 			b.WriteString("\n")
 		}
 	}
 	b.WriteString(bottom.String())
-	// Input/status block sits fixed right above the footer: footer (row 1
-	// from bottom), "you>" (row 2) — always, regardless of conversation
-	// length or scroll state.
+	// "you>" follows immediately after the last real line — natural
+	// flow, not pinned to the bottom of the terminal. On a short
+	// conversation it sits a few lines down, not at the very bottom;
+	// View()'s own outer .Height(bodyHeight) padding fills whatever's
+	// left below it, unremarkably, rather than this function trying to
+	// force a fixed docked position.
 	return b.String()
 }
 
@@ -15289,6 +15516,60 @@ var startupMinimized bool
 // --autopilot and --minimized instead just set a startup flag and fall
 // through to the normal TUI startup, since both affect how the TUI itself
 // comes up rather than replacing it.
+// printChatFrameDump renders one real agentic-chat frame using the
+// actual View()/renderAgentChat() code path (not a reimplementation) —
+// for headless proof of what a given screen size + conversation state
+// really produces, byte for byte. Reproduces the exact reported scenario:
+// a short file listing plus one in-progress reply, at the larger
+// maximized-window size from the bug report.
+func printChatFrameDump() {
+	m := model{
+		width:  158,
+		height: 46,
+		view:   viewAgentChat,
+	}
+	m.agentModelName = "qwen2.5:3b"
+	m.agentWorkDir = `C:\Sources\gm-vscode\llama-shell`
+	m.agentCapabilities = "com,too"
+	m.agentToolMode = "on"
+	m.agentBusy = true
+	m.agentStarted = time.Now().Add(-7 * time.Second)
+	m.agentSpinner = 2
+	files := []string{
+		"4153_1848_601.txt", "4341_1005_601.datalog.txt", "4341_1039_604.datalog.txt",
+		"H2232_2100_600.datalog.txt", "H2232_2100_610.datalog.txt",
+		"H2232_2102_600.datalog.txt", "dashboard.html",
+		"gm-datacenter-summary.md", "index.40.html", "llama-test/",
+		"rg-linux-aarch64.tar.gz", "ripgrep-14.1.0-aarch64-unknown-linux-gnu/",
+		"test_leaks.txt", "trump.html", "trump.md", "trump2.md",
+		"README.md", "dist/", "docs/", "go.mod", "go.sum",
+		"keep_awake_darwin.go", "keep_awake_linux.go", "keep_awake_other.go",
+		"keep_awake_windows.go", "llama-shell.exe", "main.go",
+		"minimize_console_other.go", "minimize_console_windows.go", "testing/",
+		"CHANGELOG.md", "CREDENTIALS.md", "LICENSE", "AUTO_UPDATE.md",
+	}
+	var listing strings.Builder
+	for _, f := range files {
+		listing.WriteString("- " + f + "\n")
+	}
+	m.agentMessages = []ollamaChatMsg{
+		{Role: "system", Content: agentSystemPrompt(m.agentWorkDir)},
+		{Role: "user", Content: "list the files here"},
+		// Tool-role messages are never rendered in the transcript (see
+		// buildAgentChatLines' "case \"tool\": continue") — what a real
+		// screenshot shows as a file listing is the model's own
+		// ASSISTANT reply text (it echoes/reformats the tool result as
+		// its answer), so that's what has to go here to reproduce a real
+		// scenario, not a tool message.
+		{Role: "assistant", Content: strings.TrimRight(listing.String(), "\n")},
+	}
+	m.agentViewport = viewport.New(agentViewportWidth(m.width), agentViewportHeight(m.height))
+	m.agentVPReady = true
+	m.syncAgentViewport()
+
+	fmt.Print(m.View())
+}
+
 func handleCLIArgs() {
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -15301,6 +15582,9 @@ func handleCLIArgs() {
 			os.Exit(0)
 		case "--tools-extended":
 			printCLITools(true)
+			os.Exit(0)
+		case "--dump-chat-frame":
+			printChatFrameDump()
 			os.Exit(0)
 		case "--autopilot":
 			startupAutopilot = true
@@ -15503,6 +15787,15 @@ func printCLILog(n int) {
 }
 
 func main() {
+	// Auto-detected color profile races against the terminal actually being
+	// ready under some spawn paths (confirmed for real via a debug capture:
+	// lipgloss.ColorProfile() reported TrueColor while a style rendered at
+	// program start produced zero ANSI escape bytes) — every launch of the
+	// same build could come up either fully colored or fully monochrome
+	// depending on timing. Forcing the profile removes the race entirely;
+	// ANSI256 is the safe common denominator across both real deployment
+	// targets (Windows Terminal directly, and GNU screen on CT102).
+	lipgloss.SetColorProfile(termenv.ANSI256)
 	handleCLIArgs()
 	cleanupOldExe()
 	preventSleep()
